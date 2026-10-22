@@ -1,0 +1,6 @@
+.ai/manifest text eol=lf
+.ai/scripts/** text eol=lf
+.ai/profiles/** text eol=lf
+.ai/templates/** text eol=lf
+.claude/skills/** text eol=lf
+.codex/skills/** text eol=lf

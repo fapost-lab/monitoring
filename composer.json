@@ -1,0 +1,32 @@
+{
+  "name": "fapost/monitoring",
+  "description": "FaPost monitoring: Pulse, Horizon access and a log viewer behind one operator-access contract",
+  "type": "library",
+  "license": "Apache-2.0",
+  "require": {
+    "php": "^8.4",
+    "illuminate/support": "^12.0",
+    "fapost/foundation": ">=0.28 <1.0"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.0",
+    "laravel/pint": "^1.27"
+  },
+  "autoload": {
+    "psr-4": {
+      "Fapost\\Monitoring\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Fapost\\Monitoring\\Tests\\": "tests/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": []
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}
