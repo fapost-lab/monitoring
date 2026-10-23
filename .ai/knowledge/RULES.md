@@ -27,6 +27,11 @@ are added as sections of this file.
   ignored request paths (`monitoring.pulse.ignore`, domain-aware), outgoing calls kept as their host only, cache
   keys kept by their first segment. A new or newly enabled recorder arrives with a test that a secret does not
   reach `pulse_*`. Known and accepted: slow SQL text may hold hand-written literals; exception locations name files.
+- **Pulse resolves no users from a table.** The `ResolvesUsers` binding is `NeutralUsers` (a label made of the id,
+  no query, no name/e-mail/avatar) unless `monitoring.pulse.resolve_users` says `true` (Pulse's own lookup) or gives
+  a callable; the application's `Pulse::users()` rebinds later and wins. Reason: users live in tenant schemas, absent
+  on the platform host. A card that needs names gets them through that setting, never by a query of this package's
+  own into a table it does not own. Enforced: `tests/UsersTest.php` (a schema without `users`).
 - The migration's `down()` is empty on purpose (a tenant-side rollback would drop the installation's Pulse data
   from `landlord`); `up()` creates each table only if missing. The DDL is a copy of Pulse's: on a Pulse upgrade
   that changes its schema, add a new migration with the change.

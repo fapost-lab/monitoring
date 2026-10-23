@@ -98,6 +98,26 @@ whitelist, not `true`; the cost is that a writer to your cache store could now p
 behaviour of their own. `MONITORING_PULSE_ALLOW_CACHED_CLASSES=false` leaves the setting alone (list them yourself). Laravel 12
 does not read the key. The list reaches only cache stores created after this package registers: a provider registered earlier that touches the cache in its `register()` keeps the old value. A card that caches another class (a custom `Pulse::user()` callback returning models) needs it listed by you.
 
+## Users in Pulse
+
+Pulse records the id of the signed-in user (a ULID in FaPost) for its Usage card and, by default, looks the
+name up in the users table of the default connection when the page is drawn. In a schema-per-tenant
+installation that table lives in a tenant's schema: on the platform host it does not exist (`/pulse` answers
+500, `relation "users" does not exist`), and platform operators and tenant users live in different places.
+
+So this package reads no users table: the card shows `user 0000abcd` (the last characters of the id) and
+never a name, e-mail or avatar, and nothing personal is written to Pulse's tables, only the id. What decides
+(`monitoring.pulse.resolve_users`, `false` by default):
+
+| Value | Result |
+|---|---|
+| `false` | the label above, no query |
+| `true` | Pulse's own lookup in the model of `auth.providers.users.model`; only for an installation whose users table is on the default connection |
+| a callable, or the class of an invokable one (a closure cannot be cached by `config:cache`: use `Class::class` or `'Class::method'`) | `fn (Collection $ids): iterable` returning rows `['id' => ..., 'name' => ..., 'extra' => ...]`, the shape `Pulse::users()` takes (an operator layer uses it to name its operators) |
+
+A `Pulse::users(...)` call made by the application itself (in a service provider) always wins over the setting.
+`Pulse::user(...)` has nothing to act on with the default resolver and is ignored.
+
 ## What is collected, and what is not
 
 Pulse keeps counters, durations, route **patterns** (`/things/{id}`, not `/things/42`), exception classes with
@@ -111,7 +131,7 @@ strings, headers or cookies. Beyond Pulse's defaults this package:
 - keeps a cache key by its **first segment** (`login:*`): keys built from an e-mail, an address or a token stay out.
 
 Slow SQL text may still contain literals written into a query by hand, and exception locations name files and
-lines; the user cards show the identifiers of signed-in users that Pulse resolves when the page is drawn.
+lines; the Usage card shows the ids of signed-in users as a short label (see [Users in Pulse](#users-in-pulse)).
 
 The tables are part of the database dump a deploy takes; seven days of entries is small at one installation's
 scale.
