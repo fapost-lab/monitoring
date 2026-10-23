@@ -83,7 +83,20 @@ Two lists in `config/monitoring.php` let the host application add its own steps,
 | `MONITORING_PULSE_CONNECTION` | `landlord` | where the tables live |
 | `PULSE_INGEST_DRIVER` | `redis` | `storage` writes in the request, without the daemon |
 | `MONITORING_LOGS_ENABLED` | `false` | the log viewer's routes exist only when `true` |
+| `MONITORING_PULSE_ALLOW_CACHED_CLASSES` | `true` | adds the classes Pulse's cards cache to `cache.serializable_classes` (see below) |
 | `PULSE_STORAGE_KEEP` | `7 days` | Pulse's own retention (trimmed by `pulse:work`) |
+
+## Pulse's cards and Laravel 13's cache
+
+Laravel 13 unserializes cached objects only if `cache.serializable_classes` lists their class (`false` turns every
+object into `__PHP_Incomplete_Class`). Pulse's cards cache their query results, so with `false` a card answers 500 on
+its second render ("call a method on an incomplete object"). The setting is one list for all stores (the cache manager
+ignores a store's own), so a store of its own for Pulse cannot carry a different one. When Pulse is enabled, the package
+therefore adds exactly `Illuminate\Support\Collection`, `stdClass` and `Carbon\CarbonImmutable` to it: `false`
+becomes that list, a list is extended, `true` (or no value: everything is allowed already) is left alone. That is a
+whitelist, not `true`; the cost is that a writer to your cache store could now plant those three classes, which carry no
+behaviour of their own. `MONITORING_PULSE_ALLOW_CACHED_CLASSES=false` leaves the setting alone (list them yourself). Laravel 12
+does not read the key. The list reaches only cache stores created after this package registers: a provider registered earlier that touches the cache in its `register()` keeps the old value. A card that caches another class (a custom `Pulse::user()` callback returning models) needs it listed by you.
 
 ## What is collected, and what is not
 

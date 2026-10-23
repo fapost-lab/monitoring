@@ -39,6 +39,11 @@ return [
         'connection' => env('MONITORING_PULSE_CONNECTION', 'landlord'),
         'ingest'     => env('PULSE_INGEST_DRIVER', 'redis'),
 
+        // Laravel 13 refuses to unserialize cached objects unless `cache.serializable_classes` lists their class,
+        // and Pulse's cards cache collections and rows. true adds exactly those three classes to that list (only a
+        // `false` or a list is touched); false leaves the setting alone, for an installation that lists them itself.
+        'allow_cached_classes' => (bool) env('MONITORING_PULSE_ALLOW_CACHED_CLASSES', true),
+
         // Paths (regular expressions; Pulse puts a route's domain, if it has one, before the slash) no recorder may keep: the
         // single-use support access entry, webhook ingress and the operator screens themselves.
         'ignore' => [
