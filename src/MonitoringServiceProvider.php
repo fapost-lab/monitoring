@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Fapost\Monitoring;
 
+use Carbon\CarbonImmutable;
 use Fapost\Foundation\Operator\Enums\OperatorSurface;
 use Fapost\Monitoring\Access\OperatorGate;
 use Fapost\Monitoring\Http\Middleware\AllowLogs;
 use Fapost\Monitoring\Http\Middleware\AllowPulse;
 use Illuminate\Contracts\Config\Repository;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\View;
 use Illuminate\Support\ServiceProvider;
@@ -22,6 +24,7 @@ use Laravel\Pulse\Recorders\UserRequests;
 use Laravel\Reverb\Pulse\Recorders\ReverbConnections;
 use Laravel\Reverb\Pulse\Recorders\ReverbMessages;
 use Opcodes\LogViewer\LogViewerServiceProvider;
+use stdClass;
 
 /**
  * Pulse and a log viewer behind the operator access contract.
@@ -33,6 +36,16 @@ use Opcodes\LogViewer\LogViewerServiceProvider;
  */
 final class MonitoringServiceProvider extends ServiceProvider
 {
+    /**
+     * The classes Pulse's cards put into the cache and read back (found by rendering every card of Pulse and of
+     * Reverb on a cache that serializes): the query result is a collection of `stdClass` rows, some with a
+     * `CarbonImmutable` timestamp. On Laravel 13 a cache whose `serializable_classes` is `false` returns them as
+     * `__PHP_Incomplete_Class` and the card answers 500.
+     *
+     * @var list<class-string>
+     */
+    public const PULSE_CACHED_CLASSES = [Collection::class, stdClass::class, CarbonImmutable::class];
+
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/monitoring.php', 'monitoring');
@@ -72,7 +85,8 @@ final class MonitoringServiceProvider extends ServiceProvider
 
         if (! $enabled) {
             // Off means no dashboard route either, not a dashboard that shows nothing.
-            Pulse::ignoreRoutes();
+            // An instance method (Pulse's facade forwards to it): a static call is an error.
+            $this->app->make(Pulse::class)->ignoreRoutes();
         }
 
         $config->set('pulse.storage.database.connection', $config->get('monitoring.pulse.connection'));
@@ -88,6 +102,27 @@ final class MonitoringServiceProvider extends ServiceProvider
 
         $this->keepPrivate($config);
         $this->addReverbRecorders($config);
+
+        if ($enabled && (bool) $config->get('monitoring.pulse.allow_cached_classes', true)) {
+            $this->allowPulseCachedClasses($config);
+        }
+    }
+
+    /**
+     * Laravel 13's `cache.serializable_classes` is one list for every store (the cache manager ignores a store's
+     * own), and Pulse's cards cache objects. A whitelist of exactly those classes is added instead of opening the
+     * setting (`true`): `false` becomes the list, a list is extended, `true` and an unset value (everything is
+     * allowed already) are left alone. Laravel 12 does not read the key; the entry is inert there.
+     */
+    private function allowPulseCachedClasses(Repository $config): void
+    {
+        $allowed = $config->get('cache.serializable_classes');
+
+        if (false === $allowed) {
+            $config->set('cache.serializable_classes', self::PULSE_CACHED_CLASSES);
+        } elseif (is_array($allowed)) {
+            $config->set('cache.serializable_classes', array_values(array_unique([...$allowed, ...self::PULSE_CACHED_CLASSES])));
+        }
     }
 
     /**
