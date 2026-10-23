@@ -5,13 +5,26 @@
   "license": "Apache-2.0",
   "require": {
     "php": "^8.4",
-    "illuminate/support": "^12.0",
-    "fapost/foundation": ">=0.28 <1.0"
+    "fapost/foundation": ">=0.29 <1.0",
+    "illuminate/support": "^12.0 || ^13.0",
+    "laravel/pulse": "^1.8",
+    "opcodesio/log-viewer": "^3.24.2"
   },
   "require-dev": {
-    "phpunit/phpunit": "^11.0",
-    "laravel/pint": "^1.27"
+    "laravel/pint": "^1.27",
+    "laravel/reverb": "^1.12",
+    "orchestra/testbench": "^10.0 || ^11.0",
+    "phpunit/phpunit": "^11.0 || ^12.0"
   },
+  "suggest": {
+    "laravel/reverb": "Adds the connection and message recorders and cards to the Pulse dashboard"
+  },
+  "repositories": [
+    {
+      "type": "vcs",
+      "url": "https://github.com/fapost-lab/foundation.git"
+    }
+  ],
   "autoload": {
     "psr-4": {
       "Fapost\\Monitoring\\": "src/"
@@ -24,7 +37,9 @@
   },
   "extra": {
     "laravel": {
-      "providers": []
+      "providers": [
+        "Fapost\\Monitoring\\MonitoringServiceProvider"
+      ]
     }
   },
   "minimum-stability": "stable",
