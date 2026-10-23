@@ -1,0 +1,87 @@
+# The checks a change has to pass before it reaches main.
+#
+# The package is tested on its own with Testbench: it depends on Foundation's contracts and on Pulse and the
+# log viewer, never on FaPost Core. The matrix covers the Laravel and PHP versions Core runs on and the one
+# before it.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: PHP ${{ matrix.php }}, Laravel ${{ matrix.laravel }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+        laravel: ["12", "13"]
+        include:
+          - laravel: "12"
+            testbench: "^10.0"
+          - laravel: "13"
+            testbench: "^11.0"
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: monitoring_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_pgsql, pdo_sqlite, redis
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ runner.os }}-${{ matrix.php }}-${{ matrix.laravel }}-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ runner.os }}-${{ matrix.php }}-${{ matrix.laravel }}-
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      # fapost/foundation is a VCS repository: unauthenticated, GitHub's API allows 60 calls an hour per IP, and
+      # past that Composer falls back to a git clone over SSH and fails with a misleading "Permission denied".
+      - name: Install dependencies
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
+        run: |
+          composer require --dev --no-update --no-interaction \
+              "illuminate/support:^${{ matrix.laravel }}.0" "orchestra/testbench:${{ matrix.testbench }}"
+          composer update --no-interaction --no-progress --prefer-dist
+
+      - name: Tests
+        env:
+          MONITORING_TEST_REDIS_HOST: 127.0.0.1
+          MONITORING_TEST_PGSQL_HOST: 127.0.0.1
+          MONITORING_TEST_PGSQL_DATABASE: monitoring_test
+          MONITORING_TEST_PGSQL_PASSWORD: postgres
+        run: vendor/bin/phpunit

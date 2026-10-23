@@ -21,6 +21,9 @@ jobs:
           php-version: "8.4"
           coverage: none
       - name: Install dependencies
+        # fapost/foundation is a VCS repository: the token keeps GitHub's API limit off the install.
+        env:
+          COMPOSER_AUTH: '{"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}'
         run: composer install --no-interaction --no-progress --prefer-dist
       - name: Code style
         run: vendor/bin/pint --test
