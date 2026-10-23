@@ -21,7 +21,7 @@ installation and want more than that page shows.
   outgoing requests, exceptions, queues, cache, usage, and Reverb's connection and message cards when
   `laravel/reverb` is installed.
 - **Log viewer** at `/log-viewer` ([opcodesio/log-viewer](https://github.com/opcodesio/log-viewer)),
-  **off by default** and read-only when on (no download, no delete; a published `monitoring.logs.read_only` can lift it).
+  **off by default** and read-only when on (no download, no delete; a published `monitoring.logs.read_only` can lift it). Its assets are published to `public/vendor/log-viewer` by the `extra.fapost.post-install` step (`log-viewer:publish`) of the image build.
 
 Both answer **404** to anyone the contract does not let in, and to everyone when no contract is bound.
 

@@ -36,6 +36,11 @@
     }
   },
   "extra": {
+    "fapost": {
+      "post-install": [
+        "log-viewer:publish"
+      ]
+    },
     "laravel": {
       "providers": [
         "Fapost\\Monitoring\\MonitoringServiceProvider"
