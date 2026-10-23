@@ -9,18 +9,24 @@ use Fapost\Foundation\Operator\Enums\OperatorSurface;
 use Fapost\Monitoring\Access\OperatorGate;
 use Fapost\Monitoring\Http\Middleware\AllowLogs;
 use Fapost\Monitoring\Http\Middleware\AllowPulse;
+use Fapost\Monitoring\Pulse\NeutralUsers;
 use Illuminate\Contracts\Config\Repository;
+use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\View;
 use Illuminate\Support\ServiceProvider;
+use InvalidArgumentException;
+use Laravel\Pulse\Contracts\ResolvesUsers;
 use Laravel\Pulse\Http\Middleware\Authorize;
+use Laravel\Pulse\LegacyUsers;
 use Laravel\Pulse\Pulse;
 use Laravel\Pulse\PulseServiceProvider;
 use Laravel\Pulse\Recorders\CacheInteractions;
 use Laravel\Pulse\Recorders\SlowOutgoingRequests;
 use Laravel\Pulse\Recorders\SlowRequests;
 use Laravel\Pulse\Recorders\UserRequests;
+use Laravel\Pulse\Users;
 use Laravel\Reverb\Pulse\Recorders\ReverbConnections;
 use Laravel\Reverb\Pulse\Recorders\ReverbMessages;
 use Opcodes\LogViewer\LogViewerServiceProvider;
@@ -102,10 +108,40 @@ final class MonitoringServiceProvider extends ServiceProvider
 
         $this->keepPrivate($config);
         $this->addReverbRecorders($config);
+        $this->bindUserResolver();
 
         if ($enabled && (bool) $config->get('monitoring.pulse.allow_cached_classes', true)) {
             $this->allowPulseCachedClasses($config);
         }
+    }
+
+    /**
+     * Pulse resolves recorded user ids through the users table of the default connection, which a
+     * schema-per-tenant installation does not have on the platform host. Unless `monitoring.pulse.resolve_users`
+     * says otherwise, a resolver that reads no table is bound; `Pulse::users()` called by the application
+     * later rebinds it, and wins.
+     */
+    private function bindUserResolver(): void
+    {
+        $this->app->singleton(ResolvesUsers::class, function (Application $app): ResolvesUsers {
+            $setting = $app->make('config')->get('monitoring.pulse.resolve_users', false);
+
+            if (is_string($setting) && ! is_callable($setting) && class_exists($setting)) {
+                $setting = $app->make($setting);
+            }
+
+            if (is_callable($setting)) {
+                // Pulse's legacy resolver wants a collection back; a plain array of rows is accepted here too.
+                return new LegacyUsers(static fn (Collection $ids): Collection => collect($setting($ids)));
+            }
+
+            if (! is_bool($setting)) {
+                throw new InvalidArgumentException('monitoring.pulse.resolve_users must be true, false, a callable or the class of an invokable one.');
+            }
+
+            // `true`: Pulse's own resolver, for an installation whose users sit where its model says.
+            return $setting ? $app->make(Users::class) : new NeutralUsers();
+        });
     }
 
     /**

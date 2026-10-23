@@ -39,6 +39,14 @@ return [
         'connection' => env('MONITORING_PULSE_CONNECTION', 'landlord'),
         'ingest'     => env('PULSE_INGEST_DRIVER', 'redis'),
 
+        // How the Usage card turns a recorded user id into a name. `false` (the default): a label made of the id
+        // ("user 0000abcd", the end of the id), no query, no name, e-mail or avatar. `true`: Pulse's own lookup in the model of
+        // `auth.providers.users.model` (only where that table exists on the default connection). A callable or
+        // the class name of an invokable one: `fn (Collection $ids): iterable` returning rows of
+        // ['id' => ..., 'name' => ..., 'extra' => ...], as `Pulse::users()` takes. Calling `Pulse::users()`
+        // yourself, in a service provider, always wins over this setting.
+        'resolve_users' => false,
+
         // Laravel 13 refuses to unserialize cached objects unless `cache.serializable_classes` lists their class,
         // and Pulse's cards cache collections and rows. true adds exactly those three classes to that list (only a
         // `false` or a list is touched); false leaves the setting alone, for an installation that lists them itself.
