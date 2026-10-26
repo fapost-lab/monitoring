@@ -560,6 +560,101 @@ jig_git_show_path() {
   git -C "$JIG_PROJECT" show "$sha:$2"
 }
 
+# The files a project declares its version in, at the repository's root, in
+# the order they are asked: Jig's own source first, then the common manifests.
+# One list for every reader of "this change raises the version"
+# (adr-20261026-a-task-that-raises-the-version-is-a-release).
+JIG_VERSION_FILES="scripts/lib/version.sh VERSION package.json composer.json pyproject.toml Cargo.toml"
+
+# _jig_version_in <file> — the version the content on stdin declares, read the
+# way <file>'s kind writes it; nothing when it declares none. A TOML file is
+# read only in the table that names the package — [project] or [tool.poetry]
+# for pyproject.toml, [package] for Cargo.toml — so a dependency's or a tool's
+# `version` is never taken for it.
+_jig_version_in() {
+  case "$1" in
+    scripts/lib/version.sh)
+      sed -n 's/^JIG_VERSION="\([^"]*\)".*/\1/p' | head -n 1 ;;
+    VERSION)
+      awk '{ gsub(/^[ \t]+|[ \t\r]+$/, "") } $0 != "" { print; exit }' ;;
+    package.json | composer.json)
+      sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 ;;
+    pyproject.toml) _jig_toml_version '[project] [tool.poetry]' ;;
+    Cargo.toml) _jig_toml_version '[package]' ;;
+  esac
+}
+
+# _jig_toml_version <tables> — the first `version = "…"` (or a literal
+# '…' string) on stdin inside one of <tables>, a space-separated list of table
+# headers as written without spaces. A header is read up to its first `]`, so
+# `[ project ] # note` is `[project]`. Any line opening with `[` starts a
+# table, also one inside a multi-line string or array: such a file can hide
+# its version, which is a miss, never a false release.
+_jig_toml_version() {
+  awk -v want=" $1 " -v q="'" '
+    /^[ \t]*\[/ { sec = substr($0, 1, index($0, "]")); gsub(/[ \t\r]/, "", sec); next }
+    sec != "" && index(want, " " sec " ") && $0 ~ ("^[ \t]*version[ \t]*=[ \t]*[\"" q "]") {
+      v = $0
+      sub(/^[^=]*=[ \t]*/, "", v)
+      c = substr(v, 1, 1)
+      v = substr(v, 2)
+      i = index(v, c)
+      if (i) v = substr(v, 1, i - 1)
+      print v
+      exit
+    }'
+}
+
+# _jig_release_fork <base> — the point HEAD forked from <base>: the later of
+# its merge-bases with origin/<base> and the local <base>, so a stale
+# remote-tracking ref does not take a raise merged in from a fresher local
+# base for the task's own. Nothing when neither answers.
+_jig_release_fork() {
+  local ref fork="" f
+  for ref in "refs/remotes/origin/$1" "refs/heads/$1"; do
+    git -C "$JIG_PROJECT" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 || continue
+    f=$(git -C "$JIG_PROJECT" merge-base "$ref" HEAD 2>/dev/null) || continue
+    [ -n "$f" ] || continue
+    if [ -z "$fork" ] || git -C "$JIG_PROJECT" merge-base --is-ancestor "$fork" "$f" 2>/dev/null; then
+      fork="$f"
+    fi
+  done
+  printf '%s\n' "$fork"
+}
+
+# jig_release_raise <base> — whether HEAD raises the version the project
+# declares, against the point it forked from the branch <base>
+# (_jig_release_fork: what the forge's pull request compares). Prints
+# `<file><TAB><old><TAB><new><TAB><level>` or nothing. The first file of
+# JIG_VERSION_FILES whose version went up decides; a file that declared no
+# version at the fork point is passed over, and the next one asked. Two `X.Y.Z` versions are compared as
+# numbers (jig_version_newer): an equal or lower one raises nothing, a higher
+# one is `major` when its first number grew, `minor-or-patch` otherwise. Any
+# other change of a version nobody can read as numbers is `major`: it is never
+# merged as a lesser release. Anything git cannot answer is "not a release" —
+# the ship goes on as it did before.
+jig_release_raise() {
+  local fork f new old o n level
+  fork=$(_jig_release_fork "$1")
+  [ -n "$fork" ] || return 0
+  for f in $JIG_VERSION_FILES; do
+    new=$(jig_git_show_path HEAD "$f" 2>/dev/null | _jig_version_in "$f")
+    [ -n "$new" ] || continue
+    old=$(jig_git_show_path "$fork" "$f" 2>/dev/null | _jig_version_in "$f")
+    [ -n "$old" ] && [ "$old" != "$new" ] || continue
+    o=${old#v}
+    n=${new#v}
+    level=major
+    if jig_release_version "v$o" >/dev/null && jig_release_version "v$n" >/dev/null; then
+      jig_version_newer "$n" "$o" || continue
+      [ "$((10#${n%%.*}))" -gt "$((10#${o%%.*}))" ] || level=minor-or-patch
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$f" "$old" "$new" "$level"
+    return 0
+  done
+  return 0
+}
+
 # jig_fresh_base_ref <name> <who> — the ref to cut from <name>: the fresher of
 # refs/heads/<name> and refs/remotes/origin/<name>, or HEAD when neither exists.
 #
@@ -2043,9 +2138,9 @@ jig_status_page_flush() {
 # The value is the highest numeric **name** in `.ai/runtime/revision/` of the
 # clone's main checkout (jig_config_clone_root: every worktree raises and reads
 # the same one, ADR-0008 as amended 2026-09-25). Raising it claims the next
-# name with `mkdir <n+1>`: mkdir is atomic on POSIX and on NTFS under Git Bash
-# (CreateDirectoryW) alike, so of two writers that both saw <n> exactly one
-# creates <n+1> and the other gets EEXIST, reads again and claims <n+2>; a
+# name, a file created exclusively (jig_claim_file, O_EXCL on POSIX and
+# CREATE_NEW on NTFS under Git Bash), so of two writers that both saw <n> exactly
+# one creates <n+1> and the other gets EEXIST, reads again and claims <n+2>; a
 # claim made stale by a long stall is caught and made again (jig_revision_bump).
 # No increment is lost, and there is no lock to go stale, wait for or break. A
 # reader only lists names and never opens one. Not `mv <n> <n+1>`: Git Bash
@@ -2091,6 +2186,21 @@ _jig_revision_scan() {
   done
 }
 
+# jig_claim_file <path> — create <path>, empty, only if nothing is there: exit
+# 0 when this process created it and 1 when it already existed (or could not
+# be made). A caller that needs content renames a finished file over it, so a
+# reader never sees a partial one (ADR-0008).
+#
+# The claim of every lock and counter in Jig (adr-20261023-a-claim-is-an-exclusive-create).
+# It is bash's own noclobber, an open with O_EXCL, so no external tool decides
+# it: uutils' `mkdir`, the default on Ubuntu 25.10 and later, returns success to
+# both of two processes making one directory (110 of 300 races, measured on
+# ubuntu:26.04), which is why `mkdir` is not a claim anywhere here. Git Bash
+# maps O_EXCL to CREATE_NEW, which is as exclusive.
+jig_claim_file() {
+  ( set -C; : > "$1" ) 2>/dev/null
+}
+
 # jig_revision_read — print the clone's revision: an integer, `0` when Jig has
 # not written anything in this clone yet (no counter).
 jig_revision_read() {
@@ -2099,6 +2209,22 @@ jig_revision_read() {
   _JIG_REV=""
   [ ! -d "$dir" ] || _jig_revision_scan "$dir"
   printf '%s\n' "${_JIG_REV:-0}"
+}
+
+# jig_revision_valid <value> — zero when <value> is a revision a caller may
+# send with `--revision`: digits without a leading zero, or `0`. `08` is not
+# one, and the shell would read it as octal. Shared by every write checked
+# against the caller's revision (`jig queue`, `jig task resume`).
+jig_revision_valid() {
+  case "$1" in
+    0) return 0 ;;
+    [1-9]*)
+      case "$1" in
+        *[!0-9]*) return 1 ;;
+      esac
+      return 0 ;;
+  esac
+  return 1
 }
 
 # _jig_revision_clear <dir> <below> <names> — remove the names in <names> that
@@ -2140,10 +2266,10 @@ _JIG_REV_KEEP=16
 # directory empty and seeded), stalled, and meanwhile others claimed <n+1> and
 # far beyond and cleared it, would create <n+1> again — below the counter,
 # counting nothing. Clearing <n+1> took a claim more than _JIG_REV_KEEP above
-# it, and the highest name never goes down, so after its mkdir every claim
+# it, and the highest name never goes down, so after its claim every claim
 # reads again: a highest name more than _JIG_REV_KEEP above its own makes it
 # stale, and it is withdrawn and made again. A fresh claim is misjudged only if
-# that many raises land between its mkdir and the next read, microseconds
+# that many raises land between its claim and the next read, microseconds
 # apart — and then it counts once too often, never too few.
 #
 # A first write (or the first after `.ai/runtime` was lost) claims the current
@@ -2169,14 +2295,14 @@ jig_revision_bump() {
       next=$((seen + 1))
     fi
     # The claim: exactly one writer creates <next>; the loser reads again.
-    mkdir "$dir/$next" 2>/dev/null || continue
+    jig_claim_file "$dir/$next" || continue
     _jig_revision_scan "$dir"
     if [ "${_JIG_REV:-$next}" -le "$((next + _JIG_REV_KEEP))" ]; then
       _jig_revision_clear "$dir" "$((next - _JIG_REV_KEEP))" "$old"
       return 0
     fi
     # Stale: <next> had been claimed and cleared before. Withdraw it.
-    rmdir "$dir/$next" 2>/dev/null || true
+    rm -f "$dir/$next" 2>/dev/null || true
   done
   jig_warn "could not raise the clone revision in $dir; a reader may miss this change"
   return 0
@@ -2196,14 +2322,14 @@ jig_record_changed() {
 # for a write that must be refused when the clone changed after its caller
 # read <expected> (adr-20261019-the-queue-is-one-file-written-against-a-revision).
 #
-# The claim is jig_revision_bump's `mkdir <expected+1>` made exact. Before it,
+# The claim is jig_revision_bump's claim of <expected+1> made exact. Before it,
 # the highest name must be <expected> (for 0, there must be no name at all):
 # otherwise the call is stale and claims nothing — a revision from before a
 # lost `.ai/runtime`, from the future, or simply old. Of two writers holding
 # one revision at most one then creates the name. After it, the claim must be
 # the highest name; when a higher one appeared in between — a cleared name
-# created again, another writer's raise — it is withdrawn: `rmdir` of the
-# digits-only name this call just created, never anything else. A claim is
+# created again, another writer's raise — it is withdrawn: `rm -f` of the
+# digits-only name, a file, this call just created, never anything else. A claim is
 # withdrawn only from under a higher name, so the clone's revision never goes
 # down. 0 claims the time in seconds, the seed of a first raise, and two
 # writers holding 0 claim different seconds; so a claim of 0 must also be the
@@ -2229,18 +2355,18 @@ jig_revision_claim() {
     [ "$_JIG_REV" = "$expected" ] || return 1
     next=$((expected + 1))
   fi
-  mkdir "$dir/$next" 2>/dev/null || return 1
+  jig_claim_file "$dir/$next" || return 1
   _jig_revision_scan "$dir"
   if [ "$_JIG_REV" = "$next" ]; then
     # For 0 the names two writers claim differ (each its own second), so
-    # mkdir alone excludes nobody: the claim stands only alone. A name below
+    # the claim alone excludes nobody: it stands only alone. A name below
     # it is another writer's first raise or claim of 0; this one stays, the
     # highest name: withdrawing it would lower the revision. It counts as one
     # more raise.
     [ "$expected" != 0 ] || [ -z "$_JIG_REV_OLD" ] || return 1
     return 0
   fi
-  rmdir "$dir/$next" 2>/dev/null || true
+  rm -f "$dir/$next" 2>/dev/null || true
   return 1
 }
 
@@ -2574,6 +2700,70 @@ jig_hash_list() {
   else
     (cd "$1" && git hash-object --no-filters --stdin-paths) < "$2"
   fi
+}
+
+# jig_relpath_from <from> <to> — the relative path from directory <from> to
+# path <to> (both absolute, no trailing slash required). Pure string
+# computation, no filesystem access, so it also works for symlink targets that
+# do not exist yet.
+jig_relpath_from() {
+  awk -v from="$1" -v to="$2" '
+    BEGIN {
+      n1 = split(from, a, "/")
+      n2 = split(to, b, "/")
+      i = 1
+      while (i <= n1 && i <= n2 && a[i] == b[i]) i++
+      up = ""
+      for (j = i; j <= n1; j++) if (a[j] != "") up = up "../"
+      down = ""
+      for (j = i; j <= n2; j++) if (b[j] != "") down = down b[j] "/"
+      result = up down
+      sub(/\/$/, "", result)
+      if (result == "") result = "."
+      print result
+    }
+  '
+}
+
+# jig_share_candidates <root> — the top-level directories of the checkout at
+# <root> that `worktree.share` should name and does not, one per line: ignored
+# by git, not a repository itself, holding at least one separate repository
+# directly inside (a `.git` directory; a `.git` file is a worktree, not a
+# package). Composer's path repositories under `packages/` are the case; a
+# `vendor/<vendor>/<package>/.git` from --prefer-source is two levels down and
+# is not. Read by `jig status` and by a worktree's bootstrap, which say so
+# (adr-20261002-a-worktree-shares-a-directory-by-mirroring-it).
+jig_share_candidates() {
+  local root="$1" entry dir child declared="" one
+  # Declared the way the bootstrap reads them: `packages/` names `packages`.
+  while IFS= read -r one; do
+    while :; do
+      case "$one" in
+        ?*/) one=${one%/} ;;
+        *) break ;;
+      esac
+    done
+    [ -z "$one" ] || declared="$declared$one
+"
+  done <<EOF
+$(cfg_list_lines worktree.share)
+EOF
+  while IFS= read -r entry; do
+    dir=${entry%/}
+    [ -n "$dir" ] || continue
+    case "$dir" in */*) continue ;; esac
+    [ "$entry" != "$dir" ] || continue
+    [ ! -e "$root/$dir/.git" ] || continue
+    ! jig_has_line "$dir" "$declared" || continue
+    for child in "$root/$dir"/*/.git "$root/$dir"/.[!.]*/.git; do
+      if [ -d "$child" ]; then
+        printf '%s\n' "$dir"
+        break
+      fi
+    done
+  done <<EOF
+$(git -C "$root" ls-files --others --ignored --exclude-standard --directory 2>/dev/null)
+EOF
 }
 
 # Path of <file> relative to <base>, both absolute. Pure string operation.

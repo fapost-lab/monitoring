@@ -81,28 +81,6 @@ _init_default_branch() {
   printf '%s\n' "$b"
 }
 
-# Relative path from directory <from> to path <to> (both absolute, no
-# trailing slash required). Pure string computation, no filesystem access,
-# so it also works for symlink targets that do not exist yet.
-_init_relpath() {
-  awk -v from="$1" -v to="$2" '
-    BEGIN {
-      n1 = split(from, a, "/")
-      n2 = split(to, b, "/")
-      i = 1
-      while (i <= n1 && i <= n2 && a[i] == b[i]) i++
-      up = ""
-      for (j = i; j <= n1; j++) if (a[j] != "") up = up "../"
-      down = ""
-      for (j = i; j <= n2; j++) if (b[j] != "") down = down b[j] "/"
-      result = up down
-      sub(/\/$/, "", result)
-      if (result == "") result = "."
-      print result
-    }
-  '
-}
-
 # The framework version of a source checkout, read from its own
 # version.sh rather than trusting the running dispatcher's $JIG_VERSION
 # (which may belong to a different checkout than --from).
@@ -236,7 +214,7 @@ _init_install_skill_staged() {
 _init_place_symlink() {
   local target_abs="$1" link_abs="$2" dry_run="${3:-0}" rel target_rel current
   rel=$(jig_relpath "$link_abs" "$JIG_PROJECT")
-  target_rel=$(_init_relpath "$(dirname "$link_abs")" "$target_abs")
+  target_rel=$(jig_relpath_from "$(dirname "$link_abs")" "$target_abs")
   if [ -L "$link_abs" ]; then
     current=$(readlink "$link_abs")
     # The text is the fast answer, not the only one: Cygwin reads a relative

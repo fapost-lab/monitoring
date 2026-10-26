@@ -95,4 +95,6 @@ file the fix as an ordinary task from the default branch, and release it as a pa
 
 The default branch keeps moving between releases. A fix needed now is an ordinary task from the
 default branch plus a patch release from there, without the epic. The epic gets it when the
-default branch is merged into it, which finishing requires anyway.
+default branch is merged into it, which finishing requires anyway. That task raises the version, so
+`jig task ship` merges it by the same rule as §6 — `release.merge`, an unattended run, never a
+`major` — and says so; a person merges it otherwise.

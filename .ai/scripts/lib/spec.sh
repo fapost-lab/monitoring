@@ -143,7 +143,7 @@ _spec_require_default_branch() {
 spec_new() {
   [ $# -ge 1 ] || jig_die "spec new: missing spec id (usage: jig spec new <id>)"
   [ $# -eq 1 ] || jig_die "spec new: unexpected argument: $2"
-  local id="$1" root dir spec_tpl roadmap_tpl f default branch
+  local id="$1" root dir spec_tpl roadmap_tpl default branch
   spec_valid_id "$id" \
     || jig_die "spec new: invalid spec id: $id (letters, digits, '.', '_', '-'; no leading dot or dash)"
   jig_require_init
@@ -160,8 +160,8 @@ spec_new() {
   dir="$root/$id"
   [ ! -e "$dir" ] || jig_die "spec new: spec already exists: $JIG_AI_DIR/specs/$id"
   mkdir -p "$root" || jig_die "spec new: cannot create $JIG_AI_DIR/specs"
-  # A plain mkdir is the existence check that cannot race: it fails if the
-  # directory appeared since the test above.
+  # A plain mkdir refuses a directory that appeared since the test above; the
+  # claim on the id is spec.md below (adr-20261023-a-claim-is-an-exclusive-create).
   mkdir "$dir" 2>/dev/null || jig_die "spec new: spec already exists: $JIG_AI_DIR/specs/$id"
   # Both files are written under temporary names first, so a failed copy
   # leaves nothing half-created and a retry works. The cleanup removes only
@@ -174,11 +174,20 @@ spec_new() {
     rmdir "$dir" 2>/dev/null || true
     jig_die "spec new: could not copy the templates into $JIG_AI_DIR/specs/$id"
   fi
-  for f in spec.md roadmap.md; do
-    mv "$dir/$f.tmp.$$" "$dir/$f" || jig_die "spec new: could not write $JIG_AI_DIR/specs/$id/$f"
-    jig_record_changed
-    printf '%s/specs/%s/%s\n' "$JIG_AI_DIR" "$id" "$f"
-  done
+  # spec.md is the claim on the id: the directory alone is not, since `mkdir`
+  # does not exclude a second maker everywhere
+  # (adr-20261023-a-claim-is-an-exclusive-create).
+  # Claimed empty, then replaced whole by the rename.
+  if ! jig_claim_file "$dir/spec.md"; then
+    rm -f "$dir/spec.md.tmp.$$" "$dir/roadmap.md.tmp.$$"
+    jig_die "spec new: spec already exists: $JIG_AI_DIR/specs/$id"
+  fi
+  mv "$dir/spec.md.tmp.$$" "$dir/spec.md" || jig_die "spec new: could not write $JIG_AI_DIR/specs/$id/spec.md"
+  jig_record_changed
+  printf '%s/specs/%s/spec.md\n' "$JIG_AI_DIR" "$id"
+  mv "$dir/roadmap.md.tmp.$$" "$dir/roadmap.md" || jig_die "spec new: could not write $JIG_AI_DIR/specs/$id/roadmap.md"
+  jig_record_changed
+  printf '%s/specs/%s/roadmap.md\n' "$JIG_AI_DIR" "$id"
   branch=$(_spec_cut_own_branch "$id" "spec new") || exit 1
   printf 'switched to %s\n' "$branch"
 }

@@ -49,7 +49,9 @@ Usage: jig <command> [args]
 
   init [--from <dir>] [--link] [--session-hook]
                                  bootstrap .ai/ in the current repository
-  upgrade [--from <dir>]         update framework-owned files (manifest-aware)
+  upgrade [--from <dir>] [--dry-run] [--json]
+                                 update framework-owned files (manifest-aware); --json
+                                 reports what it did as data (schemas/json.md)
   status [--html | --open | --json]
                                  active tasks, housekeeping flags, drift;
                                  --html writes the status page to .ai/runtime/status.html,
@@ -100,6 +102,7 @@ Usage: jig <command> [args]
   spec remove <id> [--dry-run] [--abandon-unstarted]
                                  unlink a spec's open tasks and move the spec to trash
   queue [list] [--json]          priority, order and dependencies of tasks and epics
+  queue next [--json]            which queued task to take next, and what holds the others
   queue set|move|depend|undepend|remove <ref> [...] [--revision <n>] [--json]
                                  change one item; refused (stale-revision) when the
                                  clone changed since revision <n>

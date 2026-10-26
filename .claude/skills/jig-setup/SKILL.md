@@ -74,8 +74,9 @@ their own file is answered by `config unset` too — say that the key then answe
 5. **Releases** (`release.merge`) — only with `true` to question 4 and `merge` at either level.
    Before asking, explain: an epic's final pull request is the release — every task of a spec
    reaching the main branch at once; with `agent` (default) the run merges it once CI passed, a
-   `major` always left as a draft; with `human` it opens it and leaves that merge to them. Task
-   pull requests are not affected. "Should the agent merge a release by itself, or leave that
+   `major` always left as a draft; with `human` it opens it and leaves that merge to them. A task
+   whose change raises the project's version is a release too and follows the same answer; other
+   task pull requests are not affected. "Should the agent merge a release by itself, or leave that
    one to you?" Recommend `human` to someone whose main branch deploys or who wants to choose
    when a release goes out.
 6. **CI wait** (`agent.ci_timeout`) — only with `merge` at either level. "How many minutes should it wait for

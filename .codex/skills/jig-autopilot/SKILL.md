@@ -48,6 +48,13 @@ entered. End the session there — say the task is paused at their request and h
   its CLI from the task worktree under the bounded permissions in the same reference,
   then check the diff, findings and receipt before moving on. A failed selected process
   stops that stage; do not replace it with this session.
+- **Helpers are subagents, never sessions.** A reviewer, a delegated stage, a phase run's task
+  agent, a repair of the queue: each is a subagent of your runtime (in Claude Code, the Agent
+  tool in the background), never a separate session of the app (Claude Code desktop's
+  `start_session`). A run goes on in turns an event began — a helper finishing, CI — and a
+  runtime may refuse to start a session in a turn the person did not begin, leaving only a card
+  for them to click. An `executor:` process (above) is not a session either. Without subagents,
+  see phase-run.md, "A runtime without subagents".
 - **The full set is CI's under `verify.full_run: ci`.** Verify with `jig verify`, never with
   `--full` or the stack's runner unfiltered; `full set left to CI` is not a gap to fill.
 - **Each repair costs one attempt.** A repair is one loop of fixing after a blocking finding or

@@ -65,7 +65,7 @@ _task_usage() {
       ;;
     abandon) printf 'usage: jig task abandon <id>\n' ;;
     pause) printf 'usage: jig task pause <id> [--reason <text>] [--stash]\n       jig task pause <id> --if-requested --stage <name>\n' ;;
-    resume) printf 'usage: jig task resume <id>\n' ;;
+    resume) printf 'usage: jig task resume <id> [--revision <n>] [--json]\n' ;;
     list) printf 'usage: jig task list [--all] [--status <status>] [--goals] [--json]\n' ;;
     show) printf 'usage: jig task show <id>\n' ;;
     current) printf 'usage: jig task current\n' ;;
@@ -649,16 +649,31 @@ _task_rewrite_state() {
 # _task_rewrite_state above, same atomic write and `updated_at` refresh).
 # A no-op, beyond refreshing `updated_at`, when <key> is already absent.
 _task_rewrite_state_remove() {
-  local dir="$1" key="$2" file tmp today
+  local dir="$1" key="$2" tmp="$1/state.tmp.$$"
+  _task_state_without "$dir" "$tmp" "$key"
+  mv "$tmp" "$dir/state"
+  jig_record_changed
+}
+
+# _task_state_without <dir> <tmp> <key>... — build <dir>/state without the
+# lines of every <key>, `updated_at` refreshed, into <tmp>, a file beside it;
+# the state itself is not touched. A write that must land several removals as
+# one — under one revision claim (`task resume`) — moves <tmp> into place
+# itself. Called as a plain command, never inside $(...): the guard dies.
+_task_state_without() {
+  local dir="$1" tmp="$2" file today
+  shift 2
   _task_guard_dir "$dir"
   file="$dir/state"
-  tmp="$dir/state.tmp.$$"
   jig_cleanup_add "$tmp"
   today=$(jig_today)
-  awk -v key="$key" -v today="$today" '
+  awk -v keys="$*" -v today="$today" '
+    BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) drop[k[i]] = 1 }
     {
       line = $0
-      if (line ~ ("^" key ":")) {
+      key = line
+      sub(/:.*/, "", key)
+      if (index(line, ":") && (key in drop)) {
         next
       } else if (line ~ /^updated_at:/) {
         print "updated_at: " today
@@ -667,8 +682,6 @@ _task_rewrite_state_remove() {
       }
     }
   ' "$file" > "$tmp"
-  mv "$tmp" "$file"
-  jig_record_changed
 }
 
 # _task_touch_state <dir> — refresh `updated_at` and mark the status page,
@@ -711,19 +724,39 @@ _task_days_since() {
 
 # _task_resume_overlap <id> — files this task changed that were also changed
 # on the task's base since the merge base (design §5: overlap, not distance).
-# Empty, rather than an error, when the base or the merge base is missing —
-# the resume report simply omits the section then.
+# Exit 1, printing nothing, when the base or the merge base is missing — the
+# resume report omits the section then, and `--json` reports `null`.
+#
+# _task_resume_overlap <id> [<tree> [<branch>]] — <tree> is the checkout the
+# task's branch is checked out in, this one by default; its uncommitted
+# changes count as the task's. With <tree> empty the branch is checked out
+# nowhere, and only its commits (<branch> against the merge base) count: a
+# resume run from another checkout must not read that checkout's HEAD as the
+# task's.
 _task_resume_overlap() {
-  local base ref mb task_files base_files
+  local base ref mb task_files base_files tree="${2-$JIG_PROJECT}" branch="${3:-}" head=HEAD
   base=$(jig_task_base "$1")
   ref=$(jig_base_ref "$base")
-  [ -n "$ref" ] || return 0
-  mb=$(git -C "$JIG_PROJECT" merge-base "$ref" HEAD 2>/dev/null) || return 0
-  task_files=$(jig_git_touched_files --base-branch "$base")
+  [ -n "$ref" ] || return 1
+  [ -n "$tree" ] || head=$branch
+  [ -n "$head" ] || return 1
+  mb=$(git -C "${tree:-$JIG_PROJECT}" merge-base "$ref" "$head" 2>/dev/null) || return 1
+  if [ -n "$tree" ]; then
+    task_files=$(_task_touched_in "$tree" "$base")
+  else
+    task_files=$(git -C "$JIG_PROJECT" diff --name-only "$mb" "$branch" 2>/dev/null)
+  fi
   base_files=$(git -C "$JIG_PROJECT" diff --name-only "$mb" "$ref" 2>/dev/null)
   comm -12 \
     <(printf '%s\n' "$task_files" | sed '/^$/d' | sort -u) \
     <(printf '%s\n' "$base_files" | sed '/^$/d' | sort -u)
+}
+
+# _task_touched_in <tree> <base> — jig_git_touched_files read in the checkout
+# at <tree>: a local JIG_PROJECT, which bash scopes to this call.
+_task_touched_in() {
+  local JIG_PROJECT="$1"
+  jig_git_touched_files --base-branch "$2"
 }
 
 # _task_branch_name <id> — the branch this task will live on, from
@@ -989,9 +1022,9 @@ _task_new_body() {
   # branch, so there is nothing for uncommitted work to leak into. The check
   # lives in `task start`, and filing a task for later in the middle of other
   # work is the case this split exists for.
-  # The directory is the claim on the id: made without -p, it fails for the
-  # second of two `task new` racing for one id, which is refused as taken
-  # rather than both writing one task.
+  # The directory, made without -p, refuses an id already filed; the claim on
+  # it is the state file below, since `mkdir` does not exclude a second maker
+  # everywhere (adr-20261023-a-claim-is-an-exclusive-create).
   mkdir -p "$(dirname "$dir")"
   if ! mkdir "$dir" 2>/dev/null; then
     [ -e "$dir" ] && jig_fail already-exists "task new: task already exists: $id"
@@ -1021,6 +1054,14 @@ _task_new_body() {
     printf 'created_at: %s\n' "$(jig_today)"
     printf 'updated_at: %s\n' "$(jig_today)"
   } > "$tmp"
+  # The state file is the claim on the id: the directory alone is not, since
+  # `mkdir` does not exclude a second maker everywhere
+  # (adr-20261023-a-claim-is-an-exclusive-create). Claimed empty, then
+  # replaced whole by the rename, so no reader sees a partial state (ADR-0008).
+  if ! jig_claim_file "$dir/state"; then
+    rm -f "$tmp"
+    jig_fail already-exists "task new: task already exists: $id"
+  fi
   mv "$tmp" "$dir/state"
   jig_record_changed
 
@@ -1587,16 +1628,22 @@ _task_close_refusal() {
   return 0
 }
 
-# _task_nobody_answers <id> — exit 0 when no human answers for <id>: this
-# clone sets `autopilot.unattended`, or the task's run was started unattended
-# and has not ended (`on` or `stopped`). Checked on the recorded mode too, so
-# unsetting the key halfway through a run changes nothing about it.
-_task_nobody_answers() {
-  if jig_unattended; then return 0; fi
+# _task_run_unattended <id> — exit 0 when the task's own run was started
+# unattended and has not ended (`on` or `stopped`). Checked on the recorded
+# mode, so unsetting the key halfway through a run changes nothing about it.
+_task_run_unattended() {
   case "$(task_state_get "$1" autopilot)" in
     on | stopped) [ "$(_task_autopilot_mode "$1")" = unattended ] ;;
     *) return 1 ;;
   esac
+}
+
+# _task_nobody_answers <id> — exit 0 when no human answers for <id>: this
+# clone sets `autopilot.unattended`, or the task's own run is unattended
+# (_task_run_unattended).
+_task_nobody_answers() {
+  if jig_unattended; then return 0; fi
+  _task_run_unattended "$1"
 }
 
 # _task_set_class <id> <dir> <class> <has-reason> <reason> — write the class.
@@ -3445,23 +3492,22 @@ _task_gate_refusal() {
       printf "task gate: --by agent is an unattended run's self-approval; %s has no unattended autopilot run on, so the gate is the human's\n" "$id"
       return 0
     fi
-  elif _task_nobody_answers "$id"; then
-    # Nobody answers where this clone is unattended or the task's unattended run
-    # is on or stopped, so an approval recorded there is the agent's, and is
-    # said to be (adr-20261004-a-route-stage-is-proven-by-its-record).
+  elif _task_run_unattended "$id"; then
+    # Inside the task's unattended run, on or stopped, nobody answers, so an
+    # approval recorded there is the agent's, and is said to be
+    # (adr-20261004-a-route-stage-is-proven-by-its-record). The clone's
+    # setting alone does not refuse it: without a run the person working the
+    # task is the one approving.
     if [ "$(task_state_get "$id" autopilot)" = on ]; then
       printf "task gate: %s's run is unattended, so this approval is the agent's: jig task gate %s approved --by agent\n" "$id" "$id"
       return 0
     fi
-    if [ "$(task_state_get "$id" autopilot)" = stopped ]; then
-      if [ "$(_task_autopilot_repairs "$id")" -ge 2 ]; then
-        printf 'task gate: %s exhausted its unattended repair limit; ship a draft\n' "$id"
-        return 0
-      fi
-      printf 'task gate: %s is stopped; if a human answered, run: jig task autopilot %s resume --answer <text> --by human; then approve with --by agent\n' "$id" "$id"
+    # Not on, so stopped.
+    if [ "$(_task_autopilot_repairs "$id")" -ge 2 ]; then
+      printf 'task gate: %s exhausted its unattended repair limit; ship a draft\n' "$id"
       return 0
     fi
-    printf 'task gate: nobody answers for %s (unattended); start its run and approve with --by agent\n' "$id"
+    printf 'task gate: %s is stopped; if a human answered, run: jig task autopilot %s resume --answer <text> --by human; then approve with --by agent\n' "$id" "$id"
     return 0
   fi
   class=$(task_state_get "$id" class)
@@ -3601,63 +3647,170 @@ task_pause() {
   printf 'paused %s\n' "$id"
 }
 
-# resume refuses when the task is not paused and when the current branch
-# differs from the state's `branch` (design §4). A failed stash apply clears
-# nothing and exits non-zero: a conflicted restore must not silently look
-# like a successful resume. `apply`, never `pop` — the stash entry survives
-# as a backup, which is why `paused_stash` itself is not cleared here.
+# resume refuses when the task is not paused, and, when a stash is recorded,
+# when this checkout is not on the task's branch (design §4, as ADR-0012's
+# amendment of 2026-10-26 narrows it): the stash is applied here, so here must
+# be the task's checkout. Without a stash resume writes the task's state and
+# touches no checkout, so it runs anywhere — a task in its own worktree is
+# resumed from the main checkout. A failed stash apply clears nothing and
+# exits non-zero: a conflicted restore must not silently look like a
+# successful resume. `apply`, never `pop` — the stash entry survives as a
+# backup, which is why `paused_stash` itself is not cleared here.
+#
+# The write is checked against the revision the caller read (`--revision`),
+# or the one this command reads before it reads the task, as a `jig queue`
+# write is (adr-20261019-the-queue-is-one-file-written-against-a-revision):
+# the new state is built whole, the revision claimed, the stash applied, and
+# only then the state moved into place — one write under one claim. The stash
+# comes after the claim: applied first, a stale claim would leave the task
+# paused with its stash already in the tree, and a retry would apply it twice.
+# `--json` anywhere runs the whole command as the producer of json_run
+# (conventions/json-output.md), so every refusal is an envelope with its code.
 task_resume() {
-  jig_require_init
-  [ $# -eq 1 ] || jig_die "$(_task_usage resume)"
-  local id="$1" dir refusal
-  dir=$(task_dir "$id")
-  _task_guard_write "$id" "task resume"
-  refusal=$(_task_resume_refusal "$id") || exit 1
-  [ -z "$refusal" ] || jig_die "$refusal"
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _task_resume_body 1 "$@"
+      return
+    fi
+  done
+  _task_resume_body 0 "$@"
+}
 
-  # A task that was filed and paused before it was ever started has no branch
-  # to switch to; the check applies only once `task start` gave it one.
-  local state_branch cur_branch
-  state_branch=$(task_state_get "$id" branch)
-  if [ -n "$state_branch" ]; then
-    cur_branch=$(_task_current_branch)
-    [ "$cur_branch" = "$state_branch" ] || jig_die "task resume: switch to $state_branch first"
+# _task_resume_body <as_json> <id> [--revision <n>] — the body of `task
+# resume`; with <as_json> 1 it runs inside json_run and prints the resumed
+# task and what the resume found as data, not the report.
+_task_resume_body() {
+  local as_json="$1" arg args=()
+  shift
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  set -- ${args[@]+"${args[@]}"}
+  jig_require_init
+  [ $# -ge 1 ] || jig_fail usage "$(_task_usage resume)"
+  case "$1" in
+    -*) jig_fail usage "$(_task_usage resume)" ;;
+  esac
+  local id="$1" rev="" rev_given=0
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --revision) [ $# -ge 2 ] || jig_fail usage "task resume: --revision requires a value"; rev="$2"; rev_given=1; shift 2 ;;
+      *) jig_fail usage "task resume: unknown argument: $1" ;;
+    esac
+  done
+  [ "$rev_given" -eq 0 ] || [ -n "$rev" ] || jig_fail usage "task resume: --revision is empty"
+  [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "task resume: --revision is not a revision: $rev"
+  _task_valid_id "$id" || jig_fail usage "invalid task id: $id"
+
+  # The revision this write is checked against: the caller's, or the one read
+  # here before the task is, so the state read below is never newer than it.
+  local expected
+  if [ -n "$rev" ]; then
+    expected=$rev
+  else
+    expected=$(jig_revision_read)
   fi
 
-  local sha stash_line=""
+  local dir refusal
+  dir=$(task_dir "$id")
+  [ -f "$dir/state" ] || jig_fail not-found "task resume: unknown task: $id"
+  _task_guard_write "$id" "task resume"
+  refusal=$(_task_resume_refusal "$id") || exit 1
+  [ -z "$refusal" ] || jig_fail not-paused "$refusal"
+
+  # Where the task's branch is checked out: this checkout, a worktree, or
+  # nowhere (empty). A task paused before it was ever started has no branch,
+  # and its checkout is this one, as it always was.
+  local state_branch tree="$JIG_PROJECT" wt=""
+  state_branch=$(task_state_get "$id" branch)
+  if [ -n "$state_branch" ] && [ "$(_task_current_branch)" != "$state_branch" ]; then
+    wt=$(_task_worktree_for "$state_branch" "$(_task_worktrees)")
+    tree=$wt
+  fi
+
+  local sha
   sha=$(task_state_get "$id" paused_stash)
+  if [ -n "$sha" ] && [ "$tree" != "$JIG_PROJECT" ]; then
+    [ -z "$wt" ] || jig_fail wrong-checkout "task resume: $id has a stash to apply, and $state_branch is checked out in $wt; run it there"
+    jig_fail wrong-checkout "task resume: $id has a stash to apply; switch to $state_branch first"
+  fi
+
+  local days tmp="$dir/state.tmp.$$" rc=0
+  days=$(_task_days_since "$(task_state_get "$id" paused_at)")
+  _task_state_without "$dir" "$tmp" paused paused_at paused_reason
+
+  jig_revision_claim "$expected" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) jig_fail stale-revision "task resume: the clone changed since revision $expected; read again and retry" ;;
+    *) jig_die "task resume: cannot claim the clone revision in $(jig_revision_dir)" ;;
+  esac
+
+  local stash_line=""
   if [ -n "$sha" ]; then
     if git -C "$JIG_PROJECT" stash apply "$sha" >/dev/null 2>&1; then
       stash_line="stash: applied $sha (kept; drop with git stash drop $sha)"
     else
-      jig_die "task resume: git stash apply failed for $sha (conflicts); resolve them, then run \`jig task resume $id\` again"
+      jig_fail stash-conflict "task resume: git stash apply failed for $sha (conflicts); resolve them, then run \`jig task resume $id\` again"
     fi
   fi
 
-  local days
-  days=$(_task_days_since "$(task_state_get "$id" paused_at)")
+  mv "$tmp" "$dir/state"
+  jig_record_changed
 
-  _task_rewrite_state_remove "$dir" paused
-  _task_rewrite_state_remove "$dir" paused_at
-  _task_rewrite_state_remove "$dir" paused_reason
+  # What the resume found, read in the task's checkout: uncommitted files only
+  # where its branch is checked out; overlap from there or, checked out
+  # nowhere, from the branch's commits.
+  local n="" overlap="" overlap_known=1 k
+  [ -z "$tree" ] || n=$(_task_count_lines "$(git -C "$tree" status --porcelain 2>/dev/null)")
+  overlap=$(_task_resume_overlap "$id" "$tree" "$state_branch") || overlap_known=0
+  k=$(_task_count_lines "$overlap")
+
+  if [ "$as_json" = 1 ]; then
+    _task_resume_json "$id" "$days" "$sha" "$n" "$overlap_known" "$overlap"
+    return 0
+  fi
 
   printf 'resumed %s (paused %s days)\n' "$id" "$days"
-
-  local uncommitted n
-  uncommitted=$(git -C "$JIG_PROJECT" status --porcelain 2>/dev/null)
-  n=$(_task_count_lines "$uncommitted")
-  [ "$n" -eq 0 ] || printf 'uncommitted: %s files\n' "$n"
-
+  [ -z "$n" ] || [ "$n" -eq 0 ] || printf 'uncommitted: %s files\n' "$n"
   [ -z "$stash_line" ] || printf '%s\n' "$stash_line"
-
-  local overlap k base
-  overlap=$(_task_resume_overlap "$id")
-  k=$(_task_count_lines "$overlap")
   if [ "$k" -gt 0 ]; then
-    base=$(jig_task_base "$id")
-    printf 'overlap: %s files you changed also changed on %s\n' "$k" "$base"
+    printf 'overlap: %s files you changed also changed on %s\n' "$k" "$(jig_task_base "$id")"
     printf '%s\n' "$overlap" | sed 's/^/  /'
   fi
+}
+
+# _task_resume_json <id> <days> <stash-sha> <uncommitted> <overlap-known>
+# <overlap> — the `data` of `task resume --json` (schemas/json.md): the task
+# as `task list --json` lists it, after the write, and what the resume found.
+# <uncommitted> is empty when the task's branch is checked out nowhere;
+# <overlap-known> 0 when no base or merge base was found.
+_task_resume_json() {
+  local id="$1" days="$2" sha="$3" n="$4" known="$5" overlap="$6" r f files="" task
+  json_int_or_null "$days"; r="{\"paused_days\":$_JSON"
+  if [ -n "$sha" ]; then
+    json_quote "$sha"; r="$r,\"stash\":{\"sha\":$_JSON,\"applied\":true}"
+  else
+    r="$r,\"stash\":null"
+  fi
+  json_int_or_null "$n"; r="$r,\"uncommitted\":$_JSON"
+  if [ "$known" = 1 ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      json_quote "$f"; files="${files:+$files,}$_JSON"
+    done <<EOF
+$overlap
+EOF
+    r="$r,\"overlap\":[$files]}"
+  else
+    r="$r,\"overlap\":null}"
+  fi
+  task=$(_task_json_one "$id")
+  printf '{"task":%s,"resume":%s}\n' "$task" "$r"
 }
 
 # Live work: unfinished, whether or not it is dormant. A paused task is still
@@ -3806,6 +3959,38 @@ _TASK_LIST_HK_FLAGS="needs-consolidation wrong-base abandoned? worktree-kept bas
 # every task it lists.
 _TASK_LIST_FORGE_CACHE=""
 
+# _task_list_hk_flagged — "<id><TAB><flag>" for every housekeeping flag that
+# still stands, asked once per flag rather than once per task. Needs hklog.sh
+# sourced. Pathname expansion is off for the split: `abandoned?` is a glob.
+_task_list_hk_flagged() {
+  local flag ids fid t
+  t=$(printf '\t')
+  set -f
+  for flag in $_TASK_LIST_HK_FLAGS; do
+    ids=$(hklog_flagged_ids "$flag")
+    while IFS= read -r fid; do
+      [ -n "$fid" ] || continue
+      printf '%s%s%s\n' "$fid" "$t" "$flag"
+    done <<EOF
+$ids
+EOF
+  done
+  set +f
+}
+
+# _task_json_one <id> — one task as `task list --json` lists it, for a write
+# that answers with the task it wrote (`task resume --json`): the same
+# producer, with the worktrees, the forge cache and the housekeeping flags
+# read as the listing reads them.
+_task_json_one() {
+  # shellcheck source=lib/hklog.sh
+  . "$JIG_LIB/hklog.sh"
+  # shellcheck source=lib/forgecache.sh
+  . "$JIG_LIB/forgecache.sh"
+  _TASK_LIST_FORGE_CACHE=$(forgecache_read)
+  _task_list_json_task "$1" "$(_task_worktrees)" "$(_task_list_hk_flagged)"
+}
+
 # _task_list_json — the `data` of `task list --json` for the tasks
 # _task_list_select chose: one JSON object on stdout, in the shape
 # schemas/json.md pins. Every value comes from the producer that already
@@ -3816,26 +4001,12 @@ _task_list_json() {
   . "$JIG_LIB/hklog.sh"
   # shellcheck source=lib/forgecache.sh
   . "$JIG_LIB/forgecache.sh"
-  local worktrees flag ids fid flagged="" run ran_at forge t id rows=""
+  local worktrees flagged run ran_at forge t id rows=""
   t=$(printf '\t')
   worktrees=$(_task_worktrees)
   # What housekeeping last heard from the forge, read once per listing.
   _TASK_LIST_FORGE_CACHE=$(forgecache_read)
-  # "<id><TAB><flag>" for every flag that still stands, asked once per flag
-  # rather than once per task. Pathname expansion is off for the split:
-  # `abandoned?` is a glob.
-  set -f
-  for flag in $_TASK_LIST_HK_FLAGS; do
-    ids=$(hklog_flagged_ids "$flag")
-    while IFS= read -r fid; do
-      [ -n "$fid" ] || continue
-      flagged="$flagged$fid$t$flag
-"
-    done <<EOF
-$ids
-EOF
-  done
-  set +f
+  flagged=$(_task_list_hk_flagged)
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     rows="$rows$id$t$(_task_list_json_task "$id" "$worktrees" "$flagged")
@@ -4692,6 +4863,11 @@ _task_ship_branch_refusal() {
   return 0
 }
 
+# The body file task_ship writes for a major release's draft; script-global
+# because the exit cleanup that removes it runs after the function returned
+# (conventions/shell.md).
+_TASK_SHIP_BODY_TMP=""
+
 task_ship() {
   jig_require_init
   [ $# -ge 1 ] || jig_die "$(_task_usage ship)"
@@ -4805,7 +4981,40 @@ EOF
     return 0
   fi
 
-  jig_ship_pr "task ship" "$branch" "$base" "$message_file" "$title" "$body_file" "$draft"
+  # A change that raises the version into the default branch is a release,
+  # whoever planned it: its merge follows `release.merge` as an epic's final
+  # pull request does (spec_ship_final), and a `major` one opens as a draft
+  # for a person (adr-20261026-a-task-that-raises-the-version-is-a-release).
+  # An epic is not the default branch: there the release is the epic's own.
+  local raise="" r_file r_old r_new r_level release_hold="" pr_draft="$draft"
+  if [ "$base" = "$(cfg git.base_branch main)" ]; then
+    raise=$(jig_release_raise "$base")
+  fi
+  if [ -n "$raise" ]; then
+    IFS=$'\t' read -r r_file r_old r_new r_level <<EOF
+$raise
+EOF
+    printf 'task ship: this change raises the version in %s: %s -> %s\n' "$r_file" "$r_old" "$r_new"
+    if [ "$level" = merge ] && [ "$draft" -eq 0 ]; then
+      if ! _task_nobody_answers "$id"; then
+        release_hold="this change raises the version; outside an unattended run a release's merge is the human's"
+      elif [ "$(jig_release_merge)" != agent ]; then
+        release_hold="release.merge is human in this clone; the release's merge is the person's"
+      elif [ "$r_level" = major ]; then
+        release_hold="a major release needs a human; the pull request is a draft"
+        pr_draft=1
+        _TASK_SHIP_BODY_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-task-body.XXXXXX")
+        jig_cleanup_add "$_TASK_SHIP_BODY_TMP"
+        {
+          printf 'Needs a human: major release?\n\n'
+          if [ -n "$body_file" ]; then cat "$body_file"; else tail -n +2 "$message_file"; fi
+        } > "$_TASK_SHIP_BODY_TMP"
+        body_file="$_TASK_SHIP_BODY_TMP"
+      fi
+    fi
+  fi
+
+  jig_ship_pr "task ship" "$branch" "$base" "$message_file" "$title" "$body_file" "$pr_draft"
   # The pull request's address, kept so the status page can link it the
   # moment it exists. A fact about what ship did, not a merge state: whether
   # it was merged is still derived by housekeeping every run (ADR-0005).
@@ -4816,6 +5025,10 @@ EOF
   [ "$level" = merge ] || return 0
   if [ "$draft" -eq 1 ]; then
     printf 'not merged: a draft pull request is never merged\n'
+    return 0
+  fi
+  if [ -n "$release_hold" ]; then
+    printf 'not merged: %s\n' "$release_hold"
     return 0
   fi
   # The task's own gates once more, right before the merge: the merge is the

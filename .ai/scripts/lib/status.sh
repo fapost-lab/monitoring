@@ -167,6 +167,33 @@ _status_load() {
   . "$JIG_LIB/hklog.sh"
   # shellcheck source=lib/notify.sh
   . "$JIG_LIB/notify.sh"
+  # The advice line is `jig queue next`'s own answer (_status_next_line).
+  # shellcheck source=lib/queue.sh
+  . "$JIG_LIB/queue.sh"
+}
+
+# The advice line, asked once per page: the report runs in a substitution, so
+# the page asks before it and the report reads the answer back.
+_STATUS_NEXT_SET=""
+_STATUS_NEXT=""
+
+# _status_next_line — the first line `jig queue next` prints for a person
+# (_queue_next, queue.sh), and nothing when the clone has no queue file or the
+# command refuses: the advice is read, never worked out here
+# (adr-20261022-the-next-task-is-advised-from-the-queue), and a queue that
+# cannot be read must not take the report down with it.
+_status_next_line() {
+  if [ -n "$_STATUS_NEXT_SET" ]; then
+    [ -z "$_STATUS_NEXT" ] || printf '%s\n' "$_STATUS_NEXT"
+    return 0
+  fi
+  local file out
+  file=$(jig_queue_file 2>/dev/null) || return 0
+  [ -f "$file" ] || return 0
+  out=$(_QUEUE_AS_JSON="" _queue_next 2>/dev/null) || return 0
+  case "$out" in
+    "next: "*) printf '%s\n' "${out%%$'\n'*}" ;;
+  esac
 }
 
 # _status_report — the plain-text report `jig status` prints. At a terminal
@@ -197,6 +224,7 @@ _status_report() {
     printf '%s\n' "manifest: missing"
   fi
   _status_new_release_hint
+  _status_share_hint
 
   # Drift: one pass over the manifest, then one git process for every file
   # still on disk (jig_hash_list). A manifest_hash_of and a jig_hash per path
@@ -376,6 +404,8 @@ $_STATUS_LIVE
 EOF
   [ "$found" = 1 ] || printf '%s\n' "no active tasks"
   [ "$_STATUS_FINISHED" -gt 0 ] && printf '(%d finished; jig task list --all)\n' "$_STATUS_FINISHED"
+  # Which queued task to take next, when the clone keeps a queue.
+  _status_next_line
 
   printf 'current task: %s\n' "${_STATUS_CURRENT:-$(_status_current_task)}"
   _status_checkout
@@ -436,6 +466,7 @@ _STT_INSTR_OWN=()    # runtimes whose Jig section was changed here
 _STT_AGENT=""        # the agent.git line's value, when it is valid
 _STT_AUTOPILOT=""    # the autopilot.git line's value, when it is valid
 _STT_CURRENT=""      # the current task, when it is not ambiguous
+_STT_NEXT=""         # the advice line's text after "next: ", when the clone has a queue
 _STT_UNSEEN=""       # 1 when the runtime does not name its sessions
 _STT_MODE=""         # the install's mode (copy, link)
 _STT_CURRENT_FW=""   # 1 when the project's framework is the global one
@@ -510,7 +541,7 @@ _status_terminal() {
   _STT_NEED_LEVEL=() _STT_NEED_TEXT=() _STT_NEED_DETAIL=() _STT_TASKS=() _STT_OTHERS=()
   _STT_INSTALL=() _STT_KNOW=() _STT_CFG=() _STT_REST=() _STT_HOOKS=() _STT_INSTR=()
   _STT_INSTR_OWN=()
-  _STT_AGENT="" _STT_CURRENT="" _STT_UNSEEN="" _STT_MODE="" _STT_CURRENT_FW="" _STT_INIT=""
+  _STT_AGENT="" _STT_CURRENT="" _STT_NEXT="" _STT_UNSEEN="" _STT_MODE="" _STT_CURRENT_FW="" _STT_INIT=""
   while IFS= read -r l || [ -n "$l" ]; do
     # A line indented by two spaces belongs to the list named above it
     # (modified:, missing:), which belongs to the drift line before that, or
@@ -625,6 +656,9 @@ _status_terminal() {
         ;;
       "current task: ambiguous"*) _status_need warn "$l" ;;
       "current task: "*) _STT_CURRENT=${l#current task: } ;;
+      # The queue's advice is a fact about the tasks, never something the
+      # reader must do: `next: none` is an answer, not a warning.
+      "next: "*) _STT_NEXT=${l#next: } ;;
       "working here: "*" (jig "*", "*" ago)")
         t=${l#working here: }
         v=${t%% (jig *}
@@ -1008,7 +1042,7 @@ _status_terminal_tasks() {
       notes+=("$t")
     done
   fi
-  [ "$ntasks" -gt 0 ] || [ -n "$finished" ] || [ -n "$_STT_CURRENT" ] || return 0
+  [ "$ntasks" -gt 0 ] || [ -n "$finished" ] || [ -n "$_STT_CURRENT" ] || [ -n "$_STT_NEXT" ] || return 0
   out_section "Tasks" "$counts"
   w=20
   for id in "${ids[@]+"${ids[@]}"}"; do
@@ -1051,6 +1085,7 @@ _status_terminal_tasks() {
       _status_terminal_task_row "$t" "${classes[$i]}" "$w" "${ids[$i]}" "${notes[$i]}"
     done
   done
+  [ -z "$_STT_NEXT" ] || out_row dim 4 "$OUT_MARK" plain 0 "next: $_STT_NEXT"
   [ -z "$_STT_CURRENT" ] || out_row dim 4 "$OUT_MARK" plain 0 "current task: $_STT_CURRENT"
 }
 
@@ -1609,6 +1644,8 @@ _status_html_page() {
   # substitution, which does not inherit it.
   # The tasks, read once for the report and the sections below.
   _status_live_collect page
+  _STATUS_NEXT=$(_status_next_line)
+  _STATUS_NEXT_SET=1
   report=$(set -e; _status_report)
 
   _status_hk_load
@@ -1915,6 +1952,20 @@ _status_attention() {
       "jig self-update, then jig upgrade"
   fi
 
+  # 0b. This project's Jig is older than the one on this machine (task
+  # status-json-upgrade-available): the text report says so in its
+  # `framework versions:` line, and a program reading many projects needs the
+  # same as an item. Only when both are release versions and this machine's
+  # is newer; the other direction is `jig self-update`, which the release
+  # item already names.
+  local up_from up_to
+  if up_from=$(_status_project_behind); then
+    up_to=${up_from#* }
+    up_from=${up_from%% *}
+    _status_attn upgrade-available project "" "" "Jig in this project is older than on this machine" \
+      "this project runs $up_from; this machine has $up_to" "jig upgrade"
+  fi
+
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _status_rec "$rec"
@@ -2147,7 +2198,7 @@ _status_attention_phase_stops() {
 
 # _status_json [--json] — the producer json_run runs for `jig status --json`.
 _status_json() {
-  local arg attn rec kind stype sid tasks title detail todo url objs="" o t tl hk stale root
+  local arg attn rec kind stype sid tasks title detail todo url objs="" o t tl hk stale root vers
   for arg in "$@"; do
     [ "$arg" = --json ] || jig_fail usage "status --json: unknown argument: $arg (usage: jig status --json)"
   done
@@ -2194,7 +2245,14 @@ REC
     json_quote "$title"; o="$o,\"title\":$_JSON"
     json_str_or_null "$detail"; o="$o,\"detail\":$_JSON"
     json_quote "$todo"; o="$o,\"todo\":$_JSON"
-    json_str_or_null "$url"; o="$o,\"url\":$_JSON}"
+    json_str_or_null "$url"; o="$o,\"url\":$_JSON"
+    # The one kind with data of its own: both versions, so a program shows
+    # them without reading `detail`, whose words may change.
+    if [ "$kind" = upgrade-available ] && vers=$(_status_project_behind); then
+      json_quote "${vers%% *}"; o="$o,\"versions\":{\"from\":$_JSON"
+      json_quote "${vers#* }"; o="$o,\"to\":$_JSON}"
+    fi
+    o="$o}"
     objs="$objs${objs:+,}$o"
   done <<ATTN
 $attn
@@ -2589,6 +2647,7 @@ _status_html_phases() {
 _status_html_summary() {
   printf '<section id="summary">\n<h2>At a glance</h2>\n<dl class="summary">\n'
   _status_html_item "Current task" "$_STATUS_CURRENT" 0
+  [ -z "$_STATUS_NEXT" ] || _status_html_item "Next task" "${_STATUS_NEXT#next: }" 0
   _status_html_count "Knowledge awaiting decision" "$_SC_PROPOSALS"
   _status_html_count "Linked sources changed" "$_SC_SOURCES"
   _status_html_count "Needs consolidation" "$(_status_hk_count needs-consolidation)"
@@ -2647,6 +2706,23 @@ _status_framework_versions() {
   printf '%s\n' "hint: run \`jig self-update\`, then \`jig upgrade --dry-run\`"
 }
 
+# _status_project_behind — "<project> <global>" when this project's installed
+# Jig (the manifest's jig.version) is an older release than the global
+# framework this checkout uses; fails, printing nothing, otherwise — no
+# manifest, no global, equal, newer, or a version that is not a release.
+# Read, never run, as _status_framework_versions reads it.
+_status_project_behind() {
+  local project global_exe global
+  manifest_exists || return 1
+  project=$(manifest_header_get jig.version) || return 1
+  global_exe=$(jig_global_executable) || return 1
+  global=$(jig_declared_version "${global_exe%/scripts/jig}") || return 1
+  jig_release_version "v$global" >/dev/null 2>&1 || return 1
+  jig_release_version "v$project" >/dev/null 2>&1 || return 1
+  jig_version_newer "$global" "$project" || return 1
+  printf '%s %s\n' "$project" "$global"
+}
+
 # _status_latest_release_available — the version housekeeping's daily
 # release check (.ai/runtime/latest-release, _hk_check_latest_release in
 # housekeeping.sh) found strictly newer than the global framework this
@@ -2676,6 +2752,19 @@ _status_latest_release_available() {
   jig_release_version "v$global" >/dev/null 2>&1 || return 1
   jig_version_newer "$latest" "$global" || return 1
   printf '%s\n' "$latest"
+}
+
+# _status_share_hint — a line per directory `worktree.share` should name and
+# does not (jig_share_candidates): without it a task worktree has no packages.
+# The key is the team's, in .ai/config.yaml, so it is named, not written.
+_status_share_hint() {
+  local dir
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    printf '%s\n' "hint: $dir/ holds separate repositories a task worktree cannot reach; add \`worktree.share: [$dir]\` to $JIG_AI_DIR/config.yaml"
+  done <<EOF
+$(jig_share_candidates "$JIG_PROJECT")
+EOF
 }
 
 # _status_new_release_hint — the one line the plain-text report shows when
