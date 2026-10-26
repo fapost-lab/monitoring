@@ -9,7 +9,7 @@ return [
     | Route middleware
     |--------------------------------------------------------------------------
     |
-    | Every operator screen of this package (Pulse, Telescope, the log viewer) runs this list first, then
+    | Every operator screen of this package (Pulse, Telescope, the log viewer, the health page) runs this list first, then
     | `before_gate`, then its own check of the operator access contract.
     |
     | `middleware` is where an installation that serves tenants on hosts of their own puts the guard
@@ -59,6 +59,7 @@ return [
             '#^([^/]*)/webhook/#',
             '#^([^/]*)/log-viewer#',
             '#^([^/]*)/telescope#',
+            '#^([^/]*)/monitoring/health#',
         ],
     ],
 
@@ -121,6 +122,7 @@ return [
             'webhook/*',
             'pulse*',
             'log-viewer*',
+            'monitoring/health*',
             '_boost*',
             '.well-known*',
         ],

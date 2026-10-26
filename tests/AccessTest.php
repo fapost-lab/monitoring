@@ -6,6 +6,7 @@ namespace Fapost\Monitoring\Tests;
 
 use Fapost\Foundation\Operator\Contracts\OperatorAccessInterface;
 use Fapost\Foundation\Operator\Enums\OperatorSurface;
+use Fapost\Monitoring\Http\Middleware\AllowHealth;
 use Fapost\Monitoring\Http\Middleware\AllowLogs;
 use Fapost\Monitoring\Http\Middleware\AllowPulse;
 use Illuminate\Http\Request;
@@ -135,6 +136,9 @@ final class AccessTest extends TestCase
                 ++$checked;
             } elseif ('pulse' === $uri) {
                 $this->assertContains(AllowPulse::class, $middleware, $uri);
+                ++$checked;
+            } elseif (str_starts_with($uri, 'monitoring/health')) {
+                $this->assertContains(AllowHealth::class, $middleware, $uri);
                 ++$checked;
             }
         }

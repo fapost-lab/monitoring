@@ -1,4 +1,7 @@
 <x-pulse>
+    {{-- Shown only to whoever the contract lets see the Health surface; lazy, since a cold probe can take seconds. --}}
+    <livewire:fapost.health cols="full" lazy />
+
     <livewire:pulse.servers cols="full" />
 
     @if (class_exists(\Laravel\Reverb\Pulse\Livewire\Connections::class))

@@ -7,7 +7,7 @@ does not belong here.
 
 ## Domains
 
-**Operator screens** (`src/`): wires Laravel Pulse, Laravel Telescope and the log viewer into an installation and puts
+**Operator screens** (`src/`): wires Laravel Pulse, Laravel Telescope and the log viewer into an installation, renders the installation's health from a Foundation contract, and puts
 the operator access contract in front of them. It owns no sign-in, no users and no policy: who may look
 is answered by `Fapost\Foundation\Operator\Contracts\OperatorAccessInterface`, bound by Core (default)
 or an operator layer (SaaS). It must not know Core's classes or the tenancy mode.
@@ -27,6 +27,9 @@ rejected for v0.1.0 as too wide a change, and stays a candidate.
   (contract; 404 on no, error or no binding) → Pulse's own `viewPulse` gate (also asks the contract) → screen.
 - Livewire card update → `/livewire/update` → Livewire re-applies the screen's middleware **by class name**,
   parameters dropped: hence one middleware class per surface, never a parameterised one.
+- Health card (Pulse's dashboard, lazy; or `/monitoring/health` behind `AllowHealth`) → contract check for
+  `OperatorSurface::Health` → `HealthReader` → Foundation's `InstallationHealthInterface` (bound by Core; unbound in a
+  Core that predates it) → rows; refreshed by a Livewire poll every 15 s (the contract asks for no more than every 5 s).
 - App process → Pulse recorders → Redis stream (`<REDIS_PREFIX>laravel:pulse:ingest`) → `pulse:work` daemon →
   `pulse_*` tables on `landlord`.
 - App process (request, job, command) → Telescope watchers → `RecordingFilter` (everything only under `record_all`)

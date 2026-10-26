@@ -13,7 +13,7 @@ installation and want more than that page shows.
 same contract (`OperatorAccessInterface`, surface `OperatorSurface::Horizon`): every installation needs the
 queue workers, with or without this package.
 
-> **Status:** Pulse and the log viewer since v0.1.0; Telescope from the next release. The plan is the spec
+> **Status:** Pulse and the log viewer since v0.1.0; Telescope and installation health from the next release. The plan is the spec
 > [`installation-health`](https://github.com/fapost-lab/core/tree/main/.ai/specs/installation-health)
 > in FaPost Core (phase 3).
 
@@ -23,6 +23,9 @@ queue workers, with or without this package.
   outgoing requests, exceptions, queues, cache, usage, and Reverb's connection and message cards when
   `laravel/reverb` is installed.
 - **Telescope** at `/telescope`, **off by default** in every environment (see [Telescope](#telescope)).
+- **Installation health**: the state of live updates (Reverb), the webhook gateway, the webhook registry and the
+  queues, with the reason and the figures each probe measured — a card at the top of Pulse's dashboard and a page of
+  its own at `/monitoring/health` (see [Installation health](#installation-health)).
 - **Log viewer** at `/log-viewer` ([opcodesio/log-viewer](https://github.com/opcodesio/log-viewer)),
   **off by default** and read-only when on (no download, no delete; a published `monitoring.logs.read_only` can lift it). Its assets are published to `public/vendor/log-viewer` by the `extra.fapost.post-install` step (`log-viewer:publish`) of the image build.
 
@@ -66,13 +69,16 @@ capacity planning.
 ## Who may open it
 
 Nobody signs in here. Every request is put to Foundation's `OperatorAccessInterface` for the surface
-(`OperatorSurface::Pulse`, `::Telescope`, `::Logs`):
+(`OperatorSurface::Pulse`, `::Telescope`, `::Logs`, `::Health`):
 
 - Core's default: the signed-in staff member who holds the operator-screens permission on a `single`
   installation; closed on a `host` one.
 - An operator layer (the SaaS package) binds its own answer for its operators; tenants' administrators
   never pass in `host` mode.
 - Anything else, an error, or no binding: **404**.
+
+The health card on Pulse's dashboard asks for `OperatorSurface::Health` as well, on every refresh: whoever may open
+Pulse but not Health sees no card, and nothing is read for them.
 
 Two lists in `config/monitoring.php` let the host application add its own steps, by class name:
 `middleware` (default `['web']`; put the guard that keeps operator routes off tenant hosts here) and
@@ -92,6 +98,25 @@ Two lists in `config/monitoring.php` let the host application add its own steps,
 | `MONITORING_TELESCOPE_KEEP_HOURS` | `48` | entries older than this are pruned daily; `0` schedules no prune |
 | `MONITORING_PULSE_ALLOW_CACHED_CLASSES` | `true` | adds the classes Pulse's cards cache to `cache.serializable_classes` (see below) |
 | `PULSE_STORAGE_KEEP` | `7 days` | Pulse's own retention (trimmed by `pulse:work`) |
+
+## Installation health
+
+FaPost Core reports the health of the whole installation through Foundation's `InstallationHealthInterface` (since
+Foundation 0.34, `@experimental`); this package only renders it. Each service shows its state — `up`, `down`,
+`unknown` (its source could not be read: unreachable, timed out, not configured), `disabled` (switched off on
+purpose) — with the one-sentence reason, what was asked (host and port, never a credential) and when, and its figures:
+connections and channels for Reverb, the spec status per platform for the gateway, missing, stale and orphaned routes
+for the registry, wait, throughput and failed jobs for the queues.
+
+- A figure the probe could not measure is shown as **not measured**, never as 0.
+- A service the installation does not probe is **not monitored**, never up.
+- A Core that predates the contract binds nothing: the card says the figures are **not available in this version of
+  FaPost Core**. A report that cannot be read says so; neither is an error.
+- The card refreshes every 15 seconds and loads after the rest of Pulse's dashboard: a probe with a cold cache can
+  take a few seconds. The figures are counts and platform or queue names, never a tenant's id or a channel's name.
+
+The page at `/monitoring/health` is the same card on its own, for an operator who may see Health but not Pulse, or an
+installation that switched Pulse off (`MONITORING_PULSE_ENABLED=false`).
 
 ## Pulse's cards and Laravel 13's cache
 
@@ -181,6 +206,13 @@ payload, a job's data, a mail's body and SQL bindings are kept as they are, when
 is monitored. Not masked either: anything else a body, a query or a mail carries (names, addresses, message texts).
 Switch Telescope on only where everyone the contract lets in may read all of that.
 
+**On a multi-tenant production installation (`host` mode, SaaS), keep Telescope off.** Even outside `record_all` it
+writes the payload of exceptions and failed jobs — the data of the tenants' customers — into the installation-wide
+`landlord` database, and it adds a write on the hot path of every request and job. Use error reporting (Sentry) and
+the logs for errors, Pulse for load and Horizon for the queues. Switch it on only for the time it takes to look at an
+incident, then off again. On a self-hosted `single` installation it is the owner's call. The package does not enforce
+this: it is a recommendation, not a check.
+
 Outside `record_all`, a failed job shows as its exception entry: Telescope records the job itself as pending,
 which the filter drops, and its later "failed" update has no entry to land on.
 
@@ -206,7 +238,7 @@ in may read all of that, and look at real log content first. It is read-only, bu
 
 - PHP `^8.4`
 - Laravel `^12 || ^13`
-- `fapost/foundation` `>=0.29`
+- `fapost/foundation` `>=0.34`
 - Redis and PostgreSQL (or MySQL/SQLite for tests) with the `landlord` connection of FaPost Core; Pulse's
   tables name the connection through `MONITORING_PULSE_CONNECTION`
 - `laravel/reverb` (optional) for the two Reverb cards

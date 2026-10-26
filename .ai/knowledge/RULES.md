@@ -7,7 +7,8 @@ are added as sections of this file.
 ## Invariants
 
 - No `App\*` reference anywhere in the package. Enforced: `tests/BoundaryTest.php`.
-- Every operator screen is reachable only through its surface middleware (`AllowPulse`, `AllowTelescope`, `AllowLogs`), which asks
+- Every operator screen is reachable only through its surface middleware (`AllowPulse`, `AllowTelescope`, `AllowLogs`,
+  `AllowHealth`), which asks
   the contract and answers 404 on no, on an exception and when nothing is bound. Enforced: `tests/AccessTest.php`.
 - Pulse, Telescope and log-viewer tables/files are never written to a tenant schema; the migrations run on `landlord`.
   Enforced: `tests/StorageTest.php`, `tests/TelescopeRecordingTest.php`.
@@ -19,6 +20,13 @@ are added as sections of this file.
   `TELESCOPE_ENABLED` does not decide. Enforced: `tests/DefaultsTest.php`.
 
 ## Rules
+
+- **Installation health is rendered, never computed, here.** The figures come only from Foundation's
+  `InstallationHealthInterface` (`HealthReader`): unbound means "not available in this version of Core", a throw means
+  "could not be read", an unknown enum case shows as unknown, a missing service as "not monitored", a null figure as
+  "not measured" — never folded into up or 0. The health card is on a screen of another surface (Pulse's dashboard),
+  so it asks the contract for `OperatorSurface::Health` itself on every render and reads nothing without it.
+  Enforced: `tests/HealthTest.php`.
 
 - A screen middleware that Livewire must repeat takes no parameters (Livewire drops them). Enforced: the
   Livewire update tests in `tests/AccessTest.php`.
