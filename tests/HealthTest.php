@@ -144,6 +144,54 @@ final class HealthTest extends TestCase
         Livewire::test(HealthCard::class)->assertSee('Installation health')->assertSee('Webhook gateway');
     }
 
+    public function test_fractions_keep_their_precision_and_whole_floats_lose_the_trailing_zero(): void
+    {
+        $this->bindReport(new InstallationHealthReport([
+            new ServiceHealth(MonitoredService::Queues, HealthState::Up, 'All good.', new DateTimeImmutable(), null, [
+                new HealthMetric('wait_seconds', 0.04, HealthUnit::Seconds, 'default'),
+                new HealthMetric('wait_seconds', 12.5, HealthUnit::Seconds, 'high'),
+                new HealthMetric('wait_seconds', 10.0, HealthUnit::Seconds, 'low'),
+            ]),
+        ], new DateTimeImmutable()));
+        $this->open = [OperatorSurface::Health];
+
+        $html = $this->get(self::PATH)->assertOk()->getContent();
+
+        $this->assertStringContainsString('0.04 s', $html);
+        $this->assertStringContainsString('12.5 s', $html);
+        $this->assertMatchesRegularExpression('#>10 s</span>#', $html);
+    }
+
+    public function test_the_time_of_the_report_names_its_zone(): void
+    {
+        $this->bindReport($this->report());
+        $this->open = [OperatorSurface::Health];
+
+        $html = $this->get(self::PATH)->assertOk()->getContent();
+
+        $this->assertMatchesRegularExpression('#as of \d{2}:\d{2}:\d{2} UTC#', $html);
+    }
+
+    public function test_the_page_has_its_own_title_and_no_period_selector(): void
+    {
+        $this->bindReport($this->report());
+        $this->open = [OperatorSurface::Health];
+
+        $this->get(self::PATH)->assertOk()
+            ->assertSee('<title>Installation health</title>', false)
+            ->assertDontSee('Laravel</b> Pulse', false)
+            ->assertDontSee('period-selector', false);
+    }
+
+    public function test_the_lazy_placeholder_is_empty_without_the_health_surface(): void
+    {
+        $this->open = [OperatorSurface::Pulse];
+        $this->assertStringNotContainsString('animate-pulse', (string) (new HealthCard())->placeholder()->render());
+
+        $this->open = [OperatorSurface::Health];
+        $this->assertStringContainsString('animate-pulse', (string) (new HealthCard())->placeholder()->render());
+    }
+
     public function test_pulses_dashboard_carries_the_card(): void
     {
         $this->open = [OperatorSurface::Pulse];

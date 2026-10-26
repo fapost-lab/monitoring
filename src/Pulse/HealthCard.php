@@ -20,6 +20,19 @@ use Laravel\Pulse\Livewire\Card;
  */
 final class HealthCard extends Card
 {
+    /**
+     * The lazy placeholder: nothing for an operator without the Health surface, so Pulse's dashboard does not flash a
+     * skeleton at someone who then gets an empty card.
+     */
+    public function placeholder(): Renderable
+    {
+        if (! app(OperatorGate::class)->allows(request(), OperatorSurface::Health)) {
+            return View::make('monitoring::health.hidden');
+        }
+
+        return parent::placeholder();
+    }
+
     public function render(): Renderable
     {
         if (! app(OperatorGate::class)->allows(request(), OperatorSurface::Health)) {
