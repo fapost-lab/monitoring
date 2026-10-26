@@ -2,16 +2,18 @@
 
 `fapost/monitoring` is the optional package for whoever wants **full control over a running
 installation**: [Laravel Pulse](https://laravel.com/docs/pulse) (server load, slow requests and
-jobs, exceptions, Reverb's connection and message cards), a log viewer, and the operator tools that
-come later (Horizon's screens, Telescope) — all behind one switch.
+jobs, exceptions, Reverb's connection and message cards), [Laravel Telescope](https://laravel.com/docs/telescope)
+(off by default) and a log viewer (off by default) — all behind one operator access contract.
 
 FaPost Core already has a health page of its own in the console (Reverb, the webhook gateway,
 the queues) that every installation gets. This package is for the people who run the
 installation and want more than that page shows.
 
-> **Status: v0.1.0.** Pulse and an (off by default) log viewer, behind the operator access contract.
-> Horizon's access and Telescope are not part of this package yet: Horizon's gate lives in Core, and
-> Telescope moves here later. The plan is the spec
+**Horizon is not part of this package.** Its supervisors and its dashboard stay in FaPost Core, behind the
+same contract (`OperatorAccessInterface`, surface `OperatorSurface::Horizon`): every installation needs the
+queue workers, with or without this package.
+
+> **Status:** Pulse and the log viewer since v0.1.0; Telescope from the next release. The plan is the spec
 > [`installation-health`](https://github.com/fapost-lab/core/tree/main/.ai/specs/installation-health)
 > in FaPost Core (phase 3).
 
@@ -20,16 +22,17 @@ installation and want more than that page shows.
 - **Pulse** at `/pulse`: server load (CPU, memory, disk), slow requests, slow jobs, slow queries, slow
   outgoing requests, exceptions, queues, cache, usage, and Reverb's connection and message cards when
   `laravel/reverb` is installed.
+- **Telescope** at `/telescope`, **off by default** in every environment (see [Telescope](#telescope)).
 - **Log viewer** at `/log-viewer` ([opcodesio/log-viewer](https://github.com/opcodesio/log-viewer)),
   **off by default** and read-only when on (no download, no delete; a published `monitoring.logs.read_only` can lift it). Its assets are published to `public/vendor/log-viewer` by the `extra.fapost.post-install` step (`log-viewer:publish`) of the image build.
 
-Both answer **404** to anyone the contract does not let in, and to everyone when no contract is bound.
+Each answers **404** to anyone the contract does not let in, and to everyone when no contract is bound.
 
 ## Install
 
 ```
 composer require fapost/monitoring
-php artisan migrate --database=landlord --force   # the pulse_* tables, never in a tenant schema
+php artisan migrate --database=landlord --force   # the pulse_* and telescope_* tables, never in a tenant schema
 ```
 
 In FaPost Core, use the composer overlay (`composer.overlay.json` with the package in `require`), as for
@@ -63,7 +66,7 @@ capacity planning.
 ## Who may open it
 
 Nobody signs in here. Every request is put to Foundation's `OperatorAccessInterface` for the surface
-(`OperatorSurface::Pulse`, `::Logs`):
+(`OperatorSurface::Pulse`, `::Telescope`, `::Logs`):
 
 - Core's default: the signed-in staff member who holds the operator-screens permission on a `single`
   installation; closed on a `host` one.
@@ -83,6 +86,10 @@ Two lists in `config/monitoring.php` let the host application add its own steps,
 | `MONITORING_PULSE_CONNECTION` | `landlord` | where the tables live |
 | `PULSE_INGEST_DRIVER` | `redis` | `storage` writes in the request, without the daemon |
 | `MONITORING_LOGS_ENABLED` | `false` | the log viewer's routes exist only when `true` |
+| `MONITORING_TELESCOPE_ENABLED` | `false` | Telescope records and has routes only when `true`; Telescope's own `TELESCOPE_ENABLED` no longer decides |
+| `MONITORING_TELESCOPE_CONNECTION` | `landlord` | where the `telescope_*` tables live |
+| `MONITORING_TELESCOPE_RECORD_ALL` | unset | unset: everything on a `local` machine, elsewhere only what went wrong (see below); `true`/`false` decide it |
+| `MONITORING_TELESCOPE_KEEP_HOURS` | `48` | entries older than this are pruned daily; `0` schedules no prune |
 | `MONITORING_PULSE_ALLOW_CACHED_CLASSES` | `true` | adds the classes Pulse's cards cache to `cache.serializable_classes` (see below) |
 | `PULSE_STORAGE_KEEP` | `7 days` | Pulse's own retention (trimmed by `pulse:work`) |
 
@@ -136,6 +143,47 @@ lines; the Usage card shows the ids of signed-in users as a short label (see [Us
 The tables are part of the database dump a deploy takes; seven days of entries is small at one installation's
 scale.
 
+## Telescope
+
+Telescope records request contents: payloads, SQL with its bindings, mails and notifications, the signed-in
+user's id, name and e-mail — of every tenant, into one installation-wide table. That is why it is **off by
+default, on a developer's machine too**, and why switching it on in production is a decision for the time it
+takes to look at a problem: `MONITORING_TELESCOPE_ENABLED=true`, then `false` again (and a restart, or
+`config:cache`). Off means no routes (404) and no recording; what was recorded expires with the prune.
+
+When it is on:
+
+- **Who may open it**: only whoever the contract lets in for `OperatorSurface::Telescope`, on a `local` machine
+  as well (Telescope's own "open on a local machine" is replaced). A host's own `Telescope::auth()` does not win.
+- **Where**: `telescope_*` tables on `landlord` (`MONITORING_TELESCOPE_CONNECTION`). The migration creates each
+  table only if it is missing (an installation of FaPost Core already has them) and its rollback drops nothing.
+- **What is kept**: everything when `record_all` holds (by default on `local`); otherwise only reportable
+  exceptions, failed requests (5xx), failed jobs, scheduled tasks and entries tagged for monitoring (from
+  Telescope's own screen). In that mode the cache, dump, event, gate, model, Redis and view watchers are off
+  (`monitoring.telescope.quiet_watchers`).
+- **How long**: `telescope:prune --hours=48` daily (`MONITORING_TELESCOPE_KEEP_HOURS`), scheduled also while
+  Telescope is off. The installation's scheduler (`schedule:work` or cron) must run.
+- **Never recorded**: the support access entry (`support/enter`), the webhook ingress (`webhook/*`), Pulse, the log
+  viewer and Telescope itself.
+- **Masked, in every environment**:
+  - request and response parameters `_token`, `token`, `secret_token`, `password`, `password_confirmation`,
+    `current_password`, `secret`, `client_secret`, `access_token`, `refresh_token`, `api_key`, `signature`;
+  - headers `cookie`, `authorization`, `php-auth-pw`, `x-csrf-token`, `x-xsrf-token`,
+    `x-telegram-bot-api-secret-token`;
+  - the same keys in a request's or an outgoing call's **query string**, and a bot token in a URL path
+    (`/bot<id>:<token>`) wherever it appears (an outgoing URL, an exception or log message).
+
+  `monitoring.telescope.hidden.*` adds to these lists, never removes from them.
+
+Masking applies to new entries and to the updates Telescope writes into them later (a failed job's exception).
+Parameters are matched by their top-level key (or a dot path added to the list): the same name nested deeper in a
+payload, a job's data, a mail's body and SQL bindings are kept as they are, whenever everything is recorded or a tag
+is monitored. Not masked either: anything else a body, a query or a mail carries (names, addresses, message texts).
+Switch Telescope on only where everyone the contract lets in may read all of that.
+
+Outside `record_all`, a failed job shows as its exception entry: Telescope records the job itself as pending,
+which the filter drops, and its later "failed" update has no entry to land on.
+
 ## Logs hold secrets
 
 Exceptions in `storage/logs` carry messages, stack traces and context arrays that can contain tokens,
@@ -171,7 +219,7 @@ Fapost\Monitoring\   →  src/
 
 ## Licence
 
-Apache-2.0, like Core, Foundation and Support. The software it wires — Pulse, Horizon, the log
+Apache-2.0, like Core, Foundation and Support. The software it wires — Pulse, Telescope, the log
 viewer — is MIT-licensed. The FaPost name and logo are covered by the
 [Trademark Policy](https://github.com/fapost-lab/core/blob/main/TRADEMARK.md), not by this
 licence.

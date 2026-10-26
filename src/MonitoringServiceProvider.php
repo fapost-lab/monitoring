@@ -9,9 +9,15 @@ use Fapost\Foundation\Operator\Enums\OperatorSurface;
 use Fapost\Monitoring\Access\OperatorGate;
 use Fapost\Monitoring\Http\Middleware\AllowLogs;
 use Fapost\Monitoring\Http\Middleware\AllowPulse;
+use Fapost\Monitoring\Http\Middleware\AllowTelescope;
 use Fapost\Monitoring\Pulse\NeutralUsers;
+use Fapost\Monitoring\Telescope\RecordingFilter;
+use Fapost\Monitoring\Telescope\RedactingEntriesRepository;
+use Fapost\Monitoring\Telescope\Redactor;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\View;
@@ -29,11 +35,17 @@ use Laravel\Pulse\Recorders\UserRequests;
 use Laravel\Pulse\Users;
 use Laravel\Reverb\Pulse\Recorders\ReverbConnections;
 use Laravel\Reverb\Pulse\Recorders\ReverbMessages;
+use Laravel\Telescope\Contracts\ClearableRepository;
+use Laravel\Telescope\Contracts\EntriesRepository;
+use Laravel\Telescope\Contracts\PrunableRepository;
+use Laravel\Telescope\Http\Middleware\Authorize as TelescopeAuthorize;
+use Laravel\Telescope\Telescope;
+use Laravel\Telescope\TelescopeServiceProvider;
 use Opcodes\LogViewer\LogViewerServiceProvider;
 use stdClass;
 
 /**
- * Pulse and a log viewer behind the operator access contract.
+ * Pulse, Telescope and a log viewer behind the operator access contract.
  *
  * There is no sign-in here: every screen asks {@see \Fapost\Foundation\Operator\Contracts\OperatorAccessInterface}
  * (through {@see OperatorGate}) and answers 404 when it says no or cannot say. The third-party providers are
@@ -60,11 +72,13 @@ final class MonitoringServiceProvider extends ServiceProvider
 
         $this->app->register(PulseServiceProvider::class);
         $this->app->register(LogViewerServiceProvider::class);
+        $this->app->register(TelescopeServiceProvider::class);
 
         $config = $this->app->make('config');
 
         $this->configurePulse($config);
         $this->configureLogViewer($config);
+        $this->configureTelescope($config);
     }
 
     public function boot(): void
@@ -80,7 +94,14 @@ final class MonitoringServiceProvider extends ServiceProvider
             $gate = $this->app->make(OperatorGate::class);
 
             Gate::define('viewPulse', static fn (mixed $user = null): bool => $gate->allows(request(), OperatorSurface::Pulse));
+            Gate::define('viewTelescope', static fn (mixed $user = null): bool => $gate->allows(request(), OperatorSurface::Telescope));
+
+            // Telescope keeps its authorization in static state, and a host's TelescopeApplicationServiceProvider
+            // sets it while booting ("open on a local machine"): this one is set last, and asks the contract only.
+            Telescope::auth(static fn (Request $request): bool => $gate->allows($request, OperatorSurface::Telescope));
         });
+
+        $this->schedulePrune();
     }
 
     private function configurePulse(Repository $config): void
@@ -209,6 +230,98 @@ final class MonitoringServiceProvider extends ServiceProvider
                 $config->set($key, ['enabled' => true, 'sample_rate' => 1]);
             }
         }
+    }
+
+    /**
+     * Telescope is off unless `monitoring.telescope.enabled` says so: its own `TELESCOPE_ENABLED` (on by default)
+     * no longer decides. Its entries live on `landlord`; its routes run the installation's stack, then the
+     * contract's check (404), then Telescope's own gate; secrets are masked in every environment.
+     */
+    private function configureTelescope(Repository $config): void
+    {
+        $config->set('telescope.enabled', (bool) $config->get('monitoring.telescope.enabled', false));
+        $config->set('telescope.storage.database.connection', $config->get('monitoring.telescope.connection', 'landlord'));
+
+        $config->set('telescope.middleware', [
+            ...(array) $config->get('monitoring.middleware', ['web']),
+            ...(array) $config->get('monitoring.before_gate', []),
+            AllowTelescope::class,
+            TelescopeAuthorize::class,
+        ]);
+
+        $config->set('telescope.ignore_paths', array_values(array_unique([
+            ...(array) $config->get('telescope.ignore_paths', []),
+            ...(array) $config->get('monitoring.telescope.ignore_paths', []),
+        ])));
+
+        if (! RecordingFilter::recordsAll($this->app)) {
+            foreach ((array) $config->get('monitoring.telescope.quiet_watchers', []) as $watcher) {
+                $key     = 'telescope.watchers.' . $watcher;
+                $current = $config->get($key);
+
+                $config->set($key, is_array($current) ? [...$current, 'enabled' => false] : false);
+            }
+        }
+
+        $parameters = $this->hidden($config, 'parameters', Redactor::PARAMETERS);
+
+        // Telescope merges these lists into static state: a host's own additions are kept, never replaced.
+        Telescope::hideRequestParameters($parameters);
+        Telescope::hideRequestHeaders($this->hidden($config, 'headers', Redactor::HEADERS));
+        Telescope::hideResponseParameters($this->hidden($config, 'response_parameters', Redactor::RESPONSE_PARAMETERS));
+
+        Telescope::filter((new RecordingFilter())(...));
+
+        $this->redactStorage(new Redactor(array_map(mb_strtolower(...), $parameters)));
+    }
+
+    /**
+     * Everything Telescope writes goes through the redactor: new entries and the updates written into them later
+     * (a filter sees new entries only). Telescope's own database storage, replaced by a subclass that masks first;
+     * another driver chosen by the installation is left alone.
+     */
+    private function redactStorage(Redactor $redactor): void
+    {
+        if ('database' !== $this->app->make('config')->get('telescope.driver', 'database')) {
+            return;
+        }
+
+        $this->app->singleton(RedactingEntriesRepository::class, static function (Application $app) use ($redactor): RedactingEntriesRepository {
+            $config = $app->make('config');
+            $chunk  = $config->get('telescope.storage.database.chunk');
+
+            return (new RedactingEntriesRepository((string) $config->get('telescope.storage.database.connection'), null === $chunk ? null : (int) $chunk))
+                ->redactWith($redactor);
+        });
+
+        foreach ([EntriesRepository::class, ClearableRepository::class, PrunableRepository::class] as $contract) {
+            $this->app->singleton($contract, static fn (Application $app): RedactingEntriesRepository => $app->make(RedactingEntriesRepository::class));
+        }
+    }
+
+    /**
+     * @param  list<string>  $base
+     *
+     * @return list<string>
+     */
+    private function hidden(Repository $config, string $list, array $base): array
+    {
+        return array_values(array_unique([...$base, ...array_map(strval(...), (array) $config->get('monitoring.telescope.hidden.' . $list, []))]));
+    }
+
+    /**
+     * Telescope prunes nothing by itself. The prune is scheduled whether Telescope is on or not, so that entries
+     * kept before it was switched off expire as well; the package's migration makes the tables either way.
+     */
+    private function schedulePrune(): void
+    {
+        $this->callAfterResolving(Schedule::class, function (Schedule $schedule): void {
+            $hours = (int) $this->app->make('config')->get('monitoring.telescope.keep_hours', 48);
+
+            if ($hours > 0) {
+                $schedule->command('telescope:prune', ['--hours' => $hours])->daily();
+            }
+        });
     }
 
     private function configureLogViewer(Repository $config): void
