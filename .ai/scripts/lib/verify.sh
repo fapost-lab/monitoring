@@ -143,11 +143,12 @@ _verify_map_apply() {
 
 # _verify_busy_claim <dir> — take the record, or fail.
 #
-# `mkdir` is the claim. Under ADR-0002 it is the one atomic primitive available
-# on POSIX and in Git Bash alike, and atomicity is the whole point: with a plain
-# flag file, eight waiters wake together when the holder leaves and produce the
-# eight simultaneous sets again. The kernel is the arbiter, so the reclaim of an
-# expired record races safely too.
+# Creating `busy/run` exclusively is the claim (jig_claim_file,
+# adr-20261023-a-claim-is-an-exclusive-create); `busy/` is only its container.
+# Atomicity is the whole point: with a plain flag file, eight waiters wake
+# together when the holder leaves and produce the eight simultaneous sets
+# again. The kernel is the arbiter, so the reclaim of an expired record races
+# safely too.
 #
 # The body is written straight into the claimed directory rather than through a
 # temporary: only the claimant can write there, a reader that catches a partial
@@ -155,8 +156,10 @@ _verify_map_apply() {
 # for good.
 _verify_busy_claim() {
   local dir="$1"
-  mkdir "$dir/busy" 2>/dev/null || return 1
+  mkdir -p "$dir/busy" 2>/dev/null || return 1
+  jig_claim_file "$dir/busy/run" || return 1
   printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$" > "$dir/busy/run" 2>/dev/null || {
+    rm -f "$dir/busy/run" 2>/dev/null || true
     rmdir "$dir/busy" 2>/dev/null || true
     return 1
   }
@@ -224,8 +227,8 @@ _verify_busy_acquire() {
     holder=$(jig_verify_busy_holder "$dir" "$ttl") || holder=""
     if [ -z "$holder" ]; then
       # Nobody live is behind the record: take it back, by the two bounded
-      # deletions above, and let the loop claim it. `mkdir` still decides
-      # between two reclaimers.
+      # deletions above, and let the loop claim it. The exclusive create of
+      # `busy/run` still decides between two reclaimers.
       _verify_busy_release "$dir"
       # Neither claiming nor reclaiming worked, and nobody is holding it: the
       # filesystem is answering no, not another run. A few attempts allow for

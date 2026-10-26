@@ -1,6 +1,6 @@
 ---
 name: jig-task
-description: Start or resume a task with Jig — classify it by risk, create its workspace and choose the workflow. Use when the user describes work to do ("add …", "fix …", "refactor …"), asks to start or continue a task, or says "jig task", "classify this", "what process does this need".
+description: Start or resume a task with Jig — classify it by risk, create its workspace and choose the workflow. Use when the user describes work to do ("add …", "fix …", "refactor …"), asks to start or continue a task, asks what to take next ("what next", "take the next one"), or says "jig task", "classify this", "what process does this need".
 ---
 
 # jig-task — classify and route
@@ -58,6 +58,11 @@ Then ask which merged tasks wait to be closed. The dry run changes nothing:
 For each task flagged `needs-consolidation`, name it and ask the user whether it can be
 closed — a fix may still be expected. On yes, close it with `jig-consolidate` §6. Never
 close without asking, and do not hold up the work the user came for while waiting.
+
+When the person asks what to take next ("what next", "take the next one"), run
+`.ai/scripts/jig queue next` instead of choosing. Name the task and its place, then start it
+through this skill (§3). On `next: none`, report its reason and the lines under it and stop:
+do not pick a task yourself.
 
 ## 2. Classify
 
@@ -123,6 +128,12 @@ Either way it prints a path and leaves this checkout alone. From then on the tas
 that path only. If your runtime can switch this session into an existing worktree, switch
 and run every command from there; otherwise tell the user to open a new agent session in
 that path. Either way, do not continue the task from here.
+
+**Where your runtime can open that session itself** (Claude Code desktop's `start_session`),
+do so for parallel work the person asked for: a task already filed with `jig task new` and
+started in its worktree, the session opened in that path and told the task id — **in the same
+turn they asked**, since a turn an event began may be refused
+([jig-autopilot](../jig-autopilot/SKILL.md) §2, where autopilot uses subagents instead).
 
 Write the task's own documents through jig, there and everywhere else — never with your
 editing tools, and never with a shell redirection:

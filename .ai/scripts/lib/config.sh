@@ -43,9 +43,10 @@ JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_t
 # stages a class route allows trimming, never below the class's floor. A
 # committed value would make that trade for every contributor
 # (adr-20261002-route-depth-is-a-personal-choice).
-# `release.merge` says whether this person's unattended agent may merge an
-# epic's final pull request, which is the release: who merges one is the
-# owner's choice, not the project's (this ADR amendment: ADR-0040, 2026-10-04).
+# `release.merge` says whether this person's unattended agent may merge a
+# release — an epic's final pull request, or a task that raises the version
+# (adr-20261026-a-task-that-raises-the-version-is-a-release): who merges one
+# is the owner's choice, not the project's (ADR-0040's amendment of 2026-10-04).
 # `run.exec` says where this machine runs the project's checks — a container
 # on one laptop, the host on a colleague's — and a committed value would send
 # every contributor's checks to one person's environment
@@ -464,11 +465,12 @@ jig_autopilot_parallel() {
   printf '%s\n' "$((10#$value))"
 }
 
-# jig_release_merge — print release.merge, who merges an epic's final pull
-# request in an unattended run at `agent.git: merge`: `agent` (the default,
-# as before) or `human`, which opens it and leaves the merge — the release —
-# to the person. Exit 1 with the value read for anything else, which every
-# reader takes as `human`: a mistake never merges a release.
+# jig_release_merge — print release.merge, who merges a release (an epic's
+# final pull request, or a task that raises the version) in an unattended run
+# at `agent.git: merge`: `agent` (the default, as before) or `human`, which
+# opens it and leaves the merge — the release — to the person. Exit 1 with
+# the value read for anything else, which every reader takes as `human`: a
+# mistake never merges a release.
 jig_release_merge() {
   local value
   value=$(cfg release.merge agent)

@@ -472,20 +472,40 @@ EOF2
   return 1
 }
 
-# _bootstrap_link_entry <target-abs> <link-abs> — link one entry of a shared
-# directory. A directory is linked by jig_link_dir: a symlink, or a junction
-# where symlinks cannot be made (ADR-0037). Anything else needs a real
-# symlink, because a junction links only a directory and a copy would
-# diverge from the owner's on the first edit. Exit 2 for exactly that case,
-# 1 for any other failure.
+# _bootstrap_link_entry <target-abs> <link-abs> <target-rel> — link one entry
+# of a shared directory. A symlink holds <target-rel>, the path from the
+# mirror's final place to the owner's entry, so it resolves wherever the two
+# checkouts are seen under a common parent — a container that mounts it, too
+# (adr-20261023-shared-entries-link-by-relative-path). A directory is linked
+# by a junction where symlinks cannot be made (ADR-0037), and a junction holds
+# only an absolute target. Under Git Bash a symlink takes the absolute target
+# too: MSYS makes a native symlink only to a target that exists, and a
+# relative one counted from <dst> dangles while it sits in staging, at another
+# depth. Anything but a directory needs a real symlink,
+# because a junction links only a directory and a copy would diverge from the
+# owner's on the first edit. Exit 2 for exactly that case, 1 for any other
+# failure.
 _bootstrap_link_entry() {
-  if [ -d "$1" ]; then
-    jig_link_dir "$1" "$2"
+  jig_link_detect
+  if [ "$_JIG_LINK_KIND" = symlink ]; then
+    case "$(uname -s)" in
+      MINGW* | MSYS* | CYGWIN*) ln -s "$1" "$2" 2>/dev/null && [ -L "$2" ] ;;
+      *) ln -s "$3" "$2" 2>/dev/null && [ -L "$2" ] ;;
+    esac
     return
   fi
-  jig_link_detect
-  [ "$_JIG_LINK_KIND" = symlink ] || return 2
-  ln -s "$1" "$2" 2>/dev/null && [ -L "$2" ]
+  [ -d "$1" ] || return 2
+  jig_link_dir "$1" "$2"
+}
+
+# _bootstrap_physical <dir> — <dir> with every link in it resolved, or
+# non-zero when it cannot be entered. A relative target is counted on these
+# paths. The roots come from git and are physical already, but the shared
+# path below them may pass through a link of the tree's own (`lib ->
+# src/lib`, sharing `lib/packages`), and counting through it would miscount
+# the `../`.
+_bootstrap_physical() {
+  (cd -P "$1" 2>/dev/null && pwd -P)
 }
 
 # _bootstrap_entries <dir> — the entries of <dir>, NUL-terminated, hidden ones
@@ -527,6 +547,7 @@ _bootstrap_report_share() {
 _bootstrap_share() {
   local owner_root="$1" tree_root="$2" path="$3" verb="$4"
   local src dst staged entry name rc linked="" failed="" needs="" n=0 tracked
+  local src_phys dst_phys
   src="$owner_root/$path"
   dst="$tree_root/$path"
 
@@ -588,6 +609,15 @@ _bootstrap_share() {
     jig_warn "$verb: could not share $path into the worktree"
     return 0
   fi
+  # The links are made in staging but read from <dst>, so their targets are
+  # counted from there; the rename into place keeps a link's text.
+  if ! src_phys=$(_bootstrap_physical "$src") \
+     || ! dst_phys=$(_bootstrap_physical "$(dirname "$dst")"); then
+    jig_warn "$verb: could not share $path into the worktree"
+    _bootstrap_discard "$_JIG_BOOTSTRAP_STAGING" "$staged" >/dev/null 2>&1 || true
+    return 0
+  fi
+  dst_phys="${dst_phys%/}/${dst##*/}"
   while IFS= read -r -d '' entry; do
     name=${entry##*/}
     case "$name" in
@@ -595,7 +625,8 @@ _bootstrap_share() {
 '*) failed="$failed${failed:+, }(a name holding a newline)"; continue ;;
     esac
     rc=0
-    _bootstrap_link_entry "$src/$name" "$staged/$name" || rc=$?
+    _bootstrap_link_entry "$src/$name" "$staged/$name" \
+      "$(jig_relpath_from "$dst_phys" "$src_phys/$name")" || rc=$?
     case "$rc" in
       0) n=$((n + 1)) ;;
       2) needs="$needs${needs:+, }$name" ;;
@@ -625,8 +656,12 @@ _bootstrap_share() {
 # added is taken back, and the take-back is proved by git as well.
 _bootstrap_top_up() {
   local tree_root="$1" src="$2" dst="$3" path="$4" verb="$5"
-  local entry name rc added="" failed="" needs=""
+  local entry name rc added="" failed="" needs="" src_phys dst_phys
   _BOOTSTRAP_MADE=""
+  if ! src_phys=$(_bootstrap_physical "$src") || ! dst_phys=$(_bootstrap_physical "$dst"); then
+    jig_warn "$verb: could not share what $path gained into the worktree"
+    return 0
+  fi
   while IFS= read -r -d '' entry; do
     name=${entry##*/}
     case "$name" in
@@ -637,7 +672,8 @@ _bootstrap_top_up() {
       continue
     fi
     rc=0
-    _bootstrap_link_entry "$src/$name" "$dst/$name" || rc=$?
+    _bootstrap_link_entry "$src/$name" "$dst/$name" \
+      "$(jig_relpath_from "$dst_phys" "$src_phys/$name")" || rc=$?
     case "$rc" in
       0)
         _BOOTSTRAP_MADE="$_BOOTSTRAP_MADE$dst/$name
@@ -696,6 +732,15 @@ jig_bootstrap_worktree() {
   _BOOTSTRAP_BASELINE=$(_bootstrap_dirt "$tree_root")
 
   started=$(date +%s 2>/dev/null || printf '0')
+
+  # A directory that should be shared and is not leaves this worktree without
+  # it; say so here, where its absence is about to bite (jig_share_candidates).
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    jig_warn "$verb: $path/ holds separate repositories this worktree cannot reach; add \`worktree.share: [$path]\` to $JIG_AI_DIR/config.yaml, then run \`jig task bootstrap\`"
+  done <<EOF
+$(jig_share_candidates "$owner_root")
+EOF
 
   # Shared first. A directory declared as shared is a source of truth, and the
   # carry below refuses to copy anything that overlaps one — so every share

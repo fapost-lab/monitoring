@@ -73,6 +73,10 @@ human is needed; the route, the gates and `agent.git` stay what they are.
 writes the answers to their gitignored `.ai/config.local.yaml` through
 `jig config set --local`; it never writes `.ai/config.yaml`.
 
+`jig-upgrade` brings a project's copy of Jig up to the version on the machine: `jig self-update`
+when a newer release is out, `jig upgrade`, and the steps the release asks for by hand; what would
+stop the upgrade is named to the person, never worked around.
+
 **Three questions decide the class**, asked about this change being wrong after it shipped:
 what takes it back; how far the mistake reaches — this repository, or users, money, somebody
 else's system; and who finds it — a test and the next run, or the person it hurt. The class is

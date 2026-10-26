@@ -68,7 +68,8 @@ running agent. `inherit` removes an override before start.
 .ai/scripts/jig task autopilot <id> start --phase <spec>/<n>
 ```
 
-Then start a background agent with the prompt below. A slot is held by an agent still
+Then start a background subagent with the prompt below — a subagent of your runtime, never a
+separate session of the app (`jig-autopilot` §2 says why). A slot is held by an agent still
 *building* — run `on`, knowledge not consolidated — so a task waiting its turn to ship frees
 one: start the next task of the same wave then. The short-lived agents that repair the queue
 (a red check, a merge conflict) are outside the limit.

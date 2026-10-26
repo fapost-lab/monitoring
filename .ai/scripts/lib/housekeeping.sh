@@ -461,8 +461,8 @@ _hk_lock_ttl() { printf '3600\n'; }
 # jig-session-hook), so a run that finds the lock held just skips instead of
 # queuing — whichever run got there first will do the same work either way.
 #
-# `mkdir` is the claim, the one atomic primitive available on POSIX and in
-# Git Bash alike (ADR-0002), the same idiom `_verify_busy_claim` uses in
+# Creating `busy/run` exclusively is the claim (jig_claim_file,
+# adr-20261023-a-claim-is-an-exclusive-create), the same idiom `_verify_busy_claim` uses in
 # verify.sh — not shared with it, because one command library never sources
 # another (ARCHITECTURE.md); `jig_verify_busy_holder` (common.sh) is shared,
 # and reads the same "checkout: / pid: " shape this writes, so liveness is
@@ -472,10 +472,10 @@ _hk_lock_ttl() { printf '3600\n'; }
 # reason to refuse to run: fail open, exactly as `_verify_busy_acquire` does.
 _hk_lock_acquire() {
   local dir="$1"
-  # `busy` is the atomic claim; `$dir` itself is only its parent and may be
-  # made ahead of time by anyone, same as `mkdir -p` everywhere else here.
+  # `busy/run` is the claim; `$dir` and `busy/` are only its containers and may
+  # be made ahead of time by anyone, same as `mkdir -p` everywhere else here.
   mkdir -p "$dir" 2>/dev/null || true
-  if mkdir "$dir/busy" 2>/dev/null; then
+  if mkdir -p "$dir/busy" 2>/dev/null && jig_claim_file "$dir/busy/run"; then
     printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$" > "$dir/busy/run" 2>/dev/null || true
     _HK_LOCK_DIR="$dir"
     return 0
@@ -487,7 +487,7 @@ _hk_lock_acquire() {
     rm -f "$dir/busy/run" 2>/dev/null || true
     rmdir "$dir/busy" 2>/dev/null || true
   fi
-  if mkdir "$dir/busy" 2>/dev/null; then
+  if mkdir -p "$dir/busy" 2>/dev/null && jig_claim_file "$dir/busy/run"; then
     printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$" > "$dir/busy/run" 2>/dev/null || true
     _HK_LOCK_DIR="$dir"
     return 0

@@ -29,7 +29,7 @@
 # never rewritten.
 # shellcheck shell=bash
 
-QUEUE_USAGE="usage: jig queue [list] [--json] | jig queue set <ref> --priority <0-5|none> | jig queue move <ref> (--before <ref> | --after <ref> | --top | --bottom) | jig queue depend <ref> --on <ref> --reason <text> | jig queue undepend <ref> --on <ref> | jig queue remove <ref> | jig queue request <ref> pause [--reason <text>] | jig queue cancel <ref> pause; every write takes [--revision <n>] [--json]; <ref> is task:<id>, epic:<spec-id> or <id>"
+QUEUE_USAGE="usage: jig queue [list] [--json] | jig queue next [--json] | jig queue set <ref> --priority <0-5|none> | jig queue move <ref> (--before <ref> | --after <ref> | --top | --bottom) | jig queue depend <ref> --on <ref> --reason <text> | jig queue undepend <ref> --on <ref> | jig queue remove <ref> | jig queue request <ref> pause [--reason <text>] | jig queue cancel <ref> pause; every write takes [--revision <n>] [--json]; <ref> is task:<id>, epic:<spec-id> or <id>"
 
 QUEUE_FORMAT=$_JIG_QUEUE_FORMAT
 QUEUE_STEP=100
@@ -65,6 +65,7 @@ _queue_main() {
   fi
   case "$sub" in
     list) _queue_list ${args[@]+"${args[@]}"} ;;
+    next) _queue_next ${args[@]+"${args[@]}"} ;;
     set | move | depend | undepend | remove | request | cancel) _queue_write "$sub" ${args[@]+"${args[@]}"} ;;
     help | -h | --help) printf '%s\n' "$QUEUE_USAGE" ;;
     *) jig_fail usage "queue: unknown subcommand: $sub; $QUEUE_USAGE" ;;
@@ -378,17 +379,8 @@ _queue_write() {
       *) jig_fail usage "queue $sub: unexpected argument: $1" ;;
     esac
   done
-  # A revision is digits without a leading zero: `08` is not one, and the
-  # shell would read it as octal.
   [ -z "$rev_given" ] || [ -n "$rev" ] || jig_fail usage "queue: --revision is empty"
-  case "$rev" in
-    '' | 0) ;;
-    [1-9]*)
-      case "$rev" in
-        *[!0-9]*) jig_fail usage "queue: --revision is not a revision: $rev" ;;
-      esac ;;
-    *) jig_fail usage "queue: --revision is not a revision: $rev" ;;
-  esac
+  [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "queue: --revision is not a revision: $rev"
   case "$sub" in
     set)
       [ -n "$prio" ] || jig_fail usage "queue set: --priority is required"
@@ -686,4 +678,270 @@ EOF
     items="$items${items:+,}$_QITEM"
   fi
   printf '{"items":[%s]}\n' "$items"
+}
+
+# --- the next task -----------------------------------------------------------------
+
+# _queue_next — `jig queue next [--json]`: which queued task to take next, by
+# the rules of the next-task-advice spec. Read-only: the queue file, the
+# revision and every task's state stay as they are, and nothing asks the
+# network — what the forge said is what the last housekeeping run wrote down.
+#
+# The facts are gathered here, in the shell, as one table of lines on stdin of
+# the one awk that decides (_queue_next_decide): the queue's items and
+# dependencies as jig_queue_items prints them, then `tf` (a queued task's state
+# facts) and `ds` (the state of every dependency's target) lines.
+_queue_next() {
+  [ $# -eq 0 ] || jig_fail usage "queue next: unexpected argument: $1"
+  jig_require_init
+  # shellcheck source=lib/hklog.sh
+  . "$JIG_LIB/hklog.sh"
+  local file items="" facts="" kind f2 f3 f4 f5 id tasks_dir notq=0 d
+  local seen=" " merged open_ids
+  file=$(queue_file)
+  if [ -f "$file" ]; then
+    _jig_queue_readable "$file" \
+      || jig_die "queue: $file is in another format than this jig reads ($QUEUE_FORMAT); upgrade jig"
+    items=$(jig_queue_items "$file")
+  fi
+  # What housekeeping saw at its last run; `closed` is a pull request that was
+  # not merged, so the work is still open as far as a dependency goes.
+  merged=" $(hklog_ids ' remote=merged ' | tr '\n' ' ') "
+  open_ids=" $(hklog_ids ' remote=(open|closed) ' | tr '\n' ' ') "
+  while IFS=$'\t' read -r kind f2 f3 f4 f5; do
+    case "$kind" in
+      item)
+        case "$f2" in
+          task:*) facts="$facts$(_queue_next_task_fact "${f2#task:}")"$'\n' ;;
+        esac ;;
+      dep)
+        case "$seen" in *" $f2 "*) continue ;; esac
+        seen="$seen$f2 "
+        facts="${facts}ds"$'\t'"$f2"$'\t'"$(_queue_next_dep_state "$f2" "$merged" "$open_ids")"$'\n' ;;
+    esac
+  done <<EOF
+$items
+EOF
+  # An epic's dependencies are inherited by its tasks, so the epic itself is
+  # asked about only through them; a task that is not queued is only counted.
+  tasks_dir="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
+  for d in "$tasks_dir"/*/; do
+    [ -f "${d}state" ] || continue
+    id=$(basename "$d")
+    jig_valid_id "$id" || continue
+    case "$(_jig_task_state_value "$id" status)" in active) ;; *) continue ;; esac
+    [ "$(_jig_task_state_value "$id" paused)" != true ] || continue
+    printf '%s\n' "$items" | awk -F '\t' -v r="task:$id" '$1 == "item" && $2 == r { f = 1 } END { exit !f }' && continue
+    notq=$((notq + 1))
+  done
+  local result
+  result=$(printf '%s\n%s\n' "$items" "$facts" | _queue_next_decide)
+  if [ -n "$_QUEUE_AS_JSON" ]; then
+    _queue_next_json "$result" "$notq"
+  else
+    _queue_next_text "$result" "$notq"
+  fi
+}
+
+# _queue_next_task_fact <id> — the `tf` line for a queued task: ref, status
+# (`gone` without a state file), paused, started (a branch and a base commit
+# both recorded) and whether a pause request waits in the queue.
+_queue_next_task_fact() {
+  local id="$1" st="gone" paused=false started=0 req=0
+  if jig_valid_id "$id" && [ -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$id/state" ]; then
+    st=$(_jig_task_state_value "$id" status)
+    [ -n "$st" ] || st=unknown
+    [ "$(_jig_task_state_value "$id" paused)" != true ] || paused=true
+    if [ -n "$(_jig_task_state_value "$id" branch)" ] && [ -n "$(_jig_task_state_value "$id" base_commit)" ]; then
+      started=1
+    fi
+    if jig_pause_request "$id"; then req=1; fi
+  fi
+  printf 'tf\t%s\t%s\t%s\t%s\t%s' "task:$id" "$st" "$paused" "$started" "$req"
+}
+
+# _queue_next_dep_state <on-ref> <merged ids> <open ids> — what a dependency's
+# target stands at: finished, open, broken or unknown.
+#
+# A task is finished when it is consolidated or housekeeping saw it merged;
+# broken when it was abandoned or its workspace is gone (the dependency can
+# never be met — the person drops it); open when housekeeping saw its pull
+# request open or closed unmerged; unknown otherwise, which is what a task
+# housekeeping never ran for answers. An epic is open or finished by its
+# spec's Epic: line; a spec this checkout does not have is read by the branch
+# alone — an ancestor of the default base is finished, a branch that is not is
+# broken, no branch at all unknown — locally, from refs already fetched.
+_queue_next_dep_state() {
+  local on="$1" merged="$2" open_ids="$3" id st roadmap line rc=0 branch ref base
+  id=${on#*:}
+  if ! jig_valid_id "$id"; then printf 'unknown'; return 0; fi
+  case "$on" in
+    task:*)
+      if [ ! -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$id/state" ]; then printf 'broken'; return 0; fi
+      st=$(_jig_task_state_value "$id" status)
+      case "$st" in
+        consolidated) printf 'finished'; return 0 ;;
+        abandoned) printf 'broken'; return 0 ;;
+      esac
+      case "$merged" in *" $id "*) printf 'finished'; return 0 ;; esac
+      case "$open_ids" in *" $id "*) printf 'open'; return 0 ;; esac
+      printf 'unknown' ;;
+    epic:*)
+      roadmap="$JIG_PROJECT/$JIG_AI_DIR/specs/$id/roadmap.md"
+      branch="epic/$id"
+      if [ -f "$roadmap" ]; then
+        line=$(jig_spec_epic "$roadmap") || rc=$?
+        if [ "$rc" -ne 0 ]; then printf 'unknown'; return 0; fi
+        if [ -n "$line" ]; then
+          printf '%s' "${line##* }"
+          return 0
+        fi
+      fi
+      ref=$(jig_base_ref "$branch")
+      base=$(jig_base_ref "$(jig_task_base "")")
+      if [ -z "$ref" ] || [ -z "$base" ]; then printf 'unknown'; return 0; fi
+      if git -C "$JIG_PROJECT" merge-base --is-ancestor "$ref" "$base" 2>/dev/null; then
+        printf 'finished'
+      else
+        printf 'broken'
+      fi ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# _queue_next_decide — the advice, from the table on stdin. Prints:
+#   next <ref> <level> <position> <priority> <started> <rank> <count>   (none when nothing)
+#   reason <waiting|paused|empty>                                       (only without next)
+#   wait <holder> <on> <state> <reason>                                  (each unfinished dependency holding a candidate)
+#
+# A candidate is a queued task whose state file says `active`, with no pause
+# and no pause request; everything else queued is silently not one. It waits
+# while any dependency of its own or of the epic it is built on is not
+# finished. Among the rest the lowest priority number goes first (`-` last),
+# then a started task before one not started, then the position of the item
+# on the top level (a task's epic's, an epic that is not queued after every
+# queued one), then its own position, then its ref.
+_queue_next_decide() {
+  awk -F '\t' '
+    function pnum(p) { return (p == "-") ? 6 : p + 0 }
+    function topkey(i) {
+      if (lvl[i] == "-") return pos[i]
+      if (lvl[i] in idx) return pos[idx[lvl[i]]]
+      return 1e18
+    }
+    # better(a, b): item a goes before item b.
+    function better(a, b,   x, y) {
+      x = pnum(pri[a]); y = pnum(pri[b])
+      if (x != y) return x < y
+      x = (sd[ref[a]] == 1) ? 0 : 1; y = (sd[ref[b]] == 1) ? 0 : 1
+      if (x != y) return x < y
+      x = topkey(a); y = topkey(b)
+      if (x != y) return x < y
+      if (pos[a] != pos[b]) return pos[a] < pos[b]
+      return ref[a] < ref[b]
+    }
+    # note(j): record the unfinished dependencies of item j.
+    function note(j,   k, key) {
+      for (k = 1; k <= nd[j]; k++) {
+        if (dst[don[j, k]] == "finished") continue
+        unfinished = 1
+        key = ref[j] SUBSEP don[j, k]
+        if (key in wseen) continue
+        wseen[key] = 1
+        wl[++nw] = "wait\t" ref[j] "\t" don[j, k] "\t" dst[don[j, k]] "\t" drea[j, k]
+      }
+    }
+    $1 == "item" { n++; ref[n] = $2; lvl[n] = $3; pos[n] = $4 + 0; pri[n] = $5; idx[$2] = n; nd[n] = 0 }
+    $1 == "dep" { k = ++nd[n]; don[n, k] = $2; drea[n, k] = $3 }
+    $1 == "tf" { st[$2] = $3; pz[$2] = $4; sd[$2] = $5; rq[$2] = $6 }
+    $1 == "ds" { dst[$2] = $3 }
+    END {
+      for (i = 1; i <= n; i++) {
+        r = ref[i]
+        if (r !~ /^task:/ || st[r] != "active") continue
+        if (pz[r] == "true" || rq[r] == 1) { paused++; continue }
+        unfinished = 0
+        note(i)
+        if (lvl[i] != "-" && (lvl[i] in idx)) note(idx[lvl[i]])
+        if (unfinished) { waiting++; continue }
+        if (!best || better(i, best)) best = i
+      }
+      if (best) {
+        rank = 0; cnt = 0
+        for (i = 1; i <= n; i++) if (lvl[i] == lvl[best]) { cnt++; if (pos[i] < pos[best]) rank++ }
+        printf "next\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n", ref[best], lvl[best], pos[best], pri[best], (sd[ref[best]] == 1), rank + 1, cnt
+      } else if (waiting) print "reason\twaiting"
+      else if (paused) print "reason\tpaused"
+      else print "reason\tempty"
+      for (i = 1; i <= nw; i++) print wl[i]
+    }
+  '
+}
+
+# _queue_next_json <result> <not queued> — the producer's data for `jig queue
+# next --json` (schemas/json.md, "jig queue next --json").
+_queue_next_json() {
+  local kind f2 f3 f4 f5 f6 f7 f8 next=null reason=null waiting=""
+  while IFS=$'\t' read -r kind f2 f3 f4 f5 f6 f7 f8; do
+    case "$kind" in
+      next)
+        json_quote "$f2"; next="{\"ref\":$_JSON"
+        next="$next,\"kind\":\"task\""
+        json_quote "${f2#task:}"; next="$next,\"id\":$_JSON"
+        if [ "$f3" = "-" ]; then next="$next,\"level\":null"; else json_quote "$f3"; next="$next,\"level\":$_JSON"; fi
+        json_int_or_null "$f4"; next="$next,\"position\":$_JSON"
+        json_int_or_null "$f5"; next="$next,\"priority\":$_JSON"
+        if [ "$f6" = 1 ]; then next="$next,\"started\":true}"; else next="$next,\"started\":false}"; fi ;;
+      reason) json_quote "$f2"; reason=$_JSON ;;
+      wait)
+        waiting="$waiting${waiting:+,}"
+        json_quote "$f2"; waiting="$waiting{\"ref\":$_JSON"
+        json_quote "$f3"; waiting="$waiting,\"on\":$_JSON"
+        json_quote "$f4"; waiting="$waiting,\"state\":$_JSON"
+        json_quote "$f5"; waiting="$waiting,\"reason\":$_JSON}" ;;
+    esac
+  done <<EOF
+$1
+EOF
+  printf '{"next":%s,"reason":%s,"waiting":[%s],"not_queued":%s}\n' "$next" "$reason" "$waiting" "$2"
+}
+
+# _queue_next_text <result> <not queued> — the advice for a person: the
+# verdict line, each unfinished dependency that holds a candidate with what to
+# do about it, and how many active tasks the queue does not know. An `open`
+# dependency is only the way things are while something is advised, so it is
+# printed when nothing is; a `broken` or `unknown` one is a thing to fix.
+_queue_next_text() {
+  local kind f2 f3 f4 f5 f6 f7 f8 advised=""
+  while IFS=$'\t' read -r kind f2 f3 f4 f5 f6 f7 f8; do
+    case "$kind" in
+      next)
+        advised=1
+        printf 'next: %s — %s of %s on %s, priority %s, %s\n' "$f2" "$f7" "$f8" \
+          "$([ "$f3" = "-" ] && printf 'the top level' || printf '%s' "$f3")" \
+          "$([ "$f5" = "-" ] && printf none || printf '%s' "$f5")" \
+          "$([ "$f6" = 1 ] && printf started || printf 'not started')" ;;
+      reason)
+        case "$f2" in
+          waiting) printf 'next: none — every queued task waits for a dependency\n' ;;
+          paused) printf 'next: none — every queued task is paused\n' ;;
+          *) printf 'next: none — the queue holds no task to take\n' ;;
+        esac ;;
+      wait)
+        case "$f4" in
+          broken) printf '  %s waits for %s: broken — jig queue undepend %s --on %s\n' "$f2" "$f3" "$f2" "$f3" ;;
+          unknown)
+            case "$f3" in
+              task:*) printf '  %s waits for %s: unknown — jig housekeeping\n' "$f2" "$f3" ;;
+              *) printf '  %s waits for %s: unknown\n' "$f2" "$f3" ;;
+            esac ;;
+          *) [ -n "$advised" ] || printf '  %s waits for %s: %s\n' "$f2" "$f3" "$f4" ;;
+        esac ;;
+    esac
+  done <<EOF
+$1
+EOF
+  if [ "$2" -gt 0 ]; then
+    printf 'not queued: %s %s — jig queue set <id> --priority <p>\n' "$2" "$([ "$2" = 1 ] && printf task || printf tasks)"
+  fi
 }

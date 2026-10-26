@@ -711,7 +711,7 @@ _upgrade_link_one() {
 # framework-owned item for the *current* config is linked — .ai/scripts,
 # each active profile, each active adapter's skills — exactly the way
 # `jig init --link` places them (domains/install). Sources init.sh for
-# _init_place_symlink/_init_relpath so the two relative-symlink code paths
+# _init_place_symlink so the two relative-symlink code paths
 # never diverge; sourcing a command library only defines its functions, it
 # does not run cmd_init.
 _upgrade_link() {
@@ -861,6 +861,12 @@ _upgrade_handoff() {
   _upgrade_out "upgrade: this jig is $JIG_VERSION; handing the upgrade to $to from $source"
   cd "$JIG_PROJECT" || jig_die "upgrade: cannot enter $JIG_PROJECT"
   # bash, not the file itself: Windows has no execute bit.
+  if [ "${_UPGRADE_JSON:-0}" = 1 ]; then
+    # The newer jig prints its data, not an envelope of its own, into this
+    # run's (fd 3, _upgrade_json_body); its refusals carry their codes.
+    JIG_UPGRADE_HANDED_OFF="$JIG_VERSION" JIG_UPGRADE_JSON_DATA=1 _JIG_JSON_CODES=1 \
+      exec bash "$source/scripts/jig" upgrade --from "$source" $q --json 1>&3
+  fi
   JIG_UPGRADE_HANDED_OFF="$JIG_VERSION" exec bash "$source/scripts/jig" upgrade --from "$source" $q
 }
 
@@ -962,12 +968,14 @@ _upgrade_preflight() {
   if [ "$2" = 1 ]; then
     while IFS= read -r r; do
       _upgrade_out "note: a real upgrade would stop: $r"
+      _UPGRADE_J_STOPS="$_UPGRADE_J_STOPS$r
+"
     done <<EOF
 $reasons
 EOF
     return 0
   fi
-  jig_die "upgrade: nothing was changed:
+  jig_fail upgrade-blocked "upgrade: nothing was changed:
 $(printf '%s\n' "$reasons" | sed 's/^/  - /')"
 }
 
@@ -1124,17 +1132,21 @@ _upgrade_finish() {
   level=$(jig_agent_git) || level=none
   _upgrade_self_check 0 || rc=$?
   _upgrade_config_note 0
+  _UPGRADE_J_LEVEL=$level
   if [ "$rc" != 0 ]; then
+    _UPGRADE_J_OUTCOME=incomplete
     _upgrade_out "upgrade: not committed, because the install is not complete; run \`jig upgrade\` again${_UPGRADE_BRANCH:+ on $_UPGRADE_BRANCH}"
     return 0
   fi
   git -C "$JIG_PROJECT" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || {
+    _UPGRADE_J_OUTCOME=staged
     _upgrade_out "upgrade: this repository has no commit yet; the change is left for you to commit"
     return 0
   }
 
   _upgrade_stage_change
   if [ -z "$(jig_ship_staged)" ]; then
+    _UPGRADE_J_OUTCOME=nothing-to-do
     if [ "$_UPGRADE_CREATED" = 1 ]; then
       # The branch was cut by this run and holds no commit of its own, so
       # `branch -d` loses nothing; it refuses anything else by itself.
@@ -1162,13 +1174,17 @@ _upgrade_finish() {
   mkdir -p "$(dirname "$msg")" || jig_die "upgrade: cannot create $(dirname "$msg")"
   _upgrade_message "$msg" "$from" "$to" "$summary"
 
+  _UPGRADE_J_STEPS=$(_upgrade_manual_steps "$from" "$to")
   if [ "$level" = none ]; then
+    _UPGRADE_J_OUTCOME=staged
     _upgrade_out "upgrade: the change is staged; commit it with \`git commit -F $rel\`"
     _upgrade_next
     return 0
   fi
   jig_ship_check_staged "upgrade"
   jig_ship_commit "upgrade" "$msg"
+  _UPGRADE_J_OUTCOME=upgraded
+  _UPGRADE_J_COMMIT=$(git -C "$JIG_PROJECT" rev-parse HEAD 2>/dev/null || true)
   if [ -z "$_UPGRADE_BRANCH" ] || [ "$level" = commit ]; then
     _upgrade_next
     return 0
@@ -1182,6 +1198,7 @@ _upgrade_finish() {
   base=$(cfg git.base_branch main)
   jig_ship_require_commits "upgrade" "$_UPGRADE_BRANCH" "$base"
   jig_ship_push "upgrade" "$_UPGRADE_BRANCH"
+  _UPGRADE_J_PUSHED=1
   if [ "$level" = push ]; then
     _upgrade_step_back "$base"
     _upgrade_next
@@ -1268,14 +1285,110 @@ _UPGRADE_WORK=""
 # filled in once the adapters are sourced (see _upgrade_deletable).
 _UPGRADE_DELETE_ROOTS=""
 
+# What a run did, for `jig upgrade --json` (_upgrade_json_data); set as the
+# run goes, read once at its end. Script-global: the producer reads them after
+# _upgrade_run returns.
+_UPGRADE_JSON=0
+_UPGRADE_J_MODE=""
+_UPGRADE_J_DRY=0
+_UPGRADE_J_FROM=""
+_UPGRADE_J_TO=""
+_UPGRADE_J_OUTCOME=""
+_UPGRADE_J_COUNTS=""
+_UPGRADE_J_LEVEL=""
+_UPGRADE_J_COMMIT=""
+_UPGRADE_J_PUSHED=0
+_UPGRADE_J_STEPS=""
+_UPGRADE_J_STOPS=""
+
+# cmd_upgrade [--json] … — `--json` anywhere runs the whole command as the
+# producer of json_run (conventions/json-output.md); the text it prints goes to
+# stderr unchanged.
 cmd_upgrade() {
+  local a json=0
+  local -a rest=()
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      *) rest+=("$a") ;;
+    esac
+  done
+  if [ "$json" = 0 ]; then
+    _upgrade_run "$@"
+    return
+  fi
+  # shellcheck source=lib/json.sh
+  . "$JIG_LIB/json.sh"
+  if [ -n "${JIG_UPGRADE_JSON_DATA:-}" ]; then
+    # Handed off from an older jig running under --json (_upgrade_handoff):
+    # its envelope is already open, so only the data is ours to print.
+    _upgrade_json_body "${rest[@]+"${rest[@]}"}"
+    return
+  fi
+  json_run _upgrade_json_body "${rest[@]+"${rest[@]}"}"
+}
+
+# _upgrade_json_body … — the producer: the run with its text on stderr, then
+# its data, one object, on what was stdout.
+_upgrade_json_body() {
+  exec 3>&1 1>&2
+  _UPGRADE_JSON=1
+  _upgrade_run "$@"
+  _upgrade_json_data >&3
+}
+
+# _upgrade_json_data — the run's data object (schemas/json.md, `jig upgrade`).
+_upgrade_json_data() {
+  local o placed kept removed conflicts list line
+  json_quote "$_UPGRADE_J_MODE"; o="{\"mode\":$_JSON"
+  json_bool "$( [ "$_UPGRADE_J_DRY" = 1 ] && printf true )"; o="$o,\"dry_run\":$_JSON"
+  json_str_or_null "$_UPGRADE_J_FROM"; o="$o,\"from\":$_JSON"
+  json_str_or_null "$_UPGRADE_J_TO"; o="$o,\"to\":$_JSON"
+  json_str_or_null "$_UPGRADE_J_OUTCOME"; o="$o,\"outcome\":$_JSON"
+  if [ -n "$_UPGRADE_J_COUNTS" ]; then
+    read -r placed kept removed conflicts <<EOF
+$_UPGRADE_J_COUNTS
+EOF
+    o="$o,\"files\":{\"placed\":$placed,\"kept\":$kept,\"removed\":$removed,\"conflicts\":$conflicts}"
+  else
+    o="$o,\"files\":null"
+  fi
+  if [ -n "$_UPGRADE_J_COMMIT" ] || [ "$_UPGRADE_J_OUTCOME" = staged ]; then
+    json_quote "$_UPGRADE_J_LEVEL"; o="$o,\"git\":{\"level\":$_JSON"
+    json_str_or_null "$_UPGRADE_BRANCH"; o="$o,\"branch\":$_JSON"
+    json_str_or_null "$_UPGRADE_J_COMMIT"; o="$o,\"commit\":$_JSON"
+    json_bool "$( [ "$_UPGRADE_J_PUSHED" = 1 ] && printf true )"; o="$o,\"pushed\":$_JSON"
+    json_str_or_null "${JIG_SHIP_URL:-}"; o="$o,\"pull_request\":$_JSON"
+    json_bool "$( [ "${JIG_SHIP_MERGED:-0}" = 1 ] && printf true )"; o="$o,\"merged\":$_JSON}"
+  else
+    o="$o,\"git\":null"
+  fi
+  list=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    json_quote "${line#- }"; list="$list${list:+,}$_JSON"
+  done <<EOF
+$_UPGRADE_J_STEPS
+EOF
+  o="$o,\"manual_steps\":[$list]"
+  list=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    json_quote "$line"; list="$list${list:+,}$_JSON"
+  done <<EOF
+$_UPGRADE_J_STOPS
+EOF
+  printf '%s\n' "$o,\"would_stop\":[$list]}"
+}
+
+_upgrade_run() {
   local from="" dry_run=0 quiet=0 level=none
   while [ $# -gt 0 ]; do
     case "$1" in
-      --from) [ $# -ge 2 ] || jig_die "upgrade: --from requires a value"; from="$2"; shift 2 ;;
+      --from) [ $# -ge 2 ] || jig_fail usage "upgrade: --from requires a value"; from="$2"; shift 2 ;;
       --dry-run) dry_run=1; shift ;;
       --quiet) quiet=1; shift ;;
-      *) jig_die "upgrade: unknown argument: $1" ;;
+      *) jig_fail usage "upgrade: unknown argument: $1" ;;
     esac
   done
   jig_require_init
@@ -1332,8 +1445,17 @@ cmd_upgrade() {
     jig_link_detect
     [ "$_JIG_LINK_KIND" = symlink ] \
       || jig_die "upgrade: this project is installed in link mode, which needs symbolic links, and they cannot be made here"
+    _UPGRADE_J_MODE="link"
+    _UPGRADE_J_DRY=$dry_run
+    _UPGRADE_J_FROM=$(manifest_header_get jig.version)
+    _UPGRADE_J_TO=$(_upgrade_source_version "$source")
     _upgrade_link "$source" "$active_profiles" "$active_adapters" "$dry_run"
-    _upgrade_self_check "$dry_run" || true
+    if _upgrade_self_check "$dry_run"; then
+      _UPGRADE_J_OUTCOME=linked
+    else
+      _UPGRADE_J_OUTCOME=incomplete
+    fi
+    [ "$dry_run" != 1 ] || _UPGRADE_J_OUTCOME=planned
     _upgrade_config_note "$dry_run"
     return 0
   fi
@@ -1357,6 +1479,10 @@ cmd_upgrade() {
     active_adapters=$(cfg_list adapters "claude codex")
   fi
   from_version=$(manifest_header_get jig.version)
+  _UPGRADE_J_MODE=copy
+  _UPGRADE_J_DRY=$dry_run
+  _UPGRADE_J_FROM=$from_version
+  _UPGRADE_J_TO=$to_version
 
   _UPGRADE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/jig-upgrade-stage.XXXXXX")
   jig_cleanup_add -d "$_UPGRADE_STAGE"
@@ -1396,7 +1522,10 @@ cmd_upgrade() {
     keep-conflict) conflict_count=$((conflict_count + 1)) ;;
   esac
 
+  _UPGRADE_J_COUNTS="$placed_count $kept_count $removed_count $conflict_count"
   if [ "$dry_run" = 1 ]; then
+    _UPGRADE_J_OUTCOME=planned
+    _UPGRADE_J_STEPS=$(_upgrade_manual_steps "$from_version" "$to_version")
     _upgrade_summary "$placed_count" "$kept_count" "$removed_count" "$conflict_count" \
       "unchanged (dry run)"
     return 0
