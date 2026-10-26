@@ -7,9 +7,12 @@ namespace Fapost\Monitoring;
 use Carbon\CarbonImmutable;
 use Fapost\Foundation\Operator\Enums\OperatorSurface;
 use Fapost\Monitoring\Access\OperatorGate;
+use Fapost\Monitoring\Health\HealthReader;
+use Fapost\Monitoring\Http\Middleware\AllowHealth;
 use Fapost\Monitoring\Http\Middleware\AllowLogs;
 use Fapost\Monitoring\Http\Middleware\AllowPulse;
 use Fapost\Monitoring\Http\Middleware\AllowTelescope;
+use Fapost\Monitoring\Pulse\HealthCard;
 use Fapost\Monitoring\Pulse\NeutralUsers;
 use Fapost\Monitoring\Telescope\RecordingFilter;
 use Fapost\Monitoring\Telescope\RedactingEntriesRepository;
@@ -20,6 +23,7 @@ use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
 use Illuminate\Support\ServiceProvider;
 use InvalidArgumentException;
@@ -41,11 +45,12 @@ use Laravel\Telescope\Contracts\PrunableRepository;
 use Laravel\Telescope\Http\Middleware\Authorize as TelescopeAuthorize;
 use Laravel\Telescope\Telescope;
 use Laravel\Telescope\TelescopeServiceProvider;
+use Livewire\LivewireManager;
 use Opcodes\LogViewer\LogViewerServiceProvider;
 use stdClass;
 
 /**
- * Pulse, Telescope and a log viewer behind the operator access contract.
+ * Pulse, Telescope, a log viewer and the installation's health behind the operator access contract.
  *
  * There is no sign-in here: every screen asks {@see \Fapost\Foundation\Operator\Contracts\OperatorAccessInterface}
  * (through {@see OperatorGate}) and answers 404 when it says no or cannot say. The third-party providers are
@@ -64,11 +69,15 @@ final class MonitoringServiceProvider extends ServiceProvider
      */
     public const PULSE_CACHED_CLASSES = [Collection::class, stdClass::class, CarbonImmutable::class];
 
+    /** The package's own health page; the card is on Pulse's dashboard as well. */
+    public const HEALTH_PATH = 'monitoring/health';
+
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/monitoring.php', 'monitoring');
 
         $this->app->singleton(OperatorGate::class);
+        $this->app->bind(HealthReader::class);
 
         $this->app->register(PulseServiceProvider::class);
         $this->app->register(LogViewerServiceProvider::class);
@@ -87,6 +96,9 @@ final class MonitoringServiceProvider extends ServiceProvider
 
         // Ahead of Pulse's own `pulse::dashboard`: the same cards plus Reverb's when it is installed.
         View::prependNamespace('pulse', __DIR__ . '/../resources/views/pulse');
+        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'monitoring');
+
+        $this->registerHealth();
 
         // After every provider has booted, so that no other definition of the abilities wins. The user is
         // optional: the contract reads the request's own sign-in, and a guest is asked too.
@@ -102,6 +114,34 @@ final class MonitoringServiceProvider extends ServiceProvider
         });
 
         $this->schedulePrune();
+    }
+
+    /**
+     * The health card (a Pulse card, on Pulse's dashboard and on a page of its own) and that page. The page runs the
+     * installation's stack, then the contract's check for {@see OperatorSurface::Health} (404); Livewire repeats that
+     * check on the card's updates by class name. The card asks the contract itself as well, since on Pulse's dashboard
+     * only the Pulse surface was checked.
+     */
+    private function registerHealth(): void
+    {
+        $this->callAfterResolving('livewire', static function (LivewireManager $livewire): void {
+            $livewire->addPersistentMiddleware([AllowHealth::class]);
+            $livewire->component('fapost.health', HealthCard::class);
+        });
+
+        if ($this->app->routesAreCached()) {
+            return;
+        }
+
+        $config = $this->app->make('config');
+
+        Route::middleware([
+            ...(array) $config->get('monitoring.middleware', ['web']),
+            ...(array) $config->get('monitoring.before_gate', []),
+            AllowHealth::class,
+        ])->group(static function (): void {
+            Route::view(self::HEALTH_PATH, 'monitoring::health.page')->name('monitoring.health');
+        });
     }
 
     private function configurePulse(Repository $config): void
