@@ -9,7 +9,7 @@ return [
     | Route middleware
     |--------------------------------------------------------------------------
     |
-    | Every operator screen of this package (Pulse, the log viewer) runs this list first, then
+    | Every operator screen of this package (Pulse, Telescope, the log viewer) runs this list first, then
     | `before_gate`, then its own check of the operator access contract.
     |
     | `middleware` is where an installation that serves tenants on hosts of their own puts the guard
@@ -58,6 +58,7 @@ return [
             '#^([^/]*)/support/enter#',
             '#^([^/]*)/webhook/#',
             '#^([^/]*)/log-viewer#',
+            '#^([^/]*)/telescope#',
         ],
     ],
 
@@ -75,5 +76,60 @@ return [
     'logs' => [
         'enabled'   => (bool) env('MONITORING_LOGS_ENABLED', false),
         'read_only' => true,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Telescope
+    |--------------------------------------------------------------------------
+    |
+    | Off by default, in every environment: Telescope keeps request contents (payloads, SQL with its
+    | bindings, mails) of every tenant. When on, it answers only through the operator access contract,
+    | keeps its entries on `landlord`, and outside `record_all` keeps only what went wrong. Secrets are
+    | masked in every environment; the lists below can add to the package's own, never remove from them.
+    |
+    */
+
+    'telescope' => [
+        'enabled'    => (bool) env('MONITORING_TELESCOPE_ENABLED', false),
+        'connection' => env('MONITORING_TELESCOPE_CONNECTION', 'landlord'),
+
+        // null: everything on a `local` machine, elsewhere only exceptions, failed requests and jobs, scheduled
+        // tasks and monitored tags. true / false decide it whatever the environment.
+        'record_all' => env('MONITORING_TELESCOPE_RECORD_ALL'),
+
+        // Entries older than this are pruned daily (`telescope:prune`), also while Telescope is off, so that what
+        // it kept before being switched off expires too. 0: nothing is scheduled.
+        'keep_hours' => (int) env('MONITORING_TELESCOPE_KEEP_HOURS', 48),
+
+        // Watchers switched off when not everything is recorded: their entries would be filtered out anyway
+        // (unless tagged for monitoring), so they only cost time.
+        'quiet_watchers' => [
+            Laravel\Telescope\Watchers\CacheWatcher::class,
+            Laravel\Telescope\Watchers\DumpWatcher::class,
+            Laravel\Telescope\Watchers\EventWatcher::class,
+            Laravel\Telescope\Watchers\GateWatcher::class,
+            Laravel\Telescope\Watchers\ModelWatcher::class,
+            Laravel\Telescope\Watchers\RedisWatcher::class,
+            Laravel\Telescope\Watchers\ViewWatcher::class,
+        ],
+
+        // Paths Telescope never records (merged into `telescope.ignore_paths`): the single-use support access
+        // entry, the webhook ingress (its path holds a secret) and the operator screens.
+        'ignore_paths' => [
+            'support/enter',
+            'webhook/*',
+            'pulse*',
+            'log-viewer*',
+            '_boost*',
+            '.well-known*',
+        ],
+
+        // Added to the package's own lists (Fapost\Monitoring\Telescope\Redactor), never instead of them.
+        'hidden' => [
+            'parameters'          => [],
+            'headers'             => [],
+            'response_parameters' => [],
+        ],
     ],
 ];

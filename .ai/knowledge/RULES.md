@@ -7,12 +7,16 @@ are added as sections of this file.
 ## Invariants
 
 - No `App\*` reference anywhere in the package. Enforced: `tests/BoundaryTest.php`.
-- Every operator screen is reachable only through its surface middleware (`AllowPulse`, `AllowLogs`), which asks
+- Every operator screen is reachable only through its surface middleware (`AllowPulse`, `AllowTelescope`, `AllowLogs`), which asks
   the contract and answers 404 on no, on an exception and when nothing is bound. Enforced: `tests/AccessTest.php`.
-- Pulse and log-viewer tables/files are never written to a tenant schema; the migration runs on `landlord`.
-  Enforced: `tests/StorageTest.php`.
+- Pulse, Telescope and log-viewer tables/files are never written to a tenant schema; the migrations run on `landlord`.
+  Enforced: `tests/StorageTest.php`, `tests/TelescopeRecordingTest.php`.
 - A secret in a request (query, body, header, cookie, support-entry token, webhook hash) leaves nothing in
   `pulse_*`. Enforced: `tests/PrivacyTest.php`.
+- Telescope never stores the support-entry token, listed credentials (body, query string, headers, cookies) or a bot
+  token in a URL, in any environment, in new entries or in later updates. Enforced: `tests/TelescopePrivacyTest.php`.
+- Telescope records nothing and has no routes unless `monitoring.telescope.enabled`; Telescope's own
+  `TELESCOPE_ENABLED` does not decide. Enforced: `tests/DefaultsTest.php`.
 
 ## Rules
 
@@ -20,7 +24,7 @@ are added as sections of this file.
   Livewire update tests in `tests/AccessTest.php`.
 - Package settings are read while the provider registers (Testbench registers providers before
   `defineEnvironment`): tests set switches through the process environment.
-- New third-party screens (Telescope next) arrive with their own surface, their own middleware class and the same
+- New third-party screens arrive with their own surface, their own middleware class and the same
   tests: refused by the contract, refused on a Livewire/API sub-request, secrets masked.
 
 - **Privacy policy of the recorders.** Pulse's own recorders keep counters and route patterns; this package adds:
@@ -38,3 +42,15 @@ are added as sections of this file.
 - `viewPulse` is defined after boot (`booted`) so that no other definition wins; the route middleware, not the
   gate, is the guarantee (a host `Gate::before` cannot bypass `AllowPulse`).
 - The log viewer's assets are served inline by the viewer: no publish step is needed in an image.
+- **Telescope's masking lives at the storage, not in a filter.** `RedactingEntriesRepository` (Telescope's database
+  repository, subclassed and bound to its three contracts) masks `store()` and `update()`: a Telescope filter sees
+  new entries only, and a failed job's exception arrives as an update. Telescope's hide lists are fed from
+  `Redactor`'s constants plus `monitoring.telescope.hidden.*` (additions only). Known and accepted: matching is by
+  top-level (or dot-path) key; nested keys, job data, mail bodies and SQL bindings are kept under `record_all` or a
+  monitored tag. Another storage driver chosen by an installation is not masked by this package.
+- **Telescope's static state is set for the last application to win.** `Telescope::auth()` and `viewTelescope` are
+  set in `booted` (after a host's `TelescopeApplicationServiceProvider`); filters read the application and config at
+  call time (`Container::getInstance()`), never capture them, since Telescope's filters outlive an application.
+- The Telescope migration is create-if-missing with an empty `down()` (it adopts tables Core created); the DDL is a
+  copy of Telescope 5's. `telescope:prune` is scheduled whether Telescope is on or not (`keep_hours`, 0 = none).
+- Do not call `telescope:publish` in an image: it publishes Telescope's config only; its assets are inline.

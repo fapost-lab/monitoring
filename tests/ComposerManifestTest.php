@@ -24,4 +24,11 @@ final class ComposerManifestTest extends TestCase
             $this->assertMatchesRegularExpression('/^[a-z0-9][a-z0-9:-]*$/', $command);
         }
     }
+
+    public function test_telescope_is_a_dependency_of_the_package_not_of_the_host(): void
+    {
+        $manifest = json_decode((string) file_get_contents(dirname(__DIR__) . '/composer.json'), true, flags: JSON_THROW_ON_ERROR);
+
+        $this->assertArrayHasKey('laravel/telescope', $manifest['require']);
+    }
 }
