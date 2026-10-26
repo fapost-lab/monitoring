@@ -17,7 +17,7 @@
 
     <x-pulse::card-header
         name="Installation health"
-        details="{{ $health['generated_at'] ? 'as of ' . $health['generated_at']->format('H:i:s') : '' }}"
+        details="{{ $health['generated_at'] ? 'as of ' . $health['generated_at']->format('H:i:s T') : '' }}"
     >
         <x-slot:icon>
             <x-pulse::icons.server />

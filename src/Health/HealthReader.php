@@ -159,7 +159,12 @@ final readonly class HealthReader
 
     private function number(int|float $value): string
     {
-        return is_int($value) ? number_format($value) : number_format($value, 1);
+        if (is_int($value)) {
+            return number_format($value);
+        }
+
+        // Up to three decimals, trailing zeros dropped: 0.04 stays 0.04, 12.5 stays 12.5, 3.0 becomes 3.
+        return mb_rtrim(mb_rtrim(number_format($value, 3), '0'), '.');
     }
 
     private function serviceLabel(MonitoredService $service): string
