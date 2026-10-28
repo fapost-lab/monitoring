@@ -606,8 +606,8 @@ jig_checkout_busy() {
 #
 # A report may say "someone is here" on weak evidence; a refusal blocks a
 # person, so it is narrower: a record occupies HEAD when it is named by a task
-# that has been started (its state has a `branch`), is not `consolidated` or
-# `abandoned`, and whose branch is the one checked out here. A record named by
+# that has been started (its state has a `branch`), is not `consolidated`,
+# `abandoned` or `archived`, and whose branch is the one checked out here. A record named by
 # a session id, a task that was only filed, a closed one, or one whose branch
 # went back to the base has no HEAD here to lose, whatever its age says.
 #
@@ -624,7 +624,7 @@ jig_checkout_occupants() {
     state="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$name/state"
     [ -f "$state" ] || continue
     _jig_checkout_read "$state" status || _JIG_CHECKOUT_READ=""
-    case "$_JIG_CHECKOUT_READ" in consolidated | abandoned) continue ;; esac
+    case "$_JIG_CHECKOUT_READ" in consolidated | abandoned | archived) continue ;; esac
     _jig_checkout_read "$state" branch || continue
     [ "$_JIG_CHECKOUT_READ" = "$head" ] || continue
     printf '%s %s %s\n' "$name" "$age" "$cmd"

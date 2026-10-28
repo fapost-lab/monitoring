@@ -286,6 +286,30 @@ _queue_apply() {
         k = r SUBSEP ENVIRON["Q_KIND"]
         if (!(k in ridx)) exit 8
         ralive[ridx[k]] = 0
+      } else if (op == "absorb") {
+        # A task merged into another (`jig task merge`): what waited for the
+        # absorbed task now waits for the one that took its work, and what the
+        # absorbed task waited for, that one now waits for. A wait between the
+        # two disappears; one that would close a cycle refuses the whole write.
+        o = ENVIRON["Q_ON"]
+        for (j = 1; j <= dn; j++) {
+          if (!dalive[j]) continue
+          if (don[j] == r) {
+            dalive[j] = 0
+            if (dsub[j] == o) continue
+            k = dsub[j] SUBSEP o
+            if (k in didx && dalive[didx[k]]) continue
+            if (reaches(o, dsub[j])) exit 7
+            jj = ++dn; dsub[jj] = dsub[j]; don[jj] = o; drea[jj] = drea[j]; dalive[jj] = 1; didx[k] = jj
+          } else if (dsub[j] == r) {
+            dalive[j] = 0
+            if (don[j] == o) continue
+            k = o SUBSEP don[j]
+            if (k in didx && dalive[didx[k]]) continue
+            if (reaches(don[j], o)) exit 7
+            jj = ++dn; dsub[jj] = o; don[jj] = don[j]; drea[jj] = drea[j]; dalive[jj] = 1; didx[k] = jj
+          }
+        }
       } else if (op == "remove") {
         if (!(r in idx)) exit 8
         alive[idx[r]] = 0
@@ -509,6 +533,32 @@ _queue_write() {
     depend) printf 'queue: %s waits for %s\n' "$ref" "$on" ;;
     *) _queue_item_line "$file" "$ref" ;;
   esac
+}
+
+# queue_absorb <from-id> <into-id> — move the waits of a task that `jig task
+# merge` absorbed onto the task that took its work, in one write against the
+# revision read here (adr-20261019-the-queue-is-one-file-written-against-a-
+# revision). The absorbed task's own item stays, as an archived task's does.
+# Nothing to do, and nothing written, when the clone has no queue yet.
+queue_absorb() {
+  local from="task:$1" into="task:$2" file new expected rc=0
+  file=$(queue_file)
+  [ -f "$file" ] || return 0
+  expected=$(jig_revision_read)
+  new="$file.tmp.$$"
+  jig_cleanup_add "$new"
+  Q_OP=absorb Q_REF="$from" Q_ON="$into" _queue_apply "$file" > "$new" || rc=$?
+  case "$rc" in
+    0) ;;
+    6) jig_die "queue: $file is in another format than this jig writes ($QUEUE_FORMAT); upgrade jig" ;;
+    7) jig_die "task merge: moving the waits of $from onto $into would close a cycle in the queue; drop one with jig queue undepend first" ;;
+    *) jig_die "queue: cannot read $file" ;;
+  esac
+  if cmp -s "$file" "$new"; then
+    rm -f "$new"
+    return 0
+  fi
+  _queue_commit "$expected" "$new" "$file"
 }
 
 # _queue_item_line <file> <ref> — `queue: <ref> at <position> on <level>, priority <p>`.
@@ -764,7 +814,7 @@ _queue_next_task_fact() {
 # target stands at: finished, open, broken or unknown.
 #
 # A task is finished when it is consolidated or housekeeping saw it merged;
-# broken when it was abandoned or its workspace is gone (the dependency can
+# broken when it was abandoned or archived or its workspace is gone (the dependency can
 # never be met — the person drops it); open when housekeeping saw its pull
 # request open or closed unmerged; unknown otherwise, which is what a task
 # housekeeping never ran for answers. An epic is open or finished by its
@@ -781,7 +831,8 @@ _queue_next_dep_state() {
       st=$(_jig_task_state_value "$id" status)
       case "$st" in
         consolidated) printf 'finished'; return 0 ;;
-        abandoned) printf 'broken'; return 0 ;;
+        # An archived task is out of the work (adr-20261027-a-task-nobody-finished-is-archived-not-purged).
+        abandoned | archived) printf 'broken'; return 0 ;;
       esac
       case "$merged" in *" $id "*) printf 'finished'; return 0 ;; esac
       case "$open_ids" in *" $id "*) printf 'open'; return 0 ;; esac

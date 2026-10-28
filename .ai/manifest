@@ -1,8 +1,8 @@
 # jig manifest. Do not edit by hand; maintained by `jig init` and `jig upgrade`.
-jig.version: 0.35.0
+jig.version: 0.37.0
 jig.source: /Users/bpartner/.local/share/jig
 jig.mode: copy
-installed_at: 2026-10-26
+installed_at: 2026-10-28
 adapters: [claude, codex]
 instructions.section: 2fc3032d4d6b719b6830891f5602ccb6050643bf AGENTS.md
 ---
@@ -14,36 +14,36 @@ af67627062aa4577b41eb6615454216514282b21 .ai/scripts/jig
 980660d100d8f5ad3c7c62109d1fdb65322048fe .ai/scripts/jig-notify-hook
 0464f3688bd9fd70b316635e3f0ce112b3869552 .ai/scripts/jig-session-hook
 3ec0200881ca93c4d9a2e2c1ca1b333abe8988f3 .ai/scripts/jig.cmd
-cf0e21850081b28f39647d950ba7f6dd783a5030 .ai/scripts/lib/bootstrap.sh
-1f8f32f195b290d55514961870f21c1b8197e90c .ai/scripts/lib/checkout.sh
-b819d5101e4553bbda14bf5a59d66fb5d7ecd7b5 .ai/scripts/lib/common.sh
-d77069b25c86166daa20a08e148d9abc166dbe87 .ai/scripts/lib/config.sh
+14f1890a4a124ac41a29f8397c7e22a3a3467bd7 .ai/scripts/lib/bootstrap.sh
+aa5355a5c90e90e5af5090d06abbdd45da6aa6e6 .ai/scripts/lib/checkout.sh
+ccd0709e40fa8b6d62f7890fee8fbc346ec80e89 .ai/scripts/lib/common.sh
+afdbb554b235a679b67296e6912e0509f8b56c11 .ai/scripts/lib/config.sh
 27b335e618e6b7bd04617e36926abdc970997551 .ai/scripts/lib/context.sh
 30bb8871fe1bfefc2aa4b6848ca1d791dcc031e3 .ai/scripts/lib/doctor.sh
 a3105f1c9668ea68e2885f9a779f8ba096f63ca7 .ai/scripts/lib/forgecache.sh
 40143f7b0f3af4062c2100ceeb79595b7c4c301d .ai/scripts/lib/frontmatter.sh
-29ddd37e2ce5643e576aa9c8199bb3505df796ac .ai/scripts/lib/hklog.sh
+1c3018cc39c5f72b8e9e305d4741785c89bd3a66 .ai/scripts/lib/hklog.sh
 db09e87f40d6245b8307b9eebc2c88e85bf35aa2 .ai/scripts/lib/hostruntime.sh
-b2def95bb3b355147e956eca00941622e3154194 .ai/scripts/lib/housekeeping.sh
+60ff888e0dec6e80d5a59f94ba35df16c6896dd6 .ai/scripts/lib/housekeeping.sh
 f90bbe29f33534cfbc0b9c3e6b736869ac9e99c2 .ai/scripts/lib/init.sh
 b889010df42ad724b44242a8188cdaffaade1403 .ai/scripts/lib/json.sh
 2e943f9f1ee9dfb443d60cc7457f8070f67903e9 .ai/scripts/lib/knowledge.sh
 c75dd123bbc829747e44739916c9eeab664b9ca8 .ai/scripts/lib/manifest.sh
-343cd35fa8de9a575b9204ca9112ed6df50ea123 .ai/scripts/lib/measure.sh
+e7d31e08cc73fd7c0f2127d5423fab8723b76bfc .ai/scripts/lib/measure.sh
 ae33af4fd69aca4fcdb97b615d2c18a1c7417b68 .ai/scripts/lib/notify.sh
 4509dcc81a0938c22ff9acd2adb982f7faa5b538 .ai/scripts/lib/output.sh
 ea8c7017924baa4925147ad09ea7bd250bf637c3 .ai/scripts/lib/profile.sh
 fa836707b8566849bf0820bee45f631cc3d831da .ai/scripts/lib/profiles.sh
-6b81600a385da36509f1f79378898dbe8da98607 .ai/scripts/lib/queue.sh
+5d36269641776fc0ad8f5f672e1ad3f7510db51d .ai/scripts/lib/queue.sh
 4e5579bce1603bb75154f1f1c48f8723c24ee88f .ai/scripts/lib/runenv.sh
 a9a2ad622dde1bcbefbefbecda5c43704b1a88ad .ai/scripts/lib/section.sh
 98d3ba0b0f0308d2e132702ebd32808092541f15 .ai/scripts/lib/self-update.sh
-31a075370d8d8bbbc31dad82d735eff4f71b42d9 .ai/scripts/lib/spec.sh
-028ca21cbc884d033b760b7b324f90e585989ad1 .ai/scripts/lib/status.sh
-39893da7658d844f1170df0ffef14894a2ba7a46 .ai/scripts/lib/task.sh
+32aca4560bc9c4614b0b417f8786287026a0e9d7 .ai/scripts/lib/spec.sh
+00df004e108daa3714843d1150c100dc493f7033 .ai/scripts/lib/status.sh
+e019b261845319fb2109f2bc3e2a9ef8d10ec179 .ai/scripts/lib/task.sh
 3d6b7a9e71833328de43e9bbbfd49a695441851f .ai/scripts/lib/upgrade.sh
 c3f8380a184522debd74c96c6cd619012b3f3ad0 .ai/scripts/lib/verify.sh
-547f6a1b70346ec871c5d32fe1f477857da202c3 .ai/scripts/lib/version.sh
+e52af0e991191a7a36c593785eaf8f6dc1b9b37d .ai/scripts/lib/version.sh
 c7e448192f8119f1fcc68a64107525839c2e04ce .ai/templates/AGENTS.md
 0bfa7525891285b0ade4424461b542041a8580b3 .ai/templates/knowledge/ARCHITECTURE.md
 4d242f6e411f31ac0d087f53ecd3f1fa135c8425 .ai/templates/knowledge/GLOSSARY.md
@@ -81,7 +81,7 @@ c5c38935eedded08fe830bf60b258f0bd488eaed .claude/skills/jig-release/SKILL.md
 95dff2d79b4397389f2670b2708bc7d67a403e4c .claude/skills/jig-review/references/change-scope.md
 ff13c11ac6ea67b819384813cfb921145ba66cd4 .claude/skills/jig-review/references/findings.md
 75ab8baed77c7f31f50c964ea62d590a6b5b45d1 .claude/skills/jig-review/references/what-to-run.md
-a1e9dc553a8dde6d563d96ad80df261be42e8ac0 .claude/skills/jig-setup/SKILL.md
+984f3ab8bd772e17795b9cd0134807d69e52912f .claude/skills/jig-setup/SKILL.md
 461bb958db7e86f2b569139c49fe9279c2dd8166 .claude/skills/jig-task/SKILL.md
 5e8a1886c14219e59773f1eb76de22f38e213d53 .claude/skills/jig-task/references/classification.md
 4f9508f32945a4aa1c604a33910193053dffe2db .claude/skills/jig-task/references/component-boundaries.md
@@ -111,7 +111,7 @@ c5c38935eedded08fe830bf60b258f0bd488eaed .codex/skills/jig-release/SKILL.md
 95dff2d79b4397389f2670b2708bc7d67a403e4c .codex/skills/jig-review/references/change-scope.md
 ff13c11ac6ea67b819384813cfb921145ba66cd4 .codex/skills/jig-review/references/findings.md
 75ab8baed77c7f31f50c964ea62d590a6b5b45d1 .codex/skills/jig-review/references/what-to-run.md
-a1e9dc553a8dde6d563d96ad80df261be42e8ac0 .codex/skills/jig-setup/SKILL.md
+984f3ab8bd772e17795b9cd0134807d69e52912f .codex/skills/jig-setup/SKILL.md
 461bb958db7e86f2b569139c49fe9279c2dd8166 .codex/skills/jig-task/SKILL.md
 5e8a1886c14219e59773f1eb76de22f38e213d53 .codex/skills/jig-task/references/classification.md
 4f9508f32945a4aa1c604a33910193053dffe2db .codex/skills/jig-task/references/component-boundaries.md

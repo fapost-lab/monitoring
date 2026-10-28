@@ -92,9 +92,10 @@ their own file is answered by `config unset` too — say that the key then answe
    `lean` for someone who would rather trade a little review depth for time and tokens. One
    task can always differ.
 9. **Cleanup** (`housekeeping.*`, `git.delete_merged_branches`) — one question, offer to skip:
-   how long an abandoned task is kept (`housekeeping.abandoned_ttl`, 14d), how long the trash
-   is kept (`housekeeping.trash_ttl`, 7d), when an idle task is called stale
-   (`housekeeping.stale_after`, 60d), how often cleanup runs (`housekeeping.cadence`, whole
+   how long an abandoned task stays in the lists before it goes to the archive
+   (`housekeeping.abandoned_ttl`, 14d), how long the trash of closed tasks is kept
+   (`housekeeping.trash_ttl`, 7d), when an untouched task is moved to the archive
+   (`housekeeping.stale_after`, 60d; the archive keeps it, nothing is deleted), how often cleanup runs (`housekeeping.cadence`, whole
    days, 1d), whether it may `git fetch` (`housekeeping.fetch`, true), and whether a branch Jig
    made is deleted once its work has landed (`git.delete_merged_branches`, true — `false` keeps
    every branch). Recommend the defaults.

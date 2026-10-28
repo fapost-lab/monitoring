@@ -104,8 +104,8 @@ cmd_housekeeping() {
     _hk_log "--- run $(date -u +%Y-%m-%dT%H:%M:%SZ) forge=$_HK_FORGE_TOKEN"
   fi
 
-  local needs_consolidation=0 wrong_base=0 found=0 keep_branches=""
-  local state_file tid st paused age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire
+  local needs_consolidation=0 wrong_base=0 archive_refused=0 found=0 keep_branches="" archive_err
+  local reason state_file tid st paused age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire
 
   # Worktrees tasks were started in, from git's own list, read once per run.
   # A task's worktree goes when the task is closed and its branch landed on its
@@ -193,7 +193,28 @@ EOF
       _HK_WT_LINE=""
       _HK_WT_NOTE=""
       retire=0
+      reason=""
       [ "$action" = "purge" ] && retire=1
+      if [ "$action" = "archive" ]; then
+        if [ "$st" = "abandoned" ]; then
+          reason="abandoned"
+          retire=1
+        else
+          reason="stale"
+          # Nobody abandoned this task, so a worktree or a dirty checkout on its
+          # branch may hold work that is still being done: it is reported as
+          # stale and left as it is. So is one whose work landed on the wrong
+          # base, which the policy could not see.
+          wt=""
+          [ -z "$branch" ] || wt=$(_task_worktree_for "$branch" "$worktrees")
+          if [ -n "$wt" ] || [ -n "$landed" ] \
+             || { [ -n "$branch" ] && [ "$branch" = "$here" ] && ! _hk_checkout_keep "$dry" "$tid"; }; then
+            action="preserve"
+            reason=""
+            flags="${flags:+$flags,}STALE_CANDIDATE"
+          fi
+        fi
+      fi
       [ "$st" = "consolidated" ] && [ "$remote" = "merged" ] && retire=1
       if [ "$retire" = 1 ] && [ -n "$branch" ]; then
         wt=$(_task_worktree_for "$branch" "$worktrees")
@@ -228,6 +249,25 @@ EOF
         fi
       fi
 
+      # The only writer of `archived` is the task domain's; housekeeping asks it
+      # and never writes the state itself. The workspace stays where it is
+      # (adr-20261027-a-task-nobody-finished-is-archived-not-purged).
+      # A refusal there is one task's, not the run's: the writer dies, so it is
+      # asked in a subshell, and a task it refused is kept and reported while
+      # the run goes on to the rest, its report and its log. Its exit status is
+      # not the proof: errexit is off in a tested command, so a failed write
+      # inside would go unnoticed. The state it leaves is asked instead.
+      if [ "$action" = "archive" ] && [ "$dry" != 1 ]; then
+        archive_err=$( (_task_archive "$tid" "$reason") 2>&1 >/dev/null) || true
+        if [ "$(task_state_get "$tid" status)" != archived ]; then
+          [ -n "$archive_err" ] || archive_err="its state was not written"
+          printf 'housekeeping: %s was not archived: %s\n' "$tid" "${archive_err#jig: error: }" >&2
+          action="preserve"
+          reason=""
+          archive_refused=1
+        fi
+      fi
+
       # A workspace that stays keeps its branch: ancestry, the epic's final
       # review and the person still read it. It keeps its base too, which may
       # be another task's branch (ADR-0026). One the run purged lets its branch
@@ -239,7 +279,7 @@ $task_base
 "
       fi
 
-      _hk_report "$dry" "$tid" "$st" "$remote" "$action" "$flags" "$dest" "$facts"
+      _hk_report "$dry" "$tid" "$st" "$remote" "$action" "$flags" "$dest" "$facts" "$reason"
       _hk_record "$tid" "$st" "$remote" "$action" "$flags" "$age" \
         "$abandoned_ttl_days" "$branch" "$base_commit" "$task_base"
     done < <(find "$tasks_dir" -mindepth 2 -maxdepth 2 -name state -type f 2>/dev/null | LC_ALL=C sort)
@@ -280,7 +320,10 @@ $task_base
   if [ "$wrong_base" = 1 ]; then
     printf 'action needed: check the tasks flagged wrong-base; their work landed outside their base\n'
   fi
-  if [ "$needs_consolidation" = 1 ] || [ "$wrong_base" = 1 ]; then
+  if [ "$archive_refused" = 1 ]; then
+    printf 'action needed: a task could not be archived; the reason is above\n'
+  fi
+  if [ "$needs_consolidation" = 1 ] || [ "$wrong_base" = 1 ] || [ "$archive_refused" = 1 ]; then
     return 3
   fi
   return 0
@@ -290,11 +333,17 @@ $task_base
 
 # housekeeping_decide <status> <remote> <paused> <age_days> <abandoned_ttl_days>
 #                     <stale_after_days> [released]
-# Print "<action> [flags]" where action is purge|preserve and flags is a
+# Print "<action> [flags]" where action is purge|preserve|archive and flags is a
 # comma-separated subset of needs-consolidation, abandoned?, base-unreleased,
 # STALE_CANDIDATE. `released` (default true) is false for a task merged into a
 # base that has not reached the default branch yet — a phase of an open epic:
 # closed and merged, it is kept rather than purged (ADR-0040).
+#
+# `archive` is for work nobody finished: an abandoned task past its TTL, or an
+# active/ready one untouched past stale_after with no flag and no pull request.
+# The reason (abandoned|stale) is the caller's to derive from the status. The
+# caller may still refuse a stale archive where a worktree holds the task's
+# work; the decision stays pure and says only what age and state allow.
 #
 # A pure function of six strings: no filesystem, no git, no config. That is
 # what makes the domains/housekeeping policy table exhaustively testable, and it is the reason
@@ -318,6 +367,13 @@ housekeeping_decide() {
     # Already abandoned: "abandoned?" would ask a question that has been
     # answered.
     abandoned:closed) ;;
+    # Archived: its work was not finished when it was shelved, so a merge means
+    # it landed after all and a person has to consolidate it. A closed pull
+    # request is no question to ask of a task already set aside.
+    archived:merged)
+      flags="needs-consolidation"
+      ;;
+    archived:closed) ;;
     *:closed)
       flags="abandoned?"
       ;;
@@ -335,16 +391,27 @@ housekeeping_decide() {
     esac
   fi
 
-  # `abandoned` is the one status whose purge is driven by a TTL rather than
-  # by remote state, because a closed PR gives the workspace no other end.
+  # `abandoned` is the one status whose end is driven by a TTL rather than by
+  # remote state, because a closed PR gives the workspace no other end. The end
+  # is the archive, not the trash: nobody finished the work, so the workspace
+  # stays readable (adr-20261027-a-task-nobody-finished-is-archived-not-purged).
   if [ "$status" = "abandoned" ] && [ "$age" -gt "$abandoned_ttl" ]; then
-    action="purge"
+    action="archive"
     flags=""
   fi
 
+  # An unfinished task untouched past stale_after, with nothing else to say
+  # about it, is set aside the same way. Any flag, or a pull request in any
+  # state, means the lifecycle has something to say and age does not decide.
+  if [ "$action" = "preserve" ] && [ -z "$flags" ] && [ "$age" -gt "$stale_after" ]; then
+    case "$status:$remote" in
+      active:unknown | ready:unknown) action="archive" ;;
+    esac
+  fi
+
   # Reported, never acted on: age is a hint, semantic lifecycle has priority
-  # over TTL (domains/housekeeping).
-  if [ "$age" -gt "$stale_after" ] && [ "$action" != "purge" ]; then
+  # over TTL (domains/housekeeping). An archived task is already set aside.
+  if [ "$age" -gt "$stale_after" ] && [ "$action" = "preserve" ] && [ "$status" != "archived" ]; then
     if [ -n "$flags" ]; then
       flags="$flags,STALE_CANDIDATE"
     else
@@ -1022,14 +1089,16 @@ _hk_branch_forge_merged() {
 # past its refusal, only a tip inside the merged pull request's head; origin
 # is touched only with a merged pull request whose head is where origin's
 # branch still is, and an origin/ ref whose branch origin no longer has (one
-# `ls-remote` per run) is dropped after the local branch.
+# `ls-remote` per run) is dropped after the local branch. Origin's copies go
+# together, in one lease push after the loop (jig_branches_leave_origin): a
+# run makes two network calls however many branches it deletes (issue #317).
 #
 # Only in the clone's main checkout: a worktree borrows `tasks/`, finds no
 # workspace of its own, and would take every task's branch for an orphan.
 # Off with git.delete_merged_branches: false; nothing remote below agent.git
 # or autopilot.git push, without housekeeping.fetch, on a dry run, or without origin.
 _hk_branch_sweep() {
-  local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 heads="" b tip sha merged landed have_local have_track rsha line
+  local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 heads="" b tip sha merged landed have_local have_track rsha out origin_go=()
   cfg_bool git.delete_merged_branches true || return 0
   [ "$(jig_config_clone_root)" = "$JIG_PROJECT" ] || return 0
   def_ref=$(jig_base_ref "$_HK_DEFAULT_BASE")
@@ -1092,16 +1161,15 @@ _hk_branch_sweep() {
     if [ -z "$sha" ] || [ -z "$rsha" ] || [ "$sha" != "$rsha" ]; then
       sha=""
     fi
-    while IFS= read -r line; do
-      [ -n "$line" ] || continue
-      printf '%s\n' "$line"
-      case "$line" in
-        *": deleted branch $b on origin") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=delete" ;;
-        *": deleted branch $b") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=delete" ;;
-        *": kept branch $b on origin"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=keep" ;;
-        *": kept branch $b"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=keep" ;;
-      esac
-    done < <(jig_branch_leave housekeeping "$b" "$sha" "$merged")
+    # Here the local branch only; origin's copy waits for the one push after
+    # the loop, and only if the local branch is gone (jig_branch_leave says
+    # why that order is the safety).
+    out=$(jig_branch_leave housekeeping "$b" "" "$merged")
+    _hk_branch_say "$b" "$out"
+    case "$out" in
+      *": kept branch $b:"*) ;;
+      *) [ -z "$sha" ] || origin_go+=("$b" "$sha") ;;
+    esac
     # A cache of a branch origin no longer has, dropped once the local branch
     # is gone (it was what `-d` compared that branch against).
     if [ "$remote_ok" = 1 ] && [ "$have_track" = 1 ] && [ -z "$rsha" ] \
@@ -1112,7 +1180,32 @@ _hk_branch_sweep() {
       git -C "$JIG_PROJECT" for-each-ref --format='%(refname:strip=2)' refs/heads/ 2>/dev/null
       git -C "$JIG_PROJECT" for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/ 2>/dev/null
     } | grep -vx 'HEAD' | LC_ALL=C sort -u)
+  if [ "${#origin_go[@]}" -gt 0 ]; then
+    out=$(jig_branches_leave_origin housekeeping "${origin_go[@]}")
+    while [ "${#origin_go[@]}" -ge 2 ]; do
+      _hk_branch_say "${origin_go[0]}" "$(printf '%s\n' "$out" | grep -F " branch ${origin_go[0]} on origin" || true)"
+      origin_go=("${origin_go[@]:2}")
+    done
+  fi
   return 0
+}
+
+# _hk_branch_say <branch> <lines> — print what jig_branch_leave or
+# jig_branches_leave_origin said about <branch>, and log each outcome.
+_hk_branch_say() {
+  local b="$1" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '%s\n' "$line"
+    case "$line" in
+      *": deleted branch $b on origin") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=delete" ;;
+      *": deleted branch $b") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=delete" ;;
+      *": kept branch $b on origin"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=keep" ;;
+      *": kept branch $b"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=keep" ;;
+    esac
+  done <<EOF
+$2
+EOF
 }
 
 # --- purge -------------------------------------------------------------------
@@ -1482,7 +1575,7 @@ _hk_trash_expire() {
 
 # --- reporting ---------------------------------------------------------------
 
-# _hk_report <dry> <task> <status> <remote> <action> <flags> <dest> [facts]
+# _hk_report <dry> <task> <status> <remote> <action> <flags> <dest> [facts] [reason]
 # One log line for the audit trail, and the same decision as a stdout line
 # with --verbose; the grouped report is _hk_record's. The log
 # records `via=` — the tier that decided — because "why was this deleted" has
@@ -1494,21 +1587,23 @@ _hk_trash_expire() {
 # preserve line keeps repeating the same short shape on every run.
 _hk_report() {
   local dry="$1" tid="$2" st="$3" remote="$4" action="$5" flags="$6" dest="$7"
-  local facts="${8:-}"
+  local facts="${8:-}" reason="${9:-}"
   local shown="$action" rel=""
 
   if [ "$action" = "purge" ]; then
     rel=$(jig_relpath "$dest" "$JIG_PROJECT")
     [ "$dry" = 1 ] && shown="would-purge"
   fi
+  [ "$action" = "archive" ] && [ "$dry" = 1 ] && shown="would-archive"
 
   local line="$tid status=$st remote=$remote via=$_HK_VIA action=$shown"
+  [ -n "$reason" ] && line="$line reason=$reason"
   [ -n "$rel" ] && line="$line dest=$rel"
   [ -n "$flags" ] && line="$line flags=$flags"
   [ "$_HK_VERBOSE" != 1 ] || printf '%s\n' "$line"
 
   [ "$dry" = 1 ] && return 0
-  _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) task=$tid status=$st remote=$remote via=$_HK_VIA action=$shown${rel:+ dest=$rel}${flags:+ flags=$flags}${facts:+ $facts}"
+  _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) task=$tid status=$st remote=$remote via=$_HK_VIA action=$shown${reason:+ reason=$reason}${rel:+ dest=$rel}${flags:+ flags=$flags}${facts:+ $facts}"
 }
 
 # _hk_record <task> <status> <remote> <action> <flags> <age_days>
@@ -1517,7 +1612,7 @@ _hk_report() {
 # person can act on. Groups: needs (something only a human can do), removed,
 # waiting (consolidated, pull request open), progress, unknown (kept because
 # jig cannot tell whether the work landed), expiring (abandoned, TTL running),
-# skipped.
+# archived (set aside by this run), shelved (archived earlier), skipped.
 _hk_record() {
   local tid="$1" st="$2" remote="$3" action="$4" flags="$5" age="$6" ttl="$7"
   local branch="$8" base_commit="$9" base="${10:-}" group note=""
@@ -1525,6 +1620,12 @@ _hk_record() {
   if [ "$action" = "purge" ]; then
     group="removed"
     note="$_HK_WT_NOTE"
+  elif [ "$action" = "archive" ]; then
+    group="archived"
+    note="$_HK_WT_NOTE"
+    case ",$flags," in
+      *,worktree-kept,*) note="${note:+$note, }its worktree stays" ;;
+    esac
   else
     case ",$flags," in
       *,worktree-kept,*) group="needs"; note="$_HK_WT_NOTE" ;;
@@ -1533,11 +1634,21 @@ _hk_record() {
         group="waiting"
         note="waiting for $base to reach $_HK_DEFAULT_BASE${_HK_WT_NOTE:+, $_HK_WT_NOTE}"
         ;;
-      *,needs-consolidation,*) group="needs"; note="merged but not consolidated, run jig-consolidate" ;;
+      *,needs-consolidation,*)
+        group="needs"
+        # An archived task changes status only by unarchive, so the close it
+        # needs starts there.
+        if [ "$st" = archived ]; then
+          note="merged after it was archived, run jig task unarchive $tid, then jig-consolidate"
+        else
+          note="merged but not consolidated, run jig-consolidate"
+        fi
+        ;;
       *,abandoned?,*) group="needs"; note="pull request closed, run jig task abandon or reopen it" ;;
       *)
         case "$st" in
-          abandoned) group="expiring"; note="expires in $((ttl - age + 1)) days" ;;
+          abandoned) group="expiring"; note="goes to the archive in $((ttl - age + 1)) days" ;;
+          archived) group="shelved"; note="" ;;
           consolidated)
             if [ "$remote" = "open" ]; then
               group="waiting"
@@ -1634,19 +1745,25 @@ _hk_print_report() {
       else names[key] = names[key] SUBSEP $2
     }
     END {
-      split("needs removed waiting progress unknown expiring skipped", groups, " ")
+      split("needs removed archived waiting progress unknown expiring shelved skipped", groups, " ")
       head["needs"] = "needs you (%d):"
       if (dry == 1) head["removed"] = "would remove (%d): would move to .ai/runtime/trash/" day "/"
       else head["removed"] = "removed (%d): moved to .ai/runtime/trash/" day "/, recoverable for " ttl " days"
       head["waiting"] = "waiting for merge (%d): consolidated, pull request still open"
       head["progress"] = "in progress (%d):"
       head["unknown"] = "kept, cannot tell whether it landed (%d):"
-      head["expiring"] = "abandoned, waiting to expire (%d):"
+      head["archived"] = "archived (%d): workspace kept, nothing was removed"
+      head["expiring"] = "abandoned, waiting to go to the archive (%d):"
+      head["shelved"] = "already in the archive (%d):"
       head["skipped"] = "skipped (%d): not a valid task id, left alone"
-      for (gi = 1; gi <= 7; gi++) {
+      for (gi = 1; gi <= 9; gi++) {
         g = groups[gi]
         if (!(g in count)) continue
         printf head[g] "\n", count[g]
+        if (g == "archived" || g == "shelved") {
+          print "  list them: jig task list --status archived"
+          print "  bring one back: jig task unarchive <id>"
+        }
         if ((g SUBSEP "") in names) emit("  ", names[g SUBSEP ""])
         for (k = 1; k <= notes[g]; k++) {
           if (order[g, k] == "") continue

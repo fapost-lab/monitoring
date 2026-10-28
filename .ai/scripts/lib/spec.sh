@@ -699,9 +699,9 @@ spec_epic_status() {
 # hand-edited local file can hold one, and `jig status`'s `config.local:`
 # line shows it as it stands.
 # <state>: not-filed, fog, no-workspace, not-started, active, ready,
-# consolidated, abandoned, done (checked, no workspace here). <merged>: roadmap,
+# consolidated, abandoned, archived, done (checked, no workspace here). <merged>: roadmap,
 # closed, housekeeping or no. <next>: start, running, file, fog, find,
-# abandoned, wait, unscheduled, done.
+# abandoned, unarchive, wait, unscheduled, done.
 spec_plan() {
   local id="" phase="" format=text
   while [ $# -gt 0 ]; do
@@ -1081,6 +1081,7 @@ _spec_plan_decide() {
       if (st[i] == "no-workspace") return "find"
       if (st[i] == "not-started") return "start"
       if (st[i] == "abandoned") return "abandoned"
+      if (st[i] == "archived") return "unarchive"
       return "running"
     }
     function item_row(i) { print "item", wv[i], id[i], st[i], mg[i], pa[i], ap[i], next_of(i), ti[i] }
@@ -1909,7 +1910,7 @@ spec_unchecked_items() {
 
 # spec_epic_unmerged_tasks <branch> — the ids of the tasks in this checkout's
 # workspace cut from <branch> (base_branch) whose own branch is not in HEAD.
-# An abandoned task, one never started, and one whose branch exists nowhere
+# An abandoned or archived task, one never started, and one whose branch exists nowhere
 # any more are not counted: there is nothing of theirs left to merge. A task
 # merged by squash is counted — its commits are not in the epic, and saying
 # so is the safe side.
@@ -1926,7 +1927,7 @@ spec_epic_unmerged_tasks() {
     base=$(sed -n 's/^base_branch:[[:space:]]*//p' "$state" | head -n 1)
     [ "$base" = "$want" ] || continue
     status=$(sed -n 's/^status:[[:space:]]*//p' "$state" | head -n 1)
-    [ "$status" != abandoned ] || continue
+    case "$status" in abandoned | archived) continue ;; esac
     tbranch=$(sed -n 's/^branch:[[:space:]]*//p' "$state" | head -n 1)
     [ -n "$tbranch" ] || continue
     ref=$(jig_base_ref "$tbranch")
@@ -2285,7 +2286,7 @@ spec_remove() {
     [ "$link" = "$sid" ] || continue
     st=$(spec_task_state "$d" status)
     case "$st" in
-      consolidated | abandoned)
+      consolidated | abandoned | archived)
         plan="${plan}keep $tid $st
 "
         continue
@@ -2405,7 +2406,7 @@ spec_link() {
 
   st=$(spec_task_state "$tdir" status)
   case "$st" in
-    consolidated | abandoned) jig_die "spec link: $tid is $st; only a live task is linked" ;;
+    consolidated | abandoned | archived) jig_die "spec link: $tid is $st; only a live task is linked" ;;
   esac
   link=$(jig_spec_link "$tdir/task.md") || rc=$?
   [ "$rc" = 0 ] || jig_die "spec link: $tid links to more than one spec in its task.md"
