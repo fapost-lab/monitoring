@@ -163,6 +163,8 @@ git.worktree_root ../<project>.worktrees
 git.delete_merged_branches true
 worktree.carry []
 worktree.share []
+worktree.setup
+worktree.setup_timeout 10m
 forge auto
 task.issue_pattern
 housekeeping.cadence 1d
@@ -594,7 +596,7 @@ jig_config_value_problem() {
       esac
       ;;
     housekeeping.trash_ttl | housekeeping.abandoned_ttl | housekeeping.stale_after \
-      | checkout.busy_ttl | verify.busy_ttl)
+      | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout)
       case "${value%[dhms]}" in
         '' | *[!0-9]* | ?????????*) printf 'not a duration (e.g. 7d, 12h, 30m, 90s)\n'; return 1 ;;
       esac

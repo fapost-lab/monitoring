@@ -215,20 +215,20 @@ _measure_process() {
     $4 == "purged" { purged++ }
     { cls[$2]++; st[$3]++ }
     END {
-      printf "%d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
+      printf "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n",
         total + 0, live + 0, purged + 0,
         cls["T0"] + 0, cls["T1"] + 0, cls["T2"] + 0, cls["T3"] + 0, cls["T4"] + 0,
         cls["unclassified"] + 0,
         st["active"] + 0, st["ready"] + 0, st["consolidated"] + 0,
-        st["abandoned"] + 0,
-        total - (st["active"] + st["ready"] + st["consolidated"] + st["abandoned"])
+        st["abandoned"] + 0, st["archived"] + 0,
+        total - (st["active"] + st["ready"] + st["consolidated"] + st["abandoned"] + st["archived"])
     }
   ' "$rows" > "$counts"
 
   local total live purged t0 t1 t2 t3 t4 unclassified
-  local active ready consolidated abandoned other
+  local active ready consolidated abandoned archived other
   read -r total live purged t0 t1 t2 t3 t4 unclassified \
-    active ready consolidated abandoned other < "$counts"
+    active ready consolidated abandoned archived other < "$counts"
 
   if [ "$total" -eq 0 ]; then
     printf 'process:    no task workspaces and no purge records\n'
@@ -239,8 +239,8 @@ _measure_process() {
     "$total" "$live" "$purged"
   printf '            class: T0 %d, T1 %d, T2 %d, T3 %d, T4 %d, unclassified %d\n' \
     "$t0" "$t1" "$t2" "$t3" "$t4" "$unclassified"
-  printf '            outcome: consolidated %d, abandoned %d, active %d, ready %d, other %d\n' \
-    "$consolidated" "$abandoned" "$active" "$ready" "$other"
+  printf '            outcome: consolidated %d, abandoned %d, archived %d, active %d, ready %d, other %d\n' \
+    "$consolidated" "$abandoned" "$archived" "$active" "$ready" "$other"
 }
 
 # --- change ------------------------------------------------------------------

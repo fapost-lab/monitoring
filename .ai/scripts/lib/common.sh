@@ -1558,7 +1558,7 @@ jig_branch_checked_out() {
 # Off with `git.delete_merged_branches: false`. Returns 0 always: keeping a
 # branch is an outcome, never a failure of the command that called this.
 jig_branch_leave() {
-  local who="$1" b="$2" sha="$3" merged="${4-$3}" ssh out tip
+  local who="$1" b="$2" sha="$3" merged="${4-$3}" out tip
   cfg_bool git.delete_merged_branches true || return 0
   jig_branch_is_jigs "$b" || return 0
   if jig_branch_checked_out "$b"; then
@@ -1584,18 +1584,53 @@ jig_branch_leave() {
   fi
   [ -n "$sha" ] || return 0
   git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1 || return 0
-  ssh=$(jig_git_batch_ssh)
-  if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh" git -C "$JIG_PROJECT" push --quiet \
-       "--force-with-lease=refs/heads/$b:$sha" origin ":refs/heads/$b" >/dev/null 2>&1; then
-    printf '%s: deleted branch %s on origin\n' "$who" "$b"
-    return 0
-  fi
-  if out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh" \
+  out=$(jig_branches_leave_origin "$who" "$b" "$sha")
+  case "$out" in
+    *": deleted branch $b on origin")
+      printf '%s\n' "$out"
+      return 0
+      ;;
+  esac
+  if out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
        git -C "$JIG_PROJECT" ls-remote --heads origin "refs/heads/$b" 2>/dev/null) && [ -z "$out" ]; then
     git -C "$JIG_PROJECT" branch -q -d -r "origin/$b" >/dev/null 2>&1 || true
     return 0
   fi
   printf '%s: kept branch %s on origin: it is no longer at the merged commit, or origin refused\n' "$who" "$b"
+  return 0
+}
+
+# jig_branches_leave_origin <who> <branch> <sha> [<branch> <sha> ...] — delete
+# each <branch> on origin while it is still at its <sha>, all in one push, and
+# say for each: `<who>: deleted branch <b> on origin` or `<who>: kept branch <b>
+# on origin: <why>`. The one place Jig deletes a branch on origin; the caller
+# has already let the local branch go (jig_branch_leave says why that order).
+#
+# One push, not one per branch: over HTTPS every network call goes through the
+# credential helper, and a helper that asks the person (a Keychain dialog
+# GIT_TERMINAL_PROMPT=0 does not stop) asked once per branch (issue #317).
+# Without --atomic, so a lease that fails for one branch holds back no other;
+# --porcelain reports each ref, `-` deleted and `!` rejected. A ref with no
+# line — the push failed as a whole — is kept. Returns 0 always.
+jig_branches_leave_origin() {
+  local who="$1" out b leases=() refs=()
+  shift
+  while [ "$#" -ge 2 ]; do
+    leases+=("--force-with-lease=refs/heads/$1:$2")
+    refs+=("$1")
+    shift 2
+  done
+  [ "${#refs[@]}" -gt 0 ] || return 0
+  out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+    git -C "$JIG_PROJECT" push --porcelain "${leases[@]}" origin "${refs[@]/#/:refs/heads/}" 2>/dev/null || true)
+  for b in "${refs[@]}"; do
+    if printf '%s\n' "$out" | awk -F '\t' -v r=":refs/heads/$b" \
+         '$1 == "-" && $2 == r { found = 1 } END { exit !found }'; then
+      printf '%s: deleted branch %s on origin\n' "$who" "$b"
+    else
+      printf '%s: kept branch %s on origin: it is no longer at the merged commit, or origin refused\n' "$who" "$b"
+    fi
+  done
   return 0
 }
 
@@ -2550,14 +2585,14 @@ jig_pause_request_refusal() {
 }
 
 # jig_pause_request_state_refusal <id> — the part of the refusal above that
-# comes from the task's own state (paused, consolidated, abandoned), or
+# comes from the task's own state (paused, consolidated, abandoned, archived), or
 # nothing. `jig queue request` refuses it with `failed`, and only a refusal
 # past it — a request already pending — with `already-exists`.
 jig_pause_request_state_refusal() {
   local id="$1" status
   status=$(_jig_task_state_value "$id" status)
   case "$status" in
-    consolidated | abandoned)
+    consolidated | abandoned | archived)
       printf 'queue request: task %s is %s\n' "$id" "$status"
       return 0 ;;
   esac
@@ -2732,9 +2767,11 @@ jig_relpath_from() {
 # package). Composer's path repositories under `packages/` are the case; a
 # `vendor/<vendor>/<package>/.git` from --prefer-source is two levels down and
 # is not. Read by `jig status` and by a worktree's bootstrap, which say so
-# (adr-20261002-a-worktree-shares-a-directory-by-mirroring-it).
+# (adr-20261002-a-worktree-shares-a-directory-by-mirroring-it). [extra] is a
+# newline list of directories shared besides the key — a task's own `share` —
+# which count as declared.
 jig_share_candidates() {
-  local root="$1" entry dir child declared="" one
+  local root="$1" extra="${2:-}" entry dir child declared="" one
   # Declared the way the bootstrap reads them: `packages/` names `packages`.
   while IFS= read -r one; do
     while :; do
@@ -2747,6 +2784,7 @@ jig_share_candidates() {
 "
   done <<EOF
 $(cfg_list_lines worktree.share)
+$extra
 EOF
   while IFS= read -r entry; do
     dir=${entry%/}

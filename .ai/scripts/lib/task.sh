@@ -27,6 +27,9 @@ cmd_task() {
     start) task_start "$@" ;;
     bootstrap) task_bootstrap "$@" ;;
     abandon) task_abandon "$@" ;;
+    archive) task_archive "$@" ;;
+    unarchive) task_unarchive "$@" ;;
+    merge) task_merge "$@" ;;
     pause) task_pause "$@" ;;
     resume) task_resume "$@" ;;
     list) task_list "$@" ;;
@@ -55,15 +58,18 @@ cmd_task() {
 # one source for both `--help` and the usage errors the subcommands die with.
 _task_usage() {
   case "${1:-}" in
-    '') printf 'usage: jig task new|start|bootstrap|set|abandon|pause|resume|list|show|current|changes|artifacts|artifact|finding|findings|receipt|ship|autopilot|gate|route ...\n' ;;
+    '') printf 'usage: jig task new|start|bootstrap|set|abandon|archive|unarchive|merge|pause|resume|list|show|current|changes|artifacts|artifact|finding|findings|receipt|ship|autopilot|gate|route ...\n' ;;
     new) printf 'usage: jig task new <id> [--class T0..T4] [--domains a,b] [--from <file> | --goal <text>] [--lean] [--json]\n' ;;
-    start) printf 'usage: jig task start <id> [--worktree] [--no-bootstrap]\n' ;;
-    bootstrap) printf 'usage: jig task bootstrap <id>\n' ;;
+    start) printf 'usage: jig task start <id> [--worktree] [--no-bootstrap] [--share <dir>]...\n' ;;
+    bootstrap) printf 'usage: jig task bootstrap <id> [--share <dir>]...\n' ;;
     set)
       printf 'usage: jig task set <id> <key> <value>\n'
       printf '       jig task set <id> class <Tn> --reason <text>   (a lower class than the current one)\n'
       ;;
     abandon) printf 'usage: jig task abandon <id>\n' ;;
+    archive) printf 'usage: jig task archive <id>\n' ;;
+    unarchive) printf 'usage: jig task unarchive <id>\n' ;;
+    merge) printf 'usage: jig task merge <from> --into <to> [--partial]\n' ;;
     pause) printf 'usage: jig task pause <id> [--reason <text>] [--stash]\n       jig task pause <id> --if-requested --stage <name>\n' ;;
     resume) printf 'usage: jig task resume <id> [--revision <n>] [--json]\n' ;;
     list) printf 'usage: jig task list [--all] [--status <status>] [--goals] [--json]\n' ;;
@@ -145,7 +151,17 @@ _task_valid_class() {
 
 _task_valid_status() {
   case "$1" in
-    active | ready | consolidated | abandoned) return 0 ;;
+    active | ready | consolidated | abandoned | archived) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The reasons a task is archived (adr-20261027-a-task-nobody-finished-is-
+# archived-not-purged): housekeeping's two, after abandoned_ttl and after
+# stale_after, and a person's own `jig task archive`.
+_task_valid_archived_reason() {
+  case "$1" in
+    abandoned | stale | manual | absorbed) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1092,17 +1108,29 @@ _task_new_body() {
 task_start() {
   jig_require_init
   [ $# -ge 1 ] || jig_die "$(_task_usage start)"
-  local id="$1" worktree=0 bootstrap=1
+  local id="$1" worktree=0 bootstrap=1 share
   shift
+  _TASK_ADD_SHARES=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --worktree) worktree=1; shift ;;
       --no-bootstrap) bootstrap=0; shift ;;
+      --share)
+        [ $# -ge 2 ] || jig_die "task start: --share needs a directory"
+        share=$(_task_share_arg "task start" "$2") || exit 1
+        _TASK_ADD_SHARES="$_TASK_ADD_SHARES$share
+"
+        shift 2
+        ;;
       *) jig_die "task start: unknown argument: $1" ;;
     esac
   done
   [ "$bootstrap" = 1 ] || [ "$worktree" = 1 ] \
     || jig_die "task start: --no-bootstrap says what not to carry into a worktree; it needs --worktree"
+  [ -z "$_TASK_ADD_SHARES" ] || [ "$worktree" = 1 ] \
+    || jig_die "task start: --share gives a worktree a directory of this checkout; it needs --worktree"
+  [ -z "$_TASK_ADD_SHARES" ] || [ "$bootstrap" = 1 ] \
+    || jig_die "task start: --share is done by the bootstrap that --no-bootstrap skips; drop one of them"
   local dir
   dir=$(task_dir "$id")
   _task_guard_write "$id" "task start"
@@ -1244,7 +1272,7 @@ _task_start_in_worktree() {
   # the tree and the branch -- is exactly what `jig task bootstrap` needs to
   # try again (adr-20260924-a-worktree-carries-what-git-does-not).
   if [ "$bootstrap" = 1 ]; then
-    _task_carry_into "$JIG_PROJECT" "$path" "task start"
+    _task_carry_into "$JIG_PROJECT" "$path" "task start" "$id"
   fi
 
   _task_base_hint "$id" "$base"
@@ -1318,7 +1346,7 @@ _task_move_to_worktree() {
   path=$(cd -P "$path" && pwd -P) || jig_die "task start: cannot resolve worktree $path"
 
   if [ "$bootstrap" = 1 ]; then
-    _task_carry_into "$JIG_PROJECT" "$path" "task start"
+    _task_carry_into "$JIG_PROJECT" "$path" "task start" "$id"
   fi
 
   _task_paused_hint "$id" " there"
@@ -1340,17 +1368,65 @@ _task_undo_move() {
     || jig_info "task start: could not put this checkout back on $2 (a worktree is still at $3); remove it with \`git worktree remove\`, then \`git switch $2\`"
 }
 
-# _task_carry_into <owner-abs> <tree-abs> <verb> — load the bootstrap library
-# and carry the declared state into a task worktree. A wrapper so that
+# _task_carry_into <owner-abs> <tree-abs> <verb> <id> — load the bootstrap
+# library and carry the declared state into a task worktree. A wrapper so that
 # `task start --worktree` and `task bootstrap` load the same two libraries the
 # same way, and so that every other task command pays for neither (verify.sh
 # sources profiles.sh on the same terms).
+#
+# The directories asked for with `--share` (_TASK_ADD_SHARES) join the task's
+# `share` here, right before the bootstrap that mirrors them, so a start that
+# died earlier records none. The project's `worktree.setup` outcome is kept as
+# `setup`: a failure stays visible in `jig status` and `jig task route` after
+# the warning has scrolled away, until a bootstrap finishes the worktree
+# (adr-20261026-a-worktree-is-finished-by-the-projects-command).
 _task_carry_into() {
+  local id="$4" dir shares one
   # shellcheck source=lib/profiles.sh
   . "$JIG_LIB/profiles.sh"
   # shellcheck source=lib/bootstrap.sh
   . "$JIG_LIB/bootstrap.sh"
-  jig_bootstrap_worktree "$1" "$2" "$3"
+  dir=$(task_dir "$id")
+  shares=$(task_state_get "$id" share | tr ',' '\n')
+  if [ -n "${_TASK_ADD_SHARES:-}" ]; then
+    while IFS= read -r one; do
+      [ -n "$one" ] || continue
+      jig_has_line "$one" "$shares" || shares="$shares${shares:+
+}$one"
+    done <<EOF
+$_TASK_ADD_SHARES
+EOF
+    _task_rewrite_state "$dir" share "$(printf '%s' "$shares" | tr '\n' ',')"
+  fi
+  jig_bootstrap_worktree "$1" "$2" "$3" "$id" "$shares"
+  # No command ran — the project has none now — so an outcome left from one
+  # that had failed describes nothing any more and goes.
+  if [ -n "$_JIG_SETUP_OUTCOME" ]; then
+    _task_rewrite_state "$dir" setup "$_JIG_SETUP_OUTCOME"
+  elif [ -n "$(task_state_get "$id" setup)" ]; then
+    _task_rewrite_state_remove "$dir" setup
+  fi
+}
+
+# _task_share_arg <verb> <dir> — <dir> as a task's `share` keeps it: no
+# trailing slash. Refuses what cannot be one entry of a comma-separated state
+# value or a directory of this checkout; the bootstrap checks the rest — that
+# git ignores it, that it is not `.ai/` — as it does for `worktree.share`.
+_task_share_arg() {
+  local verb="$1" dir="$2"
+  while :; do
+    case "$dir" in
+      ?*/) dir=${dir%/} ;;
+      *) break ;;
+    esac
+  done
+  case "$dir" in
+    '' | /* | *,* | *[[:space:]]* | .. | ../* | */../* | */.. | . | ./*)
+      printf '%s: --share takes a directory of this checkout, relative and without commas or blanks: %s\n' "$verb" "$2" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$dir"
 }
 
 # task_bootstrap <id> — carry the declared state into the task's existing
@@ -1372,9 +1448,21 @@ _task_carry_into() {
 task_bootstrap() {
   jig_require_init
   [ $# -ge 1 ] || jig_die "$(_task_usage bootstrap)"
-  local id="$1" dir branch tree owner workspace
+  local id="$1" dir branch tree owner workspace share
   shift
-  [ $# -eq 0 ] || jig_die "task bootstrap: unknown argument: $1"
+  _TASK_ADD_SHARES=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --share)
+        [ $# -ge 2 ] || jig_die "task bootstrap: --share needs a directory"
+        share=$(_task_share_arg "task bootstrap" "$2") || exit 1
+        _TASK_ADD_SHARES="$_TASK_ADD_SHARES$share
+"
+        shift 2
+        ;;
+      *) jig_die "task bootstrap: unknown argument: $1" ;;
+    esac
+  done
 
   dir=$(task_dir "$id")
   _task_guard_write "$id" "task bootstrap"
@@ -1394,7 +1482,7 @@ task_bootstrap() {
   [ -d "$owner" ] || jig_die "task bootstrap: cannot find the checkout that owns $id"
   [ "$owner" != "$tree" ] || jig_die "task bootstrap: $id is not in a worktree of its own"
 
-  _task_carry_into "$owner" "$tree" "task bootstrap"
+  _task_carry_into "$owner" "$tree" "task bootstrap" "$id"
 }
 
 # _task_base_hint <id> <base> — a task cut from anything but the project's base
@@ -1503,7 +1591,15 @@ task_set() {
 
   case "$key" in
     class) _task_valid_class "$value" || jig_die "task set: invalid class: $value" ;;
-    status) _task_valid_status "$value" || jig_die "task set: invalid status: $value" ;;
+    status)
+      _task_valid_status "$value" || jig_die "task set: invalid status: $value"
+      # `archived` has a command of its own, which records when, why and what
+      # it was; a status written by hand would leave unarchive nothing to
+      # return to, and an archived task changes status only by unarchive.
+      [ "$value" != archived ] || jig_die "task set: a task is archived by jig task archive $id"
+      [ "$(task_state_get "$id" status)" != archived ] \
+        || jig_die "task set: task $id is archived; run jig task unarchive $id first"
+      ;;
     knowledge_consolidated) _task_valid_bool "$value" || jig_die "task set: invalid knowledge_consolidated: $value" ;;
     domains) _task_valid_domains "$value" || jig_die "task set: invalid domains: $value" ;;
     route_depth) _cfg_route_depth "$value" || jig_die "task set: invalid route_depth: $value (full or lean)" ;;
@@ -1519,7 +1615,9 @@ task_set() {
       ;;
     task_id | issue | branch | base_commit | base_branch | created_at | updated_at | paused | paused_at | paused_reason | paused_stash \
       | autopilot | autopilot_repairs | autopilot_mode | autopilot_phase | gate | gate_design | gate_by | pr_url \
-      | route_evidence | class_lowered_from | class_lowered_reason \
+      | archived_at | archived_reason | archived_from \
+      | absorbed_into | absorbs | partly_in | absorbs_partly \
+      | route_evidence | class_lowered_from | class_lowered_reason | share | setup \
       | executor_implement_runtime_source | executor_review_runtime_source \
       | executor_implement_model_source | executor_review_model_source)
       jig_die "task set: key is not writable: $key" ;;
@@ -1694,6 +1792,188 @@ _task_set_class() {
 task_abandon() {
   [ $# -eq 1 ] || jig_die "$(_task_usage abandon)"
   task_set "$1" status abandoned
+}
+
+# task_archive <id> — a person's archive of a task nobody will finish now
+# (adr-20261027-a-task-nobody-finished-is-archived-not-purged). The workspace
+# stays where it is, kept without a limit; only the status changes, and the
+# branch, worktree, pull request and queue place are left alone.
+task_archive() {
+  [ $# -eq 1 ] || jig_die "$(_task_usage archive)"
+  jig_require_init
+  _task_archive "$1" manual
+}
+
+# _task_archive <id> <reason> — the one writer of `archived`, shared with
+# housekeeping, which archives through it rather than writing state itself.
+# `archived_from` is what unarchive returns to. A consolidated task is refused:
+# its work is already in git, and its workspace is purged, not kept.
+_task_archive() {
+  local id="$1" reason="$2" dir status
+  _task_valid_archived_reason "$reason" || jig_die "task archive: invalid reason: $reason"
+  dir=$(task_dir "$id")
+  _task_guard_write "$id" "task archive"
+  status=$(task_state_get "$id" status)
+  case "$status" in
+    active | ready | abandoned) ;;
+    archived) jig_die "task archive: task $id is already archived" ;;
+    *) jig_die "task archive: task $id is $status; only an unfinished task is archived" ;;
+  esac
+  _task_rewrite_state "$dir" archived_from "$status"
+  _task_rewrite_state "$dir" archived_reason "$reason"
+  _task_rewrite_state "$dir" archived_at "$(jig_today)"
+  _task_rewrite_state "$dir" status archived
+}
+
+# task_unarchive <id> — return an archived task to the status it had. The
+# write refreshes `updated_at`, so the next housekeeping run does not find it
+# stale and archive it again.
+task_unarchive() {
+  [ $# -eq 1 ] || jig_die "$(_task_usage unarchive)"
+  jig_require_init
+  local id="$1" dir from
+  dir=$(task_dir "$id")
+  _task_guard_write "$id" "task unarchive"
+  [ "$(task_state_get "$id" status)" = archived ] || jig_die "task unarchive: task $id is not archived"
+  from=$(task_state_get "$id" archived_from)
+  case "$from" in
+    active | ready | abandoned) ;;
+    *) from=active ;;
+  esac
+  _task_rewrite_state "$dir" status "$from"
+  _task_rewrite_state_remove "$dir" archived_from
+  _task_rewrite_state_remove "$dir" archived_reason
+  _task_rewrite_state_remove "$dir" archived_at
+  # An absorbed task that comes back is its own task again; the receiver
+  # keeps `absorbs` as the record of the documents it took.
+  _task_rewrite_state_remove "$dir" absorbed_into
+}
+
+# _task_list_add <list> <id> — <list>, comma-separated, with <id> added once.
+_task_list_add() {
+  case ",$1," in
+    *",$2,"*) printf '%s\n' "$1" ;;
+    ,,) printf '%s\n' "$2" ;;
+    *) printf '%s,%s\n' "$1" "$2" ;;
+  esac
+}
+
+# _task_json_ids <list> — a comma-separated list of task ids as a JSON array
+# in _JSON, `[]` when empty.
+_task_json_ids() {
+  local list="$1" out="" one
+  local IFS=,
+  for one in $list; do
+    [ -n "$one" ] || continue
+    json_quote "$one"
+    out="${out:+$out,}$_JSON"
+  done
+  _JSON="[$out]"
+}
+
+# task_merge <from> --into <to> [--partial] — record that <to> does <from>'s
+# work (adr-20261027-an-absorbed-task-is-archived-with-its-receiver). <from>'s
+# documents are copied to <to>/absorbed/<from>/ and named in <to>'s task.md.
+# Whole: <from> is archived with reason `absorbed` and `absorbed_into`, and its
+# queue waits move to <to>. Partial: <from> stays live with `partly_in`. Both
+# ends record the link (`absorbs`, `absorbs_partly`). The tracker is never
+# called: `task ship` of <to> names the absorbed issues.
+task_merge() {
+  jig_require_init
+  [ $# -ge 1 ] || jig_die "$(_task_usage merge)"
+  local from="$1" to="" partial=0
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --into) [ $# -ge 2 ] || jig_die "task merge: --into requires a value"; to="$2"; shift 2 ;;
+      --partial) partial=1; shift ;;
+      *) jig_die "task merge: unknown argument: $1" ;;
+    esac
+  done
+  [ -n "$to" ] || jig_die "$(_task_usage merge)"
+  [ "$from" != "$to" ] || jig_die "task merge: a task cannot absorb itself: $from"
+
+  local from_dir to_dir from_root to_root from_status to_status
+  from_dir=$(task_dir "$from")
+  to_dir=$(task_dir "$to")
+  _task_guard_write "$from" "task merge"
+  _task_guard_write "$to" "task merge"
+  from_status=$(task_state_get "$from" status)
+  to_status=$(task_state_get "$to" status)
+  case "$to_status" in
+    active | ready) ;;
+    *) jig_die "task merge: task $to is $to_status; only a live task absorbs another" ;;
+  esac
+  case "$from_status" in
+    active | ready | abandoned) ;;
+    *) jig_die "task merge: task $from is $from_status; only an unfinished task is absorbed" ;;
+  esac
+
+  # Everything that can refuse is asked before anything is written. Both
+  # roots are the guarded physical ones, and the destination is built from two
+  # validated ids only. A copy already there — a merge that stopped midway, or
+  # one taken back by unarchive — is refreshed, not refused, so the command
+  # can always be run again.
+  from_root=$(_task_workspace_root "$from" "task merge") || return 1
+  to_root=$(_task_workspace_root "$to" "task merge") || return 1
+  local dest="$to_root/absorbed/$from"
+  [ ! -L "$to_root/absorbed" ] && [ ! -L "$dest" ] \
+    || jig_die "task merge: absorbed/$from in $to is a link; remove it first"
+
+  # The queue next: a wait that would close a cycle refuses there, before
+  # anything is copied, written or archived.
+  if [ "$partial" -eq 0 ]; then
+    # shellcheck source=lib/queue.sh
+    . "$JIG_LIB/queue.sh"
+    queue_absorb "$from" "$to"
+  fi
+
+  # The copy: every document of <from>, with whatever <from> itself absorbed,
+  # as regular files only — a link is left behind, never followed or copied
+  # as a link that would lead out of the receiver's workspace.
+  mkdir -p "$dest" || jig_die "task merge: cannot create absorbed/$from in $to"
+  local f rel
+  for f in "$from_root"/*.md; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    cp "$f" "$dest/" || jig_die "task merge: cannot copy ${f##*/} into $to"
+  done
+  if [ -d "$from_root/absorbed" ] && [ ! -L "$from_root/absorbed" ]; then
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      if [ -d "$from_root/$rel" ]; then
+        mkdir -p "$dest/$rel" || jig_die "task merge: cannot create $rel in $to"
+      else
+        cp "$from_root/$rel" "$dest/$rel" || jig_die "task merge: cannot copy $rel into $to"
+      fi
+    done < <(cd "$from_root" && find absorbed \( -type d -o -type f \) | LC_ALL=C sort)
+  fi
+
+  local goal note how
+  goal=$(_task_goal "$from_root/task.md")
+  how="whole"
+  [ "$partial" -eq 0 ] || how="partly"
+  note=$(mktemp "${TMPDIR:-/tmp}/jig-merge.XXXXXX")
+  jig_cleanup_add "$note"
+  {
+    printf '\n## Absorbed: %s (%s)\n\n' "$from" "$how"
+    [ -z "$goal" ] || printf '%s\n\n' "$goal"
+    printf 'Its documents: absorbed/%s/.\n' "$from"
+  } > "$note"
+  task_artifact append "$to" task --from "$note" >/dev/null
+
+  if [ "$partial" -eq 1 ]; then
+    _task_rewrite_state "$to_dir" absorbs_partly "$(_task_list_add "$(task_state_get "$to" absorbs_partly)" "$from")"
+    _task_rewrite_state "$from_dir" partly_in "$(_task_list_add "$(task_state_get "$from" partly_in)" "$to")"
+    printf '\n## Partly in %s\n\nPart of this work is done by %s; its task.md says which.\n' "$to" "$to" > "$note"
+    task_artifact append "$from" task --from "$note" >/dev/null
+    printf 'task merge: %s takes part of %s; %s stays open\n' "$to" "$from" "$from"
+    return 0
+  fi
+
+  _task_rewrite_state "$to_dir" absorbs "$(_task_list_add "$(task_state_get "$to" absorbs)" "$from")"
+  _task_rewrite_state "$from_dir" absorbed_into "$to"
+  _task_archive "$from" absorbed
+  printf 'task merge: %s absorbed into %s; %s is archived\n' "$from" "$to" "$from"
 }
 
 # --- autopilot run (design.md, .ai/workspace/tasks/autopilot-run) --------------
@@ -3308,6 +3588,7 @@ $(_task_route_depth "$id")
 EOF
   printf 'class: %s\n' "${class:--}"
   printf 'depth: %s (%s)\n' "$depth" "$source"
+  _task_route_setup_line "$id"
   if ! _task_valid_class "$class"; then
     printf 'route: none until the task is classified (jig task set %s class Tn)\n' "$id"
     return 0
@@ -3324,6 +3605,19 @@ EOF
   if [ -n "$from" ]; then
     printf 'lowered: from %s: %s\n' "$from" "$(task_state_get "$id" class_lowered_reason)"
   fi
+}
+
+# _task_route_setup_line <id> — a line when the project's `worktree.setup`
+# did not finish the task's worktree; nothing when it did or never ran. Shown
+# by `task route` because that is what a coordinator reads after a start
+# (adr-20261026-a-worktree-is-finished-by-the-projects-command).
+_task_route_setup_line() {
+  local setup
+  setup=$(task_state_get "$1" setup)
+  case "$setup" in
+    '' | ok) ;;
+    *) printf 'setup: %s — the worktree is not finished; fix worktree.setup and run jig task bootstrap %s\n' "$setup" "$1" ;;
+  esac
 }
 
 # --- route evidence (adr-20261004-a-route-stage-is-proven-by-its-record) -------
@@ -3866,8 +4160,11 @@ _task_list() {
   fi
 
   local base="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
-  local dir id class status branch base_branch default_base paused issue line lines="" hidden worktrees wt
-  hidden=$_TASK_LIST_HIDDEN
+  local dir id class status branch base_branch default_base paused issue line lines="" hidden archived worktrees wt
+  # `hidden` counts the finished tasks alone in the text; the archive has a
+  # line of its own.
+  hidden=$((_TASK_LIST_HIDDEN - _TASK_LIST_ARCHIVED))
+  archived=$_TASK_LIST_ARCHIVED
   worktrees=$(_task_worktrees)
   # The base is shown only where it is not the project's: a listing where
   # every line says base=main says nothing.
@@ -3898,6 +4195,15 @@ _task_list() {
       line="$line base=$base_branch"
     fi
     [ "$paused" = "true" ] && line="$line paused"
+    if [ "$status" = archived ]; then
+      line="$line archived_at=$(task_state_get "$id" archived_at) archived_reason=$(task_state_get "$id" archived_reason)"
+    fi
+    # What `jig task merge` linked, both ends (comma-separated ids, no spaces).
+    local link key
+    for key in absorbed_into absorbs absorbs_partly partly_in; do
+      link=$(task_state_get "$id" "$key")
+      [ -z "$link" ] || line="$line $key=$link"
+    done
     # The goal rides on the line through the sort, after a unit separator,
     # and is put on a line of its own below it once sorted.
     [ "$goals" -eq 0 ] || line="$line"$'\037'"goal: $(_task_goal "${dir}task.md")"
@@ -3910,26 +4216,33 @@ EOF
   if [ -z "$lines" ]; then
     if [ "$hidden" -gt 0 ]; then
       printf 'no live tasks (%d finished; jig task list --all)\n' "$hidden"
-    else
+    elif [ "$archived" -eq 0 ]; then
       printf 'no tasks\n'
+    else
+      printf 'no live tasks\n'
     fi
+    [ "$archived" -gt 0 ] && printf 'archived: %d (jig task list --status archived)\n' "$archived"
     return 0
   fi
   printf '%s\n' "$lines" | sort | awk -F '\037' '{ print $1; if (NF > 1) print "  " $2 }'
   [ "$hidden" -gt 0 ] && printf '(%d finished; jig task list --all)\n' "$hidden"
+  [ "$archived" -gt 0 ] && printf 'archived: %d (jig task list --status archived)\n' "$archived"
   return 0
 }
 
 # _task_list_select <show_all> <want_status> — which tasks `task list` shows,
 # in the text and the JSON form alike: _TASK_LIST_IDS gets their ids, one per
-# line, and _TASK_LIST_HIDDEN how many finished tasks were left out. Called as
+# line, _TASK_LIST_HIDDEN how many finished or archived tasks were left out and
+# _TASK_LIST_ARCHIVED how many of those were archived. Called as
 # a plain command, never through $(...), so both globals reach the caller.
 _TASK_LIST_IDS=""
 _TASK_LIST_HIDDEN=0
+_TASK_LIST_ARCHIVED=0
 _task_list_select() {
   local show_all="$1" want_status="$2" dir id status
   _TASK_LIST_IDS=""
   _TASK_LIST_HIDDEN=0
+  _TASK_LIST_ARCHIVED=0
   for dir in "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"/*/; do
     [ -f "${dir}state" ] || continue
     id=$(basename "$dir")
@@ -3941,6 +4254,10 @@ _task_list_select() {
       [ "$status" = "$want_status" ] || continue
     elif [ "$show_all" -eq 0 ] && ! _task_is_live "$status"; then
       _TASK_LIST_HIDDEN=$((_TASK_LIST_HIDDEN + 1))
+      # The archive is a subset of what is hidden, counted on its own so the
+      # listing can point at it (adr-20261027-a-task-nobody-finished-is-
+      # archived-not-purged).
+      [ "$status" != archived ] || _TASK_LIST_ARCHIVED=$((_TASK_LIST_ARCHIVED + 1))
       continue
     fi
     _TASK_LIST_IDS="$_TASK_LIST_IDS$id
@@ -4019,7 +4336,9 @@ EOF
   # newline (json_quote escapes both), so the id column is the whole key.
   printf '%s' "$rows" | sed '/^$/d' | LC_ALL=C sort -t "$t" -k1,1 | cut -f2- \
     | awk 'NR > 1 { printf "," } { printf "%s", $0 }'
-  printf '],"hidden":%s,"housekeeping":' "$_TASK_LIST_HIDDEN"
+  # `hidden` stays every task left out; `archived` is the part of it that the
+  # archive holds.
+  printf '],"hidden":%s,"archived":%s,"housekeeping":' "$_TASK_LIST_HIDDEN" "$_TASK_LIST_ARCHIVED"
   run=$(hklog_last_run)
   if [ -z "$run" ]; then
     printf 'null'
@@ -4075,6 +4394,13 @@ _task_list_json_task() {
   fi
   json_str_or_null "$created"; o="$o,\"created_at\":$_JSON"
   json_str_or_null "$updated"; o="$o,\"updated_at\":$_JSON"
+  json_str_or_null "$(task_state_get "$id" archived_at)"; o="$o,\"archived_at\":$_JSON"
+  json_str_or_null "$(task_state_get "$id" archived_reason)"; o="$o,\"archived_reason\":$_JSON"
+  json_str_or_null "$(task_state_get "$id" archived_from)"; o="$o,\"archived_from\":$_JSON"
+  json_str_or_null "$(task_state_get "$id" absorbed_into)"; o="$o,\"absorbed_into\":$_JSON"
+  _task_json_ids "$(task_state_get "$id" absorbs)"; o="$o,\"absorbs\":$_JSON"
+  _task_json_ids "$(task_state_get "$id" absorbs_partly)"; o="$o,\"absorbs_partly\":$_JSON"
+  _task_json_ids "$(task_state_get "$id" partly_in)"; o="$o,\"partly_in\":$_JSON"
   json_str_or_null "$branch"; o="$o,\"branch\":$_JSON"
   base=$(jig_task_base "$id")
   json_quote "$base"; o="$o,\"base_branch\":$_JSON"
@@ -4180,7 +4506,7 @@ EOF
 #
 # The rows, in their order; the ids are a contract. The pause request rows ask
 # the guards `jig queue request|cancel` asks (common.sh), which read the queue.
-_TASK_ACTIONS="start pause resume request-pause cancel-pause-request approve-gate answer-stop set-class ship close abandon reopen"
+_TASK_ACTIONS="start pause resume request-pause cancel-pause-request approve-gate answer-stop set-class ship close abandon archive unarchive reopen"
 
 # _task_actions <id> <pr-state> — one line per row of the table:
 # `<action><TAB><true|false><TAB><command><TAB><reason>`, the reason empty
@@ -4211,15 +4537,26 @@ _task_actions() {
       ship) command="jig task ship $id --message-file <file>" ;;
       close) command="jig task set $id status consolidated" ;;
       abandon) command="jig task abandon $id" ;;
+      archive) command="jig task archive $id" ;;
+      unarchive) command="jig task unarchive $id" ;;
       reopen) command="jig task set $id status active" ;;
     esac
     case "$status:$action" in
       abandoned:reopen) ;;
+      # An abandoned task can be archived and an unfinished one too; a
+      # consolidated task is not (its work is in git, its workspace is
+      # purged) and an archived one already is
+      # (adr-20261027-a-task-nobody-finished-is-archived-not-purged).
+      active:archive | ready:archive | abandoned:archive) ;;
+      consolidated:archive) reason="task archive: task $id is consolidated; only an unfinished task is archived" ;;
+      archived:archive) reason="task archive: task $id is already archived" ;;
+      archived:unarchive) ;;
+      *:unarchive) reason="task unarchive: task $id is not archived" ;;
       # A request left on a finished task — made during its last stage, or
       # before it was closed — can still be taken back.
-      consolidated:cancel-pause-request | abandoned:cancel-pause-request)
+      consolidated:cancel-pause-request | abandoned:cancel-pause-request | archived:cancel-pause-request)
         reason=$(_task_actions_guard "$id" "$action" jig_pause_cancel_refusal "$id") ;;
-      consolidated:* | abandoned:*) reason="task $id is $status" ;;
+      consolidated:* | abandoned:* | archived:*) reason="task $id is $status" ;;
       *:reopen) reason="task $id is $status, not abandoned" ;;
       *:start) reason=$(_task_actions_guard "$id" "$action" _task_start_refusal "$id") ;;
       *:pause) reason=$(_task_actions_guard "$id" "$action" _task_pause_refusal "$id") ;;
@@ -4952,6 +5289,30 @@ EOF
       printf "task ship: issue %s added to the message's first line\n" "$issue"
     fi
     [ -z "$title" ] || title=$(_task_issue_subject "$title" "$issue")
+  fi
+
+  # The issues of the tasks this one absorbed (`jig task merge`), named once at
+  # the end of the commit and of the pull request's body: the tracker links
+  # them from there, as it links the task's own. Jig never calls the tracker.
+  local absorbed_refs="" one one_issue
+  for one in $(printf '%s,%s' "$(task_state_get "$id" absorbs)" "$(task_state_get "$id" absorbs_partly)" | tr ',' ' '); do
+    one_issue=$(task_state_get "$one" issue 2>/dev/null) || one_issue=""
+    [ -n "$one_issue" ] || continue
+    absorbed_refs="${absorbed_refs:+$absorbed_refs, }$(_task_issue_ref "$one_issue")"
+  done
+  if [ -n "$absorbed_refs" ] && ! grep -q '^Absorbs: ' "$message_file"; then
+    msg_tmp=$(mktemp "${TMPDIR:-/tmp}/jig-ship-msg.XXXXXX")
+    jig_cleanup_add "$msg_tmp"
+    { cat "$message_file"; printf '\nAbsorbs: %s\n' "$absorbed_refs"; } > "$msg_tmp"
+    message_file="$msg_tmp"
+    if [ -n "$body_file" ] && ! grep -q '^Absorbs: ' "$body_file"; then
+      local body_tmp
+      body_tmp=$(mktemp "${TMPDIR:-/tmp}/jig-ship-body.XXXXXX")
+      jig_cleanup_add "$body_tmp"
+      { cat "$body_file"; printf '\nAbsorbs: %s\n' "$absorbed_refs"; } > "$body_tmp"
+      body_file="$body_tmp"
+    fi
+    printf 'task ship: absorbed issues named: %s\n' "$absorbed_refs"
   fi
 
   _task_ship_unverified_notice

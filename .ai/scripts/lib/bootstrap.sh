@@ -698,9 +698,14 @@ _bootstrap_top_up() {
   return 0
 }
 
-# jig_bootstrap_worktree <owner-abs> <tree-abs> <verb> — share and carry the
-# declared state from the owning checkout into the worktree: first every
-# `worktree.share` directory, mirrored; then every carried path, copied.
+# jig_bootstrap_worktree <owner-abs> <tree-abs> <verb> [id] [task-shares] —
+# share and carry the declared state from the owning checkout into the
+# worktree: first every `worktree.share` directory and every directory the
+# task itself shares (<task-shares>, one per line), mirrored; then every
+# carried path, copied; then the project's own `worktree.setup`, which
+# finishes what a copy cannot (jig_bootstrap_setup). The order is the
+# contract: setup finds both the mirrors and what was carried, a personal
+# `.make.local` included (adr-20261026-a-worktree-is-finished-by-the-projects-command).
 #
 # Never fatal, and never a rollback. By the time it runs the task is started,
 # its branch exists and its workspace is linked; a tree that is missing a
@@ -708,9 +713,10 @@ _bootstrap_top_up() {
 # what is needed to try the carry again (`jig task bootstrap`). Every refusal
 # and every skip is reported. Always returns 0.
 jig_bootstrap_worktree() {
-  local owner="$1" tree="$2" verb="$3"
-  local src dst staged ok source path problem started elapsed over
-  local carried="" missing="" seen="" shared_paths=""
+  local owner="$1" tree="$2" verb="$3" id="${4:-}" task_shares="${5:-}"
+  local src dst staged ok source path problem started elapsed over origin
+  local carried="" missing="" seen="" shared_paths="" shared_here=""
+  _JIG_SETUP_OUTCOME=""
   local owner_root tree_root
 
   owner_root=$(cd -P "$owner" 2>/dev/null && pwd -P) || return 0
@@ -733,20 +739,25 @@ jig_bootstrap_worktree() {
 
   started=$(date +%s 2>/dev/null || printf '0')
 
-  # A directory that should be shared and is not leaves this worktree without
-  # it; say so here, where its absence is about to bite (jig_share_candidates).
+  # A directory that could be shared and is not: say so here, where a task
+  # that edits it would miss it (jig_share_candidates). Not a warning: a task
+  # that does not edit the packages is right to run on the lock's versions,
+  # and that is the common case.
   while IFS= read -r path; do
     [ -n "$path" ] || continue
-    jig_warn "$verb: $path/ holds separate repositories this worktree cannot reach; add \`worktree.share: [$path]\` to $JIG_AI_DIR/config.yaml, then run \`jig task bootstrap\`"
+    jig_info "$verb: $path/ is not shared with this worktree; if this task edits it: \`jig task bootstrap ${id:-<id>} --share $path\`"
   done <<EOF
-$(jig_share_candidates "$owner_root")
+$(jig_share_candidates "$owner_root" "$task_shares")
 EOF
 
   # Shared first. A directory declared as shared is a source of truth, and the
   # carry below refuses to copy anything that overlaps one — so every share
   # declaration that names a path at all counts, whether or not it could be
   # mirrored this time.
-  while IFS= read -r path; do
+  # The project's declarations first, then the task's own. A task sharing
+  # what the project already shares is no mistake — the person asked for a
+  # directory, not knowing it was shared anyway — so that repeat is silent.
+  while IFS="$(printf '\t')" read -r origin path; do
     [ -n "$path" ] || continue
     path=$(_bootstrap_trim_slash "$path")
     problem=$(_bootstrap_path_problem "$path") && {
@@ -755,7 +766,7 @@ EOF
     }
     case "$seen" in
       *"<$path>"*)
-        jig_warn "$verb: $path is declared more than once; shared once"
+        [ "$origin" = task ] || jig_warn "$verb: $path is declared more than once; shared once"
         continue
         ;;
     esac
@@ -763,7 +774,18 @@ EOF
     shared_paths="$shared_paths$path
 "
     _bootstrap_share "$owner_root" "$tree_root" "$path" "$verb"
-  done < <(cfg_list_lines worktree.share)
+    # What the setup command is told is shared is what the worktree now has:
+    # a declaration refused or skipped above still counts for the overlap
+    # check below, but a command told about a directory that is not there
+    # would act on nothing.
+    if [ -d "$tree_root/$path" ] && [ ! -L "$tree_root/$path" ]; then
+      shared_here="$shared_here$path
+"
+    fi
+  done < <(
+    cfg_list_lines worktree.share | awk '{ print "project\t" $0 }'
+    printf '%s\n' "$task_shares" | awk 'NF { print "task\t" $0 }'
+  )
 
   while IFS="$(printf '\t')" read -r source path; do
     [ -n "$path" ] || continue
@@ -851,6 +873,147 @@ EOF
   fi
   _bootstrap_missing_report "$missing" "$verb"
   _bootstrap_stale "$owner_root" "$tree_root" "$verb"
+  jig_bootstrap_setup "$owner_root" "$tree_root" "$verb" "$id" "$shared_here"
+  return 0
+}
+
+# _bootstrap_dangling <tree-root> — one line per link inside a declared carry
+# path of the worktree that leads nowhere, relative to <tree-root>. A copied
+# `vendor/` keeps the links `composer dev:link` made into `packages/`; in a
+# worktree that does not share `packages/` they dangle, and composer, which
+# reads such a package as installed, would leave it so. Jig does not remove
+# them: what a link is for is the project's to know, so it is named to the
+# project's own command (JIG_DANGLING). `find` without -L never follows a link,
+# so a shared mirror is never walked.
+_bootstrap_dangling() {
+  local tree_root="$1" source path link
+  while IFS="$(printf '\t')" read -r source path; do
+    [ -n "$path" ] || continue
+    path=$(_bootstrap_trim_slash "$path")
+    _bootstrap_path_problem "$path" >/dev/null && continue
+    [ -e "$tree_root/$path" ] || continue
+    [ ! -L "$tree_root/$path" ] || continue
+    while IFS= read -r link; do
+      [ -n "$link" ] || continue
+      [ -e "$link" ] || printf '%s\n' "${link#"$tree_root"/}"
+    done < <(find "$tree_root/$path" -type l 2>/dev/null)
+  done < <(_bootstrap_declared)
+  return 0
+}
+
+# _bootstrap_setup_stop — the exit action that stops a `worktree.setup` still
+# running when Jig itself ends: its whole group, as the timeout does.
+_JIG_SETUP_PID=""
+_bootstrap_setup_stop() {
+  [ -n "$_JIG_SETUP_PID" ] || return 0
+  kill -TERM -- "-$_JIG_SETUP_PID" 2>/dev/null || kill -TERM "$_JIG_SETUP_PID" 2>/dev/null || true
+  _JIG_SETUP_PID=""
+  return 0
+}
+
+# jig_bootstrap_setup <owner-root> <tree-root> <verb> <id> <shared> — run the
+# project's `worktree.setup` in the worktree, and leave its outcome in
+# _JIG_SETUP_OUTCOME: empty when the project has none, else `ok`,
+# `failed (exit <n>)` or `timed out (<duration>)`.
+#
+# Jig still installs nothing of its own (adr-20260924-a-worktree-carries-what-git-does-not):
+# the command is the project's, written in its `.ai/config.yaml`, and runs on
+# this machine — never through `run.exec`, which is a person's setting and
+# would make one line of the project's file mean something different for each
+# person. A project that lives in a container reaches it from its own command.
+#
+# What the command is told, in its environment: JIG_TASK_ID; JIG_OWNER_CHECKOUT,
+# the checkout the worktree was made from; JIG_SHARED, the directories shared
+# into this worktree, space-separated; JIG_DANGLING, the links in carried paths
+# that lead nowhere, one per line (_bootstrap_dangling). Its stdin is empty and
+# both its outputs go to stderr: `task start` prints the worktree's path on
+# stdout, and that line is what agents read.
+#
+# Bounded by `worktree.setup_timeout`. The command runs in a process group of
+# its own (`set -m`), so that at the limit the whole group — `make`, the
+# `docker exec` under it, the `composer` under that — is sent SIGTERM, and
+# SIGKILL five seconds later. A process a container started inside itself may
+# not get the signal; that boundary is the container's. Rolled by hand like
+# jig_ls_remote_tags: no `timeout` is guaranteed to exist (ADR-0002).
+#
+# Never fatal, like the carry before it: the task is started either way and
+# `jig task bootstrap` runs it again. And since the command is the project's,
+# what it leaves that git can see is named, never taken back — Jig does not
+# know what those files are.
+jig_bootstrap_setup() {
+  local owner_root="$1" tree_root="$2" verb="$3" id="$4" shared="$5"
+  local cmd limit secs dangling pid rc ticks=0 max_ticks waited monitor dirt
+  _JIG_SETUP_OUTCOME=""
+  cmd=$(cfg worktree.setup)
+  [ -n "$cmd" ] || return 0
+  limit=$(cfg worktree.setup_timeout 10m)
+  if ! secs=$(jig_duration_seconds "$limit" 2>/dev/null); then
+    jig_warn "$verb: worktree.setup_timeout $limit is not a duration; using 10m"
+    limit=10m
+    secs=600
+  fi
+  dangling=$(_bootstrap_dangling "$tree_root")
+  shared=$(printf '%s' "$shared" | tr '\n' ' ')
+  shared=${shared% }
+
+  jig_info "$verb: running worktree.setup: $cmd"
+  monitor=0
+  case "$-" in *m*) monitor=1 ;; esac
+  set -m
+  (
+    cd "$tree_root" || exit 1
+    JIG_TASK_ID="$id" JIG_OWNER_CHECKOUT="$owner_root" JIG_SHARED="$shared" \
+      JIG_DANGLING="$dangling" exec sh -c "$cmd"
+  ) </dev/null >&2 &
+  pid=$!
+  [ "$monitor" = 1 ] || set +m
+  # A group of its own does not hear the terminal's Ctrl-C, which reaches only
+  # Jig; so whatever ends Jig ends the command with it.
+  _JIG_SETUP_PID=$pid
+  jig_on_exit '_bootstrap_setup_stop'
+
+  rc=""
+  if [ "$secs" -gt 0 ]; then
+    max_ticks=$((secs * 5))
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ "$ticks" -ge "$max_ticks" ]; then
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+        waited=0
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 25 ]; do
+          sleep 0.2
+          waited=$((waited + 1))
+        done
+        kill -KILL -- "-$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rc=timeout
+        break
+      fi
+      sleep 0.2
+      ticks=$((ticks + 1))
+    done
+  fi
+  if [ -z "$rc" ]; then
+    rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+  fi
+  _JIG_SETUP_PID=""
+
+  case "$rc" in
+    0) _JIG_SETUP_OUTCOME=ok ;;
+    timeout)
+      _JIG_SETUP_OUTCOME="timed out ($limit)"
+      jig_warn "$verb: worktree.setup did not finish in $limit and was stopped; fix it and run \`jig task bootstrap ${id:-<id>}\`"
+      ;;
+    *)
+      _JIG_SETUP_OUTCOME="failed (exit $rc)"
+      jig_warn "$verb: worktree.setup exited $rc; fix it and run \`jig task bootstrap ${id:-<id>}\`"
+      ;;
+  esac
+
+  dirt=$(_bootstrap_new_dirt "$tree_root" "$_BOOTSTRAP_BASELINE")
+  if [ -n "$dirt" ]; then
+    jig_warn "$verb: worktree.setup left files git can see, and a worktree holding them can never be removed; add them to .gitignore or have the command not make them: $(printf '%s' "$dirt" | sed 's/^...//' | tr '\n' ' ' | sed 's/ $//')"
+  fi
   return 0
 }
 

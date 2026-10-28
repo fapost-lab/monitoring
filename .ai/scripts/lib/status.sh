@@ -363,6 +363,12 @@ EOF
     # (adr-20261004-a-route-stage-is-proven-by-its-record).
     [ -z "$_ST_LOWERED" ] || line="$line lowered=$_ST_LOWERED"
     [ -z "$_ST_WT" ] || line="$line $_ST_WT_NOTE"
+    # Only a failure is shown: a worktree the project's own command could not
+    # finish stays named until a `jig task bootstrap` finishes it.
+    case "$_ST_SETUP" in
+      '' | ok) ;;
+      *) line="$line setup=$_ST_SETUP" ;;
+    esac
     # Same rule as `jig task list`: the base only where it is not the project's.
     if [ -n "$_ST_BASE" ] && [ "$_ST_BASE" != "$default_base" ]; then
       line="$line base=$_ST_BASE"
@@ -404,6 +410,7 @@ $_STATUS_LIVE
 EOF
   [ "$found" = 1 ] || printf '%s\n' "no active tasks"
   [ "$_STATUS_FINISHED" -gt 0 ] && printf '(%d finished; jig task list --all)\n' "$_STATUS_FINISHED"
+  [ "$_STATUS_ARCHIVED" -gt 0 ] && printf 'archived: %d (jig task list --status archived)\n' "$_STATUS_ARCHIVED"
   # Which queued task to take next, when the clone keeps a queue.
   _status_next_line
 
@@ -1240,6 +1247,11 @@ _status_activity_fold() {
 _STATUS_LIVE=""
 _STATUS_LIVE_READY=""
 _STATUS_FINISHED=0
+# Archived tasks are neither live nor finished
+# (adr-20261027-a-task-nobody-finished-is-archived-not-purged): counted apart
+# and kept as ids, one per line, for the page's Archive block.
+_STATUS_ARCHIVED=0
+_STATUS_ARCHIVED_IDS=""
 _STATUS_WORKTREES=""
 _STATUS_DEFAULT_BASE=""
 _STATUS_US=$(printf '\037')
@@ -1260,10 +1272,10 @@ _status_task_rows() {
   awk '
     function out() {
       if (have)
-        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n",
+        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n",
           v["task_id"], v["class"], v["status"], v["paused"], v["paused_reason"],
           v["branch"], v["base_branch"], v["autopilot"], v["pr_url"], v["knowledge_consolidated"],
-          v["route_depth"], v["class_lowered_from"], v["issue"]
+          v["route_depth"], v["class_lowered_from"], v["issue"], v["setup"]
     }
     FNR == 1 { out(); split("", v); split("", seen); have = 1 }
     /^[^:]+:/ {
@@ -1284,20 +1296,27 @@ _status_task_rows() {
 # `page`, also the answers only the page shows: the gate of a T3/T4 design
 # (_task_gate_state) and the autopilot run (_task_autopilot_facts).
 _status_live_collect() {
-  local page="${1:-}" row id class status paused reason branch base autopilot pr_url kc own_depth lowered issue
+  local page="${1:-}" row id class status paused reason branch base autopilot pr_url kc own_depth lowered issue setup
   local wt wt_note receipt gate facts depth setting us="$_STATUS_US"
   _STATUS_FINISHED=0
+  _STATUS_ARCHIVED=0
+  _STATUS_ARCHIVED_IDS=""
   _STATUS_LIVE=""
   _STATUS_WORKTREES=$(_task_worktrees)
   _STATUS_DEFAULT_BASE=$(cfg git.base_branch main)
   setting=$(_task_route_setting)
   while IFS= read -r row; do
     [ -n "$row" ] || continue
-    IFS="$us" read -r id class status paused reason branch base autopilot pr_url kc own_depth lowered issue <<EOF
+    IFS="$us" read -r id class status paused reason branch base autopilot pr_url kc own_depth lowered issue setup <<EOF
 $row
 EOF
     case "$status" in
       active | ready) ;;
+      archived)
+        _STATUS_ARCHIVED=$((_STATUS_ARCHIVED + 1))
+        _STATUS_ARCHIVED_IDS="$_STATUS_ARCHIVED_IDS$id
+"
+        continue ;;
       *) _STATUS_FINISHED=$((_STATUS_FINISHED + 1)); continue ;;
     esac
     [ "$paused" = true ] || reason=""
@@ -1321,7 +1340,7 @@ EOF
     # person's route.depth, read once above.
     depth=$(_task_route_depth_of "$own_depth" "$setting")
     depth=${depth%%$'\t'*}
-    _STATUS_LIVE="$_STATUS_LIVE$id$us$class$us$status$us$paused$us$reason$us$branch$us$base$us$autopilot$us$pr_url$us$kc$us$wt$us$wt_note$us$receipt$us$gate$us$depth$us$lowered$us$issue$us$facts
+    _STATUS_LIVE="$_STATUS_LIVE$id$us$class$us$status$us$paused$us$reason$us$branch$us$base$us$autopilot$us$pr_url$us$kc$us$wt$us$wt_note$us$receipt$us$gate$us$depth$us$lowered$us$issue$us$setup$us$facts
 "
   done <<EOF
 $(_status_task_rows)
@@ -1335,10 +1354,12 @@ EOF
 # route depth (_task_route_depth): `full` or `lean`. _ST_LOWERED is the class
 # the task was lowered from (`class_lowered_from`), empty when it never was.
 # _ST_ISSUE is the task's tracker issue (`issue`), empty when it has none.
+# _ST_SETUP is the outcome of the project's `worktree.setup` in the task's
+# worktree (`setup`): `ok`, a failure, or empty when none ran.
 _status_rec() {
   IFS="$_STATUS_US" read -r _ST_ID _ST_CLASS _ST_STATUS _ST_PAUSED _ST_REASON _ST_BRANCH _ST_BASE \
     _ST_AUTOPILOT _ST_PR_URL _ST_KC _ST_WT _ST_WT_NOTE _ST_RECEIPT _ST_GATE _ST_DEPTH _ST_LOWERED _ST_ISSUE \
-    _ST_APFACTS <<EOF
+    _ST_SETUP _ST_APFACTS <<EOF
 $1
 EOF
 }
@@ -2082,7 +2103,7 @@ OPEN
       url=$(task_state_get "$id" pr_url)
       live=$(task_state_get "$id" status)
     fi
-    if [ "$live" = abandoned ]; then
+    if [ "$live" = abandoned ] || [ "$live" = archived ]; then
       # `task abandon` never touches the forge, so a task the person gave up
       # on keeps its pull request. The flag stands -- only the forge knows
       # whether it is still open -- but the ask does not: work nobody wants is
@@ -2127,8 +2148,30 @@ PRS
   wrong=$(hklog_flagged_ids wrong-base)
   closed=$(hklog_flagged_ids 'abandoned?')
   kept=$(hklog_flagged_ids worktree-kept)
-  _status_attention_per_task needs-consolidation "$nc" "Merged: the task can be closed" "$hk_note" \
+  # An archived task whose work merged after all is closed the same way, but
+  # it changes status only by unarchive, so its card says that first.
+  local nc_live="" nc_archived="" one
+  while IFS= read -r one; do
+    [ -n "$one" ] || continue
+    if [ "$(task_state_get "$one" status 2>/dev/null)" = archived ]; then
+      nc_archived="$nc_archived$one
+"
+    else
+      nc_live="$nc_live$one
+"
+    fi
+  done <<IDS
+$nc
+IDS
+  _status_attention_per_task needs-consolidation "$nc_live" "Merged: the task can be closed" "$hk_note" \
     "Tell the agent to close this task (jig-consolidate)."
+  while IFS= read -r one; do
+    [ -n "$one" ] || continue
+    _status_attn needs-consolidation task "$one" "$one" "Merged: the task can be closed" "$hk_note" \
+      "It is archived: run jig task unarchive $one, then tell the agent to close it (jig-consolidate)."
+  done <<IDS
+$nc_archived
+IDS
   _status_attention_per_task wrong-base "$wrong" "The work landed on a different branch than planned" "$hk_note" \
     "Check where its pull request was merged; the details are in .ai/runtime/housekeeping.log."
   _status_attention_per_task closed-unmerged "$closed" "The pull request was closed without merging" "$hk_note" \
@@ -2435,10 +2478,38 @@ EOF
     _status_html_task_table "$paused_rows"
     printf '</details>\n'
   fi
+  if [ "$_STATUS_ARCHIVED" -gt 0 ]; then
+    _status_html_archive
+  fi
   if [ "$_STATUS_FINISHED" -gt 0 ]; then
     printf '<p class="muted">%d finished, not listed (<code>jig task list --all</code>).</p>\n' "$_STATUS_FINISHED"
   fi
   printf '</section>\n'
+}
+
+# _status_html_archive -- the collapsed "Archive (N)" block: one row per
+# archived task, its goal, when and why it was archived. Read from the state
+# at draw time, not carried in _STATUS_LIVE: an archived task is nobody's
+# work in flight, and few enough that a read each is cheap.
+_status_html_archive() {
+  local id dir goal at why
+  printf '<details id="archived"><summary>Archive (%d)</summary>\n' "$_STATUS_ARCHIVED"
+  printf '<div class="scroll"><table>\n<tr><th>Task</th><th>Goal</th><th>Archived</th><th>Reason</th></tr>\n'
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    goal="" at="" why=""
+    if jig_valid_id "$id"; then
+      dir=$(task_dir "$id") || dir=""
+      [ -z "$dir" ] || goal=$(_task_goal "$dir/task.md")
+      at=$(task_state_get "$id" archived_at)
+      why=$(task_state_get "$id" archived_reason)
+    fi
+    printf '<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
+      "$(_status_h "$id")" "$(_status_h "$goal")" "$(_status_h "$at")" "$(_status_h "$why")"
+  done <<EOF
+$_STATUS_ARCHIVED_IDS
+EOF
+  printf '</table></div>\n</details>\n'
 }
 
 # _status_html_task_groups <rows> — "<id><TAB><row>" lines, already in the
@@ -2756,12 +2827,17 @@ _status_latest_release_available() {
 
 # _status_share_hint — a line per directory `worktree.share` should name and
 # does not (jig_share_candidates): without it a task worktree has no packages.
-# The key is the team's, in .ai/config.yaml, so it is named, not written.
+# The key is the team's, in .ai/config.yaml, so it is named, not written; the
+# other road, sharing it for one task, is named beside it. A project with a
+# `worktree.setup` has taken preparing its worktrees on itself, so the line is
+# not shown there; `task start --worktree` still names the per-task road
+# (adr-20261026-a-worktree-is-finished-by-the-projects-command).
 _status_share_hint() {
   local dir
+  [ -z "$(cfg worktree.setup)" ] || return 0
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
-    printf '%s\n' "hint: $dir/ holds separate repositories a task worktree cannot reach; add \`worktree.share: [$dir]\` to $JIG_AI_DIR/config.yaml"
+    printf '%s\n' "hint: $dir/ holds separate repositories a task worktree cannot reach; for a task that edits them: \`jig task bootstrap <id> --share $dir\`; for every task: add \`worktree.share: [$dir]\` to $JIG_AI_DIR/config.yaml"
   done <<EOF
 $(jig_share_candidates "$JIG_PROJECT")
 EOF

@@ -102,13 +102,14 @@ _hklog_recheck() {
         # asks for (ADR-0030).
         case "$(task_state_get "$id" status)" in
           consolidated | abandoned) continue ;;
+          # An archived task whose work merged still needs closing: it stays.
         esac
         ;;
       'abandoned?')
         # housekeeping_decide drops this flag for a task already abandoned
         # (abandoned:closed). The page says the same thing a run earlier,
         # instead of asking a question that has been answered.
-        [ "$(task_state_get "$id" status)" != abandoned ] || continue
+        case "$(task_state_get "$id" status)" in abandoned | archived) continue ;; esac
         ;;
       worktree-kept)
         _hklog_worktree_kept "$id" || continue
