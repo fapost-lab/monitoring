@@ -7,14 +7,14 @@ does not belong here.
 
 ## Domains
 
-**Operator screens** (`src/`): wires Laravel Pulse, Laravel Telescope and the log viewer into an installation, renders the installation's health from a Foundation contract, and puts
+**Operator screens** (`src/`): wires Laravel Pulse, Laravel Telescope, the log viewer and Sentry error reporting into an installation, renders the installation's health from a Foundation contract, and puts
 the operator access contract in front of them. It owns no sign-in, no users and no policy: who may look
 is answered by `Fapost\Foundation\Operator\Contracts\OperatorAccessInterface`, bound by Core (default)
 or an operator layer (SaaS). It must not know Core's classes or the tenancy mode.
 
 ## Boundaries and dependency direction
 
-The package depends on Foundation (contracts) and on third-party Pulse, Telescope and log-viewer (all in `require`:
+The package depends on Foundation (contracts) and on third-party Pulse, Telescope, log-viewer and sentry-laravel (all in `require`:
 the package is the optional part, its tools are not); Core and the SaaS
 package depend on nothing here. Host-specific wiring (keeping operator routes off tenant hosts, sending a
 guest to a sign-in) enters through two configuration lists, `monitoring.middleware` and
@@ -35,6 +35,9 @@ rejected for v0.1.0 as too wide a change, and stays a candidate.
 - App process (request, job, command) → Telescope watchers → `RecordingFilter` (everything only under `record_all`)
   → `RedactingEntriesRepository` (masks new entries and later updates) → `telescope_*` tables on `landlord`;
   `telescope:prune` daily from the installation's scheduler.
+- Unhandled exception (web, queue, scheduler, console) → Laravel's handler → the reportable hook of
+  `ErrorReporting` (only when `SENTRY_LARAVEL_DSN` is set) → Sentry client → `EventScrubber::send` (`before_send`)
+  → Sentry. Core never calls `Integration::handles()`: this hook is the only reporter.
 
 ## System-wide constraints and invariants
 
@@ -42,6 +45,7 @@ rejected for v0.1.0 as too wide a change, and stays a candidate.
 - Pulse tables live on the `landlord` connection, never in a tenant schema (`pulse_*`, names fixed by Pulse).
 - Pulse keeps counters and route patterns only; query strings, bodies, headers and cookies are not stored.
 - The log viewer is off by default and read-only when on (no download, no delete).
+- Error reporting is off without a DSN and never sends personal data (see RULES).
 - Telescope is off by default in every environment (`monitoring.telescope.enabled` overrides Telescope's own
   switch); when on, its entries live on `landlord` and pass the redactor. Horizon is not part of this package:
   it stays in Core behind the same contract.

@@ -39,6 +39,14 @@ are added as sections of this file.
   ignored request paths (`monitoring.pulse.ignore`, domain-aware), outgoing calls kept as their host only, cache
   keys kept by their first segment. A new or newly enabled recorder arrives with a test that a secret does not
   reach `pulse_*`. Known and accepted: slow SQL text may hold hand-written literals; exception locations name files.
+- **Error reports carry no personal data and are off without a DSN.** `ErrorReporting` wires sentry-laravel only
+  when `SENTRY_LARAVEL_DSN` is set and forces the privacy options whatever the environment says (no PII, request
+  bodies, headers, cookies, SQL bindings, logs or input-carrying breadcrumbs); the config stays cacheable (static
+  callables, never closures). `EventScrubber` keeps only method and path, scrubs sensitive keys, replaces every
+  database exception message with SQLSTATE plus placeholder SQL, also where a wrapper such as `ViewException`
+  copied it, and drops the event if it fails. `JobContext` is a deliberate singleton (worker state reset on
+  `JobProcessed`, `Looping`, `WorkerStopping`). Moved here from fapost/saas, where it was reviewed (saas#119).
+  (`tests/ErrorReporting`.)
 - **Pulse resolves no users from a table.** The `ResolvesUsers` binding is `NeutralUsers` (a label made of the id,
   no query, no name/e-mail/avatar) unless `monitoring.pulse.resolve_users` says `true` (Pulse's own lookup) or gives
   a callable; the application's `Pulse::users()` rebinds later and wins. Reason: users live in tenant schemas, absent

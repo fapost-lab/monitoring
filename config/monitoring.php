@@ -134,4 +134,28 @@ return [
             'response_parameters' => [],
         ],
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Error reporting (Sentry)
+    |--------------------------------------------------------------------------
+    |
+    | Unhandled exceptions of requests, queue jobs, the scheduler and console commands go to Sentry through
+    | `sentry/sentry-laravel`, and only when a DSN is set: without one nothing is hooked and nothing is sent. The
+    | privacy options (no PII, no request bodies, no local variables, no SQL bindings, no logs) are forced over any
+    | Sentry environment variable or published `config/sentry.php`; see the README.
+    |
+    | `dsn`: SENTRY_LARAVEL_DSN (or SENTRY_DSN), empty = off.
+    | `environment`: SENTRY_ENVIRONMENT, default APP_ENV.
+    | `release`: SENTRY_RELEASE, default APP_VERSION when set.
+    | `traces_sample_rate`: SENTRY_TRACES_SAMPLE_RATE, 0 to 1, default 0 (no performance tracing).
+    |
+    */
+
+    'error_reporting' => [
+        'dsn'                => env('SENTRY_LARAVEL_DSN', env('SENTRY_DSN')),
+        'environment'        => env('SENTRY_ENVIRONMENT'),
+        'release'            => env('SENTRY_RELEASE', env('APP_VERSION')),
+        'traces_sample_rate' => env('SENTRY_TRACES_SAMPLE_RATE', 0),
+    ],
 ];

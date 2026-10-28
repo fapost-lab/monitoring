@@ -3,7 +3,8 @@
 `fapost/monitoring` is the optional package for whoever wants **full control over a running
 installation**: [Laravel Pulse](https://laravel.com/docs/pulse) (server load, slow requests and
 jobs, exceptions, Reverb's connection and message cards), [Laravel Telescope](https://laravel.com/docs/telescope)
-(off by default) and a log viewer (off by default) — all behind one operator access contract.
+(off by default), a log viewer (off by default) and opt-in, privacy-first error reporting to
+[Sentry](https://sentry.io) (off without a DSN) — all behind one operator access contract.
 
 FaPost Core already has a health page of its own in the console (Reverb, the webhook gateway,
 the queues) that every installation gets. This package is for the people who run the
@@ -28,8 +29,10 @@ queue workers, with or without this package.
   its own at `/monitoring/health` (see [Installation health](#installation-health)).
 - **Log viewer** at `/log-viewer` ([opcodesio/log-viewer](https://github.com/opcodesio/log-viewer)),
   **off by default** and read-only when on (no download, no delete; a published `monitoring.logs.read_only` can lift it). Its assets are published to `public/vendor/log-viewer` by the `extra.fapost.post-install` step (`log-viewer:publish`) of the image build.
+- **Error reporting** to Sentry for unhandled exceptions, **off until a DSN is set**, with personal data stripped
+  before anything leaves the installation (see [Error reporting](#error-reporting)).
 
-Each answers **404** to anyone the contract does not let in, and to everyone when no contract is bound.
+Each screen answers **404** to anyone the contract does not let in, and to everyone when no contract is bound.
 
 ## Install
 
@@ -98,6 +101,7 @@ Two lists in `config/monitoring.php` let the host application add its own steps,
 | `MONITORING_TELESCOPE_KEEP_HOURS` | `48` | entries older than this are pruned daily; `0` schedules no prune |
 | `MONITORING_PULSE_ALLOW_CACHED_CLASSES` | `true` | adds the classes Pulse's cards cache to `cache.serializable_classes` (see below) |
 | `PULSE_STORAGE_KEEP` | `7 days` | Pulse's own retention (trimmed by `pulse:work`) |
+| `SENTRY_LARAVEL_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`, `SENTRY_TRACES_SAMPLE_RATE` | unset / `APP_ENV` / unset / `0` | error reporting; no DSN means off (see [Error reporting](#error-reporting)) |
 
 ## Installation health
 
@@ -221,6 +225,56 @@ which the filter drops, and its later "failed" update has no entry to land on.
 Exceptions in `storage/logs` carry messages, stack traces and context arrays that can contain tokens,
 addresses and personal data. Switch the viewer on only on an installation where everyone the contract lets
 in may read all of that, and look at real log content first. It is read-only, but reading is the risk.
+
+## Error reporting
+
+Unhandled exceptions of web requests, queue jobs (Horizon), the scheduler and console commands can be sent to
+[Sentry](https://sentry.io) through `sentry/sentry-laravel`, which this package requires and package discovery loads. It is
+**off until a DSN is set**: with `SENTRY_LARAVEL_DSN` empty nothing is sent, no hook is installed and Sentry's client has no
+transport. Core is not changed and does not depend on Sentry.
+
+| Variable | Meaning |
+|---|---|
+| `SENTRY_LARAVEL_DSN` (or `SENTRY_DSN`) | The project's DSN. Empty: error reporting is off. |
+| `SENTRY_ENVIRONMENT` | The environment name in Sentry. Default: `APP_ENV`. |
+| `SENTRY_RELEASE` | The release. Default: `APP_VERSION` when the deployment sets it, otherwise none. |
+| `SENTRY_TRACES_SAMPLE_RATE` | Performance tracing, 0 to 1. Default `0` (off: errors only, no added load). |
+
+The settings are read into `monitoring.error_reporting` (`config/monitoring.php`) and written to the `sentry` configuration
+while the application boots. The privacy settings below are forced there: no Sentry environment variable
+(`SENTRY_SEND_DEFAULT_PII`, `SENTRY_ENABLE_LOGS` and the like) and no published `config/sentry.php` can switch them on.
+The configuration stays cacheable (`config:cache`): the hooks are static callables, never closures.
+
+What is **never sent**: request bodies, headers, cookies and query strings (the event keeps the HTTP method and the URL
+without its query string; a long token-like path segment is replaced); the signed-in user and the client's IP address
+(`send_default_pii` is off); queue job payloads; local variables of stack frames; SQL bindings, log records and metrics.
+A `before_send` hook (`Fapost\Monitoring\ErrorReporting\EventScrubber`) cleans extra data, contexts, breadcrumbs, tags and
+exception messages: a value under a sensitive key (token, `_token`, password, secret, API key, authorization, cookie,
+e-mail, phone, `name`, first, last and full name, message text) is replaced by `[redacted]`, long strings and lists are
+capped, and an event it cannot clean is dropped.
+
+Exception messages are free text. The hook cuts e-mail addresses, bearer credentials and `key=value` secrets out of them
+(`token=...`, `password=...`). The message of a database exception (a query exception, a PDO or Doctrine exception, also
+when it is the previous exception of another) is replaced as a whole: it becomes `Database error SQLSTATE[<code>]`, and for a
+query exception the SQL with its `?` placeholders follows. No driver text, `DETAIL`, `HINT`, quoted value or binding is
+sent. A wrapper that copies a database error into its own message (the view engine does: `<database error> (View: ...)`)
+is cleaned too: the copied text is replaced by the same fixed form, and a message of a wrapper over a database exception that
+still shows `SQLSTATE[` or `(SQL: ` is cut where that text starts. The hook cannot know a name or other words written into any
+other message by the code that threw it, nor a database error that application code paraphrases (values re-typed into its own
+sentence) rather than copies. Treat messages as potentially sensitive, and keep personal data out of exception messages.
+
+What is sent: the exception class, its cleaned message and stack trace with the lines of source code around each frame, the
+route name, the environment and release, and, for an exception in a queued job, the tags `job` and `queue` (the job's name
+and queue, never the payload).
+
+Not reported, as expected noise: 404 and every other HTTP error below 500 (403 and 404 refusals of the operator screens
+included), 419 expired forms, 422 validation failures, unauthenticated requests, throttled requests, malformed requests, and
+failures of the Eloquent route binding. Laravel does not report HTTP exceptions at all (`abort(503)` included), so these never
+reach Sentry either; every other exception does.
+
+Caveats: Core must not call `Integration::handles()` (this package's reportable hook is the only reporter, or every error
+would go out twice); the job context is process state of a worker and is reset when a job ends and when the worker loops or
+stops.
 
 ## Design rules
 

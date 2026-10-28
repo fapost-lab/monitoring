@@ -1,6 +1,6 @@
 {
   "name": "fapost/monitoring",
-  "description": "FaPost monitoring: Pulse, Telescope and a log viewer behind one operator-access contract",
+  "description": "FaPost monitoring: Pulse, Telescope, a log viewer and Sentry error reporting behind one operator-access contract",
   "type": "library",
   "license": "Apache-2.0",
   "require": {
@@ -9,7 +9,8 @@
     "illuminate/support": "^12.0 || ^13.0",
     "laravel/pulse": "^1.8",
     "opcodesio/log-viewer": "^3.24.2",
-    "laravel/telescope": "^5.26"
+    "laravel/telescope": "^5.26",
+    "sentry/sentry-laravel": "^4.29"
   },
   "require-dev": {
     "laravel/pint": "^1.27",
