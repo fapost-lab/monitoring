@@ -114,7 +114,10 @@ Pass `--body-file` when the task agent wrote a `pr-body.md`; without it the body
   the table below.
 
 After each merge: `jig task set <id> status consolidated`, `jig spec done <id>` **in the epic
-checkout**, `jig task autopilot <id> end --reason merged`, and fast-forward the epic. Asking for a phase run is
+checkout**, `jig task autopilot <id> end --reason merged`, and fast-forward the epic. A task of the
+wave that was abandoned instead (`spec plan` shows its item `abandoned`) gets `jig spec drop <id>`
+in the epic checkout in place of `spec done`: its branch could not close the item, and the edit is
+committed on the epic like a checkmark. Asking for a phase run is
 the person's yes to closing a task whose pull request merged, attended too — otherwise the plan
 cannot see the merge until housekeeping runs.
 
@@ -186,6 +189,7 @@ rules verbatim:
 | A conflict updating the base | `git merge` stopped | an agent in that worktree resolves it keeping both intentions, runs the targeted tests, re-reviews and ships again. If the resolution needs a product decision: stop (unattended: `git merge --abort` and a draft naming the reason) |
 | CI or the forge is unreachable | `not merged: …` | attended: into the message. Unattended: the pull request stays open, the wave does not close, and the run ends with a report |
 | The epic diverged from origin | `jig task start` dies with "diverged" | `git merge origin/<epic>` into the local epic — never rebase — and carry on |
+| A brief with no goal | `jig task start` dies with "has no goal" (T3/T4) | write the goal from the roadmap item and the spec with `jig task artifact write <id> task --from <file>`, and start again; with nothing there to write it from, a stop of the run (unattended: end the run with a report) |
 
 Unattended, a draft ends the phase run: report what landed, what is a draft and why, and leave
 the next wave to a person — and record it with `jig spec stop`, the reason naming the draft.

@@ -7,7 +7,7 @@
 #
 # A task links to a spec through one `Spec: .ai/specs/<id>/ — Phase <n>` line in
 # its task.md. `new` creates a spec, `done` checks a linked task's roadmap
-# items, `link` writes a filed task's `Spec:` line, `remove` unlinks a spec's open tasks and moves the spec to trash,
+# items, `drop` closes the items of an abandoned or moved one, `link` writes a filed task's `Spec:` line, `remove` unlinks a spec's open tasks and moves the spec to trash,
 # `stop` records a phase run's stop by sending it to the person's Telegram,
 # `close` removes a spec whose roadmap is complete, `epic` declares, cuts,
 # finishes and reopens a spec's epic branch (ADR-0035, ADR-0040 as amended),
@@ -16,7 +16,7 @@
 # `list` only reads.
 # shellcheck shell=bash
 
-SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec link <spec-id> <task-id> | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
+SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
 
 cmd_spec() {
   local sub="${1:-}"
@@ -30,6 +30,7 @@ cmd_spec() {
     plan) spec_plan "$@" ;;
     stop) spec_stop "$@" ;;
     done) spec_done "$@"; jig_status_page_touch ;;
+    drop) spec_drop "$@"; jig_status_page_touch ;;
     link) spec_link "$@" ;;
     remove) spec_remove "$@"; jig_status_page_touch ;;
     close) spec_close "$@"; jig_status_page_touch ;;
@@ -282,11 +283,15 @@ spec_progress() {
 # `<phase>\t<title>\t<done>\t<total>\t<filed>\t<fog>` line each. The one place
 # the counting rules for roadmap lines live (schemas/spec.md).
 #
-# An item is a checkbox line. Done is a checked one. Filed is an unchecked item
-# whose text starts with a backticked task id followed by a dash — the id alone
-# is not enough, because an item may just as well open with a backticked
-# command name. Fog is an unchecked item whose text starts with `fog:`. Wave
-# lines are a numbered list, not checkboxes, so they are never counted.
+# An item is a checkbox line. Done is a checked one, or an unchecked one whose
+# task is known to have merged (spec_merged_task_ids — the rule `spec plan`
+# reads too): in a phase run the coordinator's checkmarks reach the epic's
+# remote only with the next pull request, and the work they mark is already
+# there. Filed is an unchecked item whose text starts with a backticked task id
+# followed by a dash — the id alone is not enough, because an item may just as
+# well open with a backticked command name — and whose task has not merged. Fog
+# is an unchecked item whose text starts with `fog:`. Wave lines are a numbered
+# list, not checkboxes, so they are never counted.
 #
 # A `## Phase <n> — <title>` heading opens phase <n>, listed even while it has
 # no items. Items under any other `##` heading, or before the first one, are
@@ -296,15 +301,19 @@ spec_progress() {
 #
 # With `items` as the second argument (spec_phase_items) each counted item is
 # also printed, before the line of its section, as
-# `item\t<checked 0|1>\t=<task-id>\t<fog 0|1>\t<text>`, `=` alone for no task
-# id — a mark no id can be, since `-` is one the pattern takes: the task id and the
+# `item\t<checked 0|1>\t<done 0|1>\t=<task-id>\t<fog 0|1>\t<text>`, `=` alone for
+# no task id — a mark no id can be, since `-` is one the pattern takes: <done> is
+# what the item counted as, the task id and the
 # fog mark by the same patterns the counts use, read from checked items too,
 # and the text as written after the checkbox, its indented continuation lines
 # joined with a space. Without it the output is the counts alone.
 spec_phase_counts() {
-  local items=0
+  local items=0 merged
   [ "${2:-}" != items ] || items=1
-  awk -v items="$items" '
+  merged=" $(spec_merged_task_ids | cut -f1 | tr '\n' ' ') "
+  # The set reaches awk through the environment: a `-v` value has its escapes
+  # expanded.
+  JIG_SP_MERGED="$merged" awk -v items="$items" '
     function reset() { done = 0; total = 0; filed = 0; fog = 0 }
     function flush() {
       if (phase != "-" || total > 0)
@@ -314,10 +323,10 @@ spec_phase_counts() {
       if (!pending) return
       gsub(/\t/, " ", itext)
       sub(/[[:space:]]+$/, "", itext)
-      printf "item\t%d\t=%s\t%d\t%s\n", ichecked, itid, ifog, itext
+      printf "item\t%d\t%d\t=%s\t%d\t%s\n", ichecked, idone, itid, ifog, itext
       pending = 0
     }
-    BEGIN { phase = "-"; title = ""; reset(); pending = 0 }
+    BEGIN { phase = "-"; title = ""; reset(); pending = 0; merged = ENVIRON["JIG_SP_MERGED"] }
     /^##[[:space:]]/ {
       emit(); flush(); reset()
       h = $0
@@ -346,10 +355,13 @@ spec_phase_counts() {
       if (text ~ /^`[A-Za-z0-9._-]+`[[:space:]]+(—|-|--)[[:space:]]/) {
         tid = substr(text, 2); sub(/`.*$/, "", tid)
       } else if (text ~ /^fog:/) isfog = 1
-      if (checked) done++
+      # Ids are compared as strings: index(), never a pattern a `.` in an id
+      # would widen.
+      isdone = checked || (tid != "" && index(merged, " " tid " ") > 0)
+      if (isdone) done++
       else if (tid != "") filed++
       else if (isfog) fog++
-      if (items == 1) { pending = 1; ichecked = checked; itid = tid; ifog = isfog; itext = text }
+      if (items == 1) { pending = 1; ichecked = checked; idone = isdone; itid = tid; ifog = isfog; itext = text }
       next
     }
     pending && /^[[:space:]]+[^[:space:]]/ {
@@ -548,13 +560,15 @@ _spec_json_phases() {
   local sd=0 st=0 sf=0 sg=0
   while IFS=$'\t' read -r f1 f2 f3 f4 f5 f6; do
     if [ "$f1" = item ]; then
-      # f2 checked, f3 `=` and the task id, f4 fog, f5 the text (no tab in it).
-      json_quote "$f5"
+      # f2 checked, f3 done, f4 `=` and the task id, f5 fog, f6 the text (no
+      # tab in it).
+      json_quote "$f6"
       items="$items$isep{\"text\":$_JSON"
       if [ "$f2" = 1 ]; then items="$items,\"checked\":true"; else items="$items,\"checked\":false"; fi
-      if [ "$f3" = = ]; then _JSON=null; else json_quote "${f3#=}"; fi
+      if [ "$f3" = 1 ]; then items="$items,\"done\":true"; else items="$items,\"done\":false"; fi
+      if [ "$f4" = = ]; then _JSON=null; else json_quote "${f4#=}"; fi
       items="$items,\"task\":$_JSON"
-      if [ "$f4" = 1 ]; then items="$items,\"fog\":true}"; else items="$items,\"fog\":false}"; fi
+      if [ "$f5" = 1 ]; then items="$items,\"fog\":true}"; else items="$items,\"fog\":false}"; fi
       isep=","
       continue
     fi
@@ -979,7 +993,8 @@ _spec_plan_parse() {
 _spec_plan_enrich() {
   local merged_ids line iphase wave checked tid ikind ititle
   local state merged paused autopilot building tdir st
-  merged_ids=" $(_spec_plan_hk_merged | tr '\n' ' ') "
+  # " <id>:<why> " pairs from the shared rule; an id holds no colon or space.
+  merged_ids=" $(spec_merged_task_ids | tr '\t\n' ': ') "
   while IFS= read -r line; do
     case "$line" in
       item$'\t'*) ;;
@@ -1012,22 +1027,60 @@ ROW
         if [ "$autopilot" = on ] && [ "$(spec_task_state "$tdir" knowledge_consolidated)" != true ]; then
           building=1
         fi
-        if [ "$merged" = no ] && [ "$st" = consolidated ]; then
-          merged=closed
-        fi
       else
         state=no-workspace
         [ "$checked" != 1 ] || state="done"
       fi
       if [ "$merged" = no ]; then
+        # Quoted, the id is matched as a string, never as a pattern.
         case "$merged_ids" in
-          *" $tid "*) merged=housekeeping ;;
+          *" $tid:closed "*) merged=closed ;;
+          *" $tid:housekeeping "*) merged=housekeeping ;;
         esac
       fi
     fi
     printf 'item\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$iphase" "$wave" "$tid" "$state" "$merged" "$paused" "$autopilot" "$building" "$ititle"
   done
+}
+
+# spec_merged_task_ids — the tasks whose work is known to have merged, one
+# `<task-id>\t<closed|housekeeping>` line each: `closed` for a task whose
+# workspace `state` says `consolidated` (ADR-0030 closes a task only after its
+# change landed), then `housekeeping` for an id the newest housekeeping run
+# logged `remote=merged` and that is not closed. The one rule every reader of
+# "merged" shares — the roadmap counts (spec_phase_counts) and `spec plan` —
+# read offline: no fetch, no forge call. Both sources are local and
+# gitignored, so a clone holding neither knows only the roadmap's checkmarks.
+spec_merged_task_ids() {
+  local ws closed=""
+  # A roadmap read outside a project (a library sourced on its own) has no
+  # tasks to ask.
+  [ -n "${JIG_PROJECT:-}" ] && [ -n "${JIG_AI_DIR:-}" ] || return 0
+  ws="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
+  # A glob, not find: in a `--worktree` checkout the tasks directory is a
+  # link to the owner's (_task_link_workspace), and find does not descend it.
+  set -- "$ws"/*/state
+  if [ -f "$1" ]; then
+    closed=$(awk '
+      FNR == 1 { seen = 0 }
+      !seen && /^status:/ {
+        seen = 1
+        v = $0; sub(/^status:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+        if (v == "consolidated") {
+          d = FILENAME; sub(/\/state$/, "", d); sub(/^.*\//, "", d)
+          print d
+        }
+      }
+    ' "$@" 2>/dev/null) || closed=""
+  fi
+  {
+    [ -z "$closed" ] || printf '%s\n' "$closed" | awk '{ print "c\t" $0 }'
+    _spec_plan_hk_merged | awk '{ print "h\t" $0 }'
+  } | awk -F '\t' '
+    $1 == "c" { if (!($2 in seen)) { seen[$2] = 1; printf "%s\tclosed\n", $2 } ; next }
+    $1 == "h" { if (!($2 in seen)) { seen[$2] = 1; printf "%s\thousekeeping\n", $2 } }
+  '
 }
 
 # _spec_plan_hk_merged — the task ids the newest housekeeping run found merged
@@ -2073,14 +2126,22 @@ spec_task_state() {
 # (adr-20260922-a-phase-run-is-coordinated). The refusal is narrow on purpose:
 # only in the task's own branch, which is where an agent runs, and never in
 # the epic checkout the coordinator runs from.
+#
+# `spec drop` asks the same question with its own name as the third argument:
+# closing an abandoned task's item is the same edit of a neighbouring line.
 _spec_done_phase_refusal() {
-  local tid="$1" tdir="$2" phase branch here
+  local tid="$1" tdir="$2" cmd="${3:-done}" phase branch here
   phase=$(spec_task_state "$tdir" autopilot_phase)
   [ -n "$phase" ] || return 0
   branch=$(spec_task_state "$tdir" branch)
   [ -n "$branch" ] || return 0
   here=$(git -C "$JIG_PROJECT" symbolic-ref --short HEAD 2>/dev/null) || here=""
   [ "$here" = "$branch" ] || return 0
+  if [ "$cmd" = drop ]; then
+    printf 'spec drop: %s runs in phase %s; in a phase run the coordinator rewrites its roadmap item after the merge, in the epic checkout: jig spec drop %s\n' \
+      "$tid" "$phase" "$tid"
+    return 0
+  fi
   printf 'spec done: %s runs in phase %s; in a phase run the coordinator checks items after the merge, in the epic checkout. Leave the roadmap alone and finish consolidation.\n' \
     "$tid" "$phase"
 }
@@ -2161,6 +2222,327 @@ spec_done() {
     *)
       rm -f "$tmp"
       jig_die "spec done: could not read $JIG_AI_DIR/specs/$sid/roadmap.md"
+      ;;
+  esac
+}
+
+# _spec_drop_own_branch_refusal <task-id> <task-dir> — why `spec drop` must
+# not edit the roadmap here, or nothing: HEAD is the abandoned task's own
+# branch, which never ships. An edit there would stay in that tree — in a
+# task worktree, one that goes away, and whose dirt keeps it from going — and
+# never reach the base. The item waits, unclosed and visible to `spec plan`
+# and the lifecycle, for a run on a checkout of the base.
+_spec_drop_own_branch_refusal() {
+  local tid="$1" tdir="$2" branch here base
+  branch=$(spec_task_state "$tdir" branch)
+  [ -n "$branch" ] || return 0
+  # Only a branch the task was started on is its own: a filed task's
+  # recorded branch with no fork point, or a project on one branch
+  # (git.branch_per_task: false) whose task records the base itself, is not.
+  [ -n "$(spec_task_state "$tdir" base_commit)" ] || return 0
+  here=$(git -C "$JIG_PROJECT" symbolic-ref --short HEAD 2>/dev/null) || here=""
+  [ "$here" = "$branch" ] || return 0
+  base=$(jig_task_base "$tid")
+  [ "$branch" != "$base" ] || return 0
+  [ "$branch" != "$(cfg git.base_branch main)" ] || return 0
+  printf 'spec drop: %s is checked out here on its own branch, which never ships; run jig spec drop %s in a checkout of %s\n' \
+    "$tid" "$tid" "$base"
+}
+
+# _spec_drop_rewrite <roadmap> <task-id> <suffix> <tmp> — write <roadmap> to
+# <tmp> with every unchecked item that names the task checked and <suffix>
+# after its last line, and print the rewritten lines. Exit 3: no item names
+# the task. Exit 4: every item that does is checked already. The id is
+# compared as a string, not a pattern: `.` is legal in an id. A matched item
+# is held until the line after its last continuation line, so the suffix ends
+# the item rather than its first line. Values reach awk through the
+# environment: a `-v` value has its escapes expanded.
+_spec_drop_rewrite() {
+  local roadmap="$1" tid="$2" suffix="$3" tmp="$4"
+  JIG_SD_ID="$tid" JIG_SD_SUFFIX="$suffix" awk -v tmp="$tmp" '
+    function flush() {
+      if (!held) return
+      hold[nh] = hold[nh] ENVIRON["JIG_SD_SUFFIX"]
+      for (k = 1; k <= nh; k++) { print hold[k] > tmp; print hold[k] }
+      held = 0; nh = 0
+    }
+    BEGIN { id = ENVIRON["JIG_SD_ID"]; head = "`" id "`" }
+    held && /^[[:space:]]+[^[:space:]]/ && !/^[[:space:]]*[-*][[:space:]]/ { hold[++nh] = $0; next }
+    {
+      flush()
+      line = $0
+      if (line ~ /^[[:space:]]*[-*][[:space:]]+\[[ xX]\]/) {
+        text = line
+        sub(/^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]*/, "", text)
+        if (substr(text, 1, length(head)) == head &&
+            substr(text, length(head) + 1) ~ /^[[:space:]]+(—|-|--)[[:space:]]/) {
+          matched++
+          if (line ~ /^[[:space:]]*[-*][[:space:]]+\[ \]/) {
+            sub(/\[ \]/, "[x]", line)
+            marked++
+            held = 1; nh = 1; hold[1] = line
+            next
+          }
+        }
+      }
+      print line > tmp
+    }
+    END {
+      flush()
+      close(tmp)
+      if (matched == 0) exit 3
+      if (marked == 0) exit 4
+    }
+  ' "$roadmap"
+}
+
+# _spec_drop_to_spec_branch <task-id> <spec-id> <roadmap> <suffix> <default>
+# — for a spec with no open epic, put HEAD on `spec/<sid>` the way
+# `spec resume` does, before the roadmap is edited: the edit is jig's, and
+# jig edits a spec on its own branch, never straight on the default one
+# (adr-20260930-a-spec-lives-on-its-own-branch-from-the-first-minute).
+# Already there: nothing to do. On the default branch: asked first whether
+# there is anything to close at all — exit 3 or 4 of _spec_drop_rewrite,
+# printed, and the branch stays — then a dirty tree is refused by the rule
+# `task start` uses, and the existing branch is switched to (here or on
+# origin) or a new one cut. Anywhere else: exit 3, naming the two checkouts
+# it runs on. Prints what it says on stdout; returns 1 when nothing is left
+# to do.
+_spec_drop_to_spec_branch() {
+  local tid="$1" sid="$2" roadmap="$3" suffix="$4" default="$5" here branch tmp rc=0
+  branch="spec/$sid"
+  here=$(git -C "$JIG_PROJECT" symbolic-ref --short HEAD 2>/dev/null) || here=""
+  [ "$here" != "$branch" ] || return 0
+  if [ "$here" != "$default" ]; then
+    printf 'spec drop: %s lands on %s through %s, and neither is checked out here; run jig spec drop %s on %s or on %s\n' \
+      "$tid" "$default" "$branch" "$tid" "$default" "$branch" >&2
+    exit 3
+  fi
+  tmp="$roadmap.tmp.$$"
+  jig_cleanup_add "$tmp"
+  _spec_drop_rewrite "$roadmap" "$tid" "$suffix" "$tmp" >/dev/null || rc=$?
+  rm -f "$tmp"
+  case "$rc" in
+    0) ;;
+    3)
+      printf 'spec drop: no item in %s/specs/%s/roadmap.md names %s; nothing to rewrite\n' "$JIG_AI_DIR" "$sid" "$tid"
+      return 1 ;;
+    4)
+      printf 'spec drop: %s already closed in %s/specs/%s/roadmap.md\n' "$tid" "$JIG_AI_DIR" "$sid"
+      return 1 ;;
+    *) jig_die "spec drop: could not read $JIG_AI_DIR/specs/$sid/roadmap.md" ;;
+  esac
+  _spec_refuse_dirty_tree "spec drop"
+  branch=$(_spec_switch_to_existing_branch "$sid" "spec drop") || branch=""
+  if [ -z "$branch" ]; then
+    branch=$(_spec_cut_own_branch "$sid" "spec drop") || exit 1
+  fi
+  printf 'spec drop: switched to %s\n' "$branch"
+}
+
+# _spec_drop_commit <task-id> <spec-id> <rel-roadmap> <was-clean> — land the
+# edit on `spec/<sid>` as a local commit of the roadmap alone, so that neither
+# the default branch nor the tree is left holding it and the next `task start`
+# is not refused; push and the pull request stay `spec ship`'s. Not at git
+# level `none`, where committing is the person's, and not when the roadmap
+# already held uncommitted changes, or is not tracked yet (<was-clean> is 0):
+# a `jig-idea` session's work on this branch is not jig's to commit, and
+# leaves with that session's `spec ship`. Hooks run. Prints the line that says how it
+# lands either way.
+_spec_drop_commit() {
+  local tid="$1" sid="$2" rel="$3" clean="$4" level line key branch reason moved
+  branch="spec/$sid"
+  line=$(spec_ship_git 2>/dev/null) || line=$'none\tagent.git'
+  level=${line%%$'\t'*}
+  key=${line#*$'\t'}
+  if [ "$level" = none ]; then
+    printf "spec drop: %s is none in this clone; commit %s on %s and open its pull request yourself\n" \
+      "$key" "$rel" "$branch"
+    return 0
+  fi
+  if [ "$clean" != 1 ]; then
+    printf 'spec drop: %s holds changes not committed on %s yet; land them together with jig spec ship %s --message-file <file>\n' \
+      "$rel" "$branch" "$sid"
+    return 0
+  fi
+  reason=$(spec_task_state "$(spec_task_dir "$tid")" abandoned_reason)
+  moved=$(spec_task_state "$(spec_task_dir "$tid")" moved_to)
+  if git -C "$JIG_PROJECT" commit --quiet \
+      -m "Close $tid in the roadmap of $sid" \
+      -m "${moved:+Moved to $moved. }${reason:-Abandoned.}" \
+      -- "$rel" >/dev/null 2>&1; then
+    printf 'spec drop: committed %s on %s; land it with jig spec ship %s --message-file <file>\n' \
+      "$(git -C "$JIG_PROJECT" rev-parse --short HEAD)" "$branch" "$sid"
+  else
+    jig_warn "spec drop: could not commit $rel on $branch; commit it yourself, then jig spec ship $sid --message-file <file>"
+  fi
+}
+
+# spec_drop <task-id> — close the roadmap items that name an abandoned task,
+# with why in their text (adr-20261029-an-abandoned-task-says-why-and-its-roadmap-item-follows).
+#
+# Run by `jig task abandon` through the dispatcher, and by a phase run's
+# coordinator in the epic checkout for an item a task branch could not touch.
+# The reason, the day and the move's target are read from the task's `state`
+# (read only: `state` is `jig task`'s), so a later run writes what abandon
+# recorded. An unchecked item that names the task — the grammar `spec done`
+# matches — is checked, and its last line, continuation lines included, gets
+# ` — moved to <ref> (<day>): <reason>` or ` — dropped (<day>): <reason>`.
+# The suffix opens with a dash between spaces, which is where a wave entry's
+# title ends (_spec_plan_parse), so the waves still name the item. A checked
+# item counts as done everywhere and as closed for the lifecycle: the why is
+# in its text, not in a count of its own.
+#
+# Where the edit is made: a spec with an open epic, on the epic; a spec with
+# none, on `spec/<sid>`, switched to or cut from the default branch the way
+# `spec resume` does and committed there (_spec_drop_to_spec_branch,
+# _spec_drop_commit) — the roadmap is never left edited on the default branch.
+#
+# Exit 3, with the reason on stderr: in a phase run's task branch, where the
+# coordinator closes the item (_spec_done_phase_refusal), in any checkout of
+# the task's own branch (_spec_drop_own_branch_refusal), and wherever neither
+# the epic nor, for a spec without one, the default branch or `spec/<sid>` is
+# checked out. No item naming the task, or every one already checked, is not
+# an error: there is nothing left for the roadmap to say. Neither is a spec
+# `spec remove` is taking away (JIG_INTERNAL_SPEC_REMOVING): its roadmap goes
+# with it, and switching branches under that command would split it in two.
+spec_drop() {
+  [ $# -ge 1 ] || jig_die "spec drop: missing task id (usage: jig spec drop <task-id>)"
+  [ $# -eq 1 ] || jig_die "spec drop: unexpected argument: $2"
+  local tid="$1" tdir st from sid roadmap rel tmp out rc=0 refusal day reason moved suffix base
+  jig_require_init
+  tdir=$(spec_task_dir "$tid") || jig_die "spec drop: invalid task id: $tid"
+  [ -f "$tdir/task.md" ] || jig_die "spec drop: unknown task: $tid (no $JIG_AI_DIR/workspace/tasks/$tid/task.md)"
+  st=$(spec_task_state "$tdir" status)
+  from=$(spec_task_state "$tdir" archived_from)
+  case "$st:$from" in
+    abandoned:* | archived:abandoned) ;;
+    *) jig_die "spec drop: $tid is ${st:-unknown}; abandon it first: jig task abandon $tid --reason <text>" ;;
+  esac
+  refusal=$(_spec_done_phase_refusal "$tid" "$tdir" drop)
+  [ -n "$refusal" ] || refusal=$(_spec_drop_own_branch_refusal "$tid" "$tdir")
+  if [ -n "$refusal" ]; then
+    printf '%s\n' "$refusal" >&2
+    exit 3
+  fi
+  sid=$(jig_spec_link "$tdir/task.md") || rc=$?
+  [ "$rc" = 0 ] || jig_die "spec drop: $tid links to more than one spec in its task.md"
+  if [ -z "$sid" ]; then
+    printf 'spec drop: %s is not linked to a spec\n' "$tid"
+    return 0
+  fi
+  if [ "${JIG_INTERNAL_SPEC_REMOVING:-}" = "$sid" ]; then
+    printf 'spec drop: spec %s is being removed; nothing to rewrite\n' "$sid"
+    return 0
+  fi
+  # A spec that is not here, or has no roadmap yet, has no item to say
+  # anything: an ordinary state (`incomplete (no roadmap.md)`), never a reason
+  # to fail the abandon that ran this — or `spec remove`, which runs that.
+  rel="$JIG_AI_DIR/specs/$sid/roadmap.md"
+  roadmap="$(spec_dir)/$sid/roadmap.md"
+  if [ ! -f "$roadmap" ]; then
+    printf 'spec drop: %s/specs/%s/ has no roadmap.md here; nothing to rewrite\n' "$JIG_AI_DIR" "$sid"
+    return 0
+  fi
+
+  day=$(spec_task_state "$tdir" abandoned_at)
+  [ -n "$day" ] || day=$(jig_today)
+  reason=$(spec_task_state "$tdir" abandoned_reason)
+  moved=$(spec_task_state "$tdir" moved_to)
+  if [ -n "$moved" ]; then
+    suffix=" — moved to $moved ($day)"
+  else
+    suffix=" — dropped ($day)"
+  fi
+  [ -z "$reason" ] || suffix="$suffix: $reason"
+
+  # Where the edit has to land. A spec with an open epic: the epic, whose copy
+  # of the roadmap is the current one, whatever base the task recorded. A
+  # spec without one whose task belongs on the default branch: `spec/<sid>`.
+  # Anything else: the task's own base when it started, else what `task
+  # start` would have cut it from — and only on a checkout of it, since
+  # anywhere else the edit would sit in a tree it never leaves.
+  local epic="" here here_before="" default on_spec=0 clean=0
+  epic=$(jig_spec_epic "$roadmap" 2>/dev/null) || epic=""
+  case "$epic" in
+    *' open') epic=${epic% open} ;;
+    *) epic="" ;;
+  esac
+  default=$(cfg git.base_branch main)
+  base=$epic
+  [ -n "$base" ] || base=$(spec_task_state "$tdir" base_branch)
+  [ -n "$base" ] || base=$(jig_task_base "$tid")
+  if [ -z "$epic" ] && [ "$base" = "$default" ]; then
+    on_spec=1
+    here_before=$(git -C "$JIG_PROJECT" symbolic-ref --short HEAD 2>/dev/null) || here_before=""
+    _spec_drop_to_spec_branch "$tid" "$sid" "$roadmap" "$suffix" "$default" || return 0
+    # A `spec/<sid>` left from an earlier session may predate the item the
+    # default branch holds: nothing would be closed, and HEAD would have moved
+    # for nothing. Back to the default branch, naming what to do.
+    rc=0
+    if [ -f "$roadmap" ]; then
+      tmp="$roadmap.tmp.$$"
+      jig_cleanup_add "$tmp"
+      _spec_drop_rewrite "$roadmap" "$tid" "$suffix" "$tmp" >/dev/null || rc=$?
+      rm -f "$tmp"
+    else
+      rc=3
+    fi
+    if [ "$rc" -eq 3 ] && [ "$here_before" = "$default" ]; then
+      git -C "$JIG_PROJECT" switch --quiet "$default" >/dev/null 2>&1 \
+        || jig_die "spec drop: spec/$sid does not name $tid, and switching back to $default failed"
+      printf 'spec drop: spec/%s does not name %s, %s does; switched back to %s. Merge %s into spec/%s, then run jig spec drop %s again\n' \
+        "$sid" "$tid" "$default" "$default" "$default" "$sid" "$tid" >&2
+      exit 3
+    fi
+    if [ ! -f "$roadmap" ]; then
+      printf 'spec drop: spec/%s has no %s; nothing to rewrite\n' "$sid" "$rel"
+      return 0
+    fi
+    if git -C "$JIG_PROJECT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 \
+      && git -C "$JIG_PROJECT" diff --quiet HEAD -- "$rel" 2>/dev/null; then
+      clean=1
+    fi
+  else
+    here=$(git -C "$JIG_PROJECT" symbolic-ref --short HEAD 2>/dev/null) || here=""
+    if [ "$here" != "$base" ]; then
+      printf 'spec drop: %s lands on %s, which is not checked out here; run jig spec drop %s in a checkout of %s\n' \
+        "$tid" "$base" "$tid" "$base" >&2
+      exit 3
+    fi
+  fi
+
+  tmp="$roadmap.tmp.$$"
+  jig_cleanup_add "$tmp"
+  rc=0
+  out=$(_spec_drop_rewrite "$roadmap" "$tid" "$suffix" "$tmp") || rc=$?
+  case "$rc" in
+    0)
+      mv "$tmp" "$roadmap" || jig_die "spec drop: could not write $rel"
+      jig_record_changed
+      printf 'spec drop: %s closed in %s\n' "$tid" "$rel"
+      printf '%s\n' "$out" | sed 's/^/  /'
+      if [ "$on_spec" = 1 ]; then
+        _spec_drop_commit "$tid" "$sid" "$rel" "$clean"
+      else
+        # On an epic the way a phase run's checkmarks are made: a commit on
+        # the epic, by whoever runs this there
+        # (adr-20260922-a-phase-run-is-coordinated).
+        printf 'spec drop: commit %s on %s now, as the checkmarks of a phase run are\n' "$rel" "$base"
+      fi
+      spec_done_complete_hint "$sid" "$roadmap"
+      ;;
+    3)
+      rm -f "$tmp"
+      printf 'spec drop: no item in %s names %s; nothing to rewrite\n' "$rel" "$tid"
+      ;;
+    4)
+      rm -f "$tmp"
+      printf 'spec drop: %s already closed in %s\n' "$tid" "$rel"
+      ;;
+    *)
+      rm -f "$tmp"
+      jig_die "spec drop: could not read $rel"
       ;;
   esac
 }
@@ -2339,7 +2721,7 @@ spec_remove() {
           printf 'would-abandon  %s (not started)\n' "$tid"
           continue
         fi
-        "$JIG_SELF" task abandon "$tid" >/dev/null \
+        JIG_INTERNAL_SPEC_REMOVING="$sid" "$JIG_SELF" task abandon "$tid" --reason "spec $sid removed" >/dev/null \
           || jig_die "spec remove: could not abandon $tid; the spec was not moved"
         printf 'abandoned      %s (not started)\n' "$tid"
         ;;

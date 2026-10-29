@@ -85,7 +85,7 @@ forgecache_entry() {
   _FORGECACHE_CI=""
   _FORGECACHE_AT=""
   [ -n "$cache" ] && [ -n "$head" ] && [ -n "$base" ] || return 0
-  t=$(printf '\t')
+  t=$'\t'
   nl=$'\n'
   rest=${nl}${cache}
   case "$rest" in

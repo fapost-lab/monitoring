@@ -804,6 +804,120 @@ _ctx_workspace_rows() {
   done
 }
 
+# _ctx_linked_rows <task-id> — the documents the task's `Linked:` lines reach
+# in neighbouring repositories (jig_task_ref,
+# adr-20261029-a-task-reads-a-neighbouring-repository-through-a-link): one
+# `<absolute path><TAB><ref>` line per document that exists, and one
+# `-<TAB><ref><TAB><why>` line per link that reaches nothing. A linked task
+# gives its task.md and the same artifacts `workspace:` lists for this task;
+# a linked spec its spec.md and roadmap.md. Never cached: the neighbour
+# changes independently of this repository's knowledge.
+_ctx_linked_rows() {
+  local id="$1" md ref f files t own
+  t=$(printf '\t')
+  [ -n "$id" ] || return 0
+  md="$(task_dir "$id")/task.md"
+  [ -f "$md" ] || return 0
+  own=$(cd -P "$(task_dir "$id")" 2>/dev/null && pwd -P) || own=""
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    if ! jig_task_ref "$ref"; then
+      printf -- '-%s%s%smalformed link: %s; the form is <repo>#<task-id> or <repo>#spec/<spec-id>\n' \
+        "$t" "$ref" "$t" "$_JIG_REF_ERROR"
+      continue
+    fi
+    if ! jig_task_ref_dir; then
+      printf -- '-%s%s%s%s\n' "$t" "$ref" "$t" "$_JIG_REF_ERROR"
+      continue
+    fi
+    # A link back to the task itself (`.#<own-id>`) gives nothing: its own
+    # artifacts are `workspace:` lines, never tracked by the ledger (ADR-0015).
+    if [ "$_JIG_REF_KIND" = task ] && [ -n "$own" ] \
+       && [ "$(cd -P "$_JIG_REF_DIR" 2>/dev/null && pwd -P)" = "$own" ]; then
+      printf -- '-%s%s%sthis is the task itself\n' "$t" "$ref" "$t"
+      continue
+    fi
+    if [ "$_JIG_REF_KIND" = spec ]; then
+      files="spec.md roadmap.md"
+    else
+      files="task.md $_CTX_WORKSPACE_ARTIFACTS"
+    fi
+    for f in $files; do
+      [ -f "$_JIG_REF_DIR/$f" ] || continue
+      printf '%s/%s%s%s\n' "$_JIG_REF_DIR" "$f" "$t" "$ref"
+    done
+  done < <(jig_task_links "$md")
+}
+
+# _ctx_linked_docs <task-id> — the linked documents that exist, one path per line.
+_ctx_linked_docs() {
+  _ctx_linked_rows "$1" | awk -F '\t' '$1 != "-" { print $1 }'
+}
+
+# _ctx_hash_paths <list-file> — `<hash><TAB><path>` for every path in the
+# list. Repository-relative paths are hashed by one git process from the
+# project root; absolute ones — linked documents — by one git process per
+# directory, run in that directory on bare file names: git on Windows cannot
+# read an absolute path through stdin (convention-shell, ADR-0037).
+_ctx_hash_paths() {
+  local list="$1" dir
+  jig_cleanup_add "$list.rel"
+  jig_cleanup_add "$list.abs"
+  jig_cleanup_add "$list.h"
+  jig_cleanup_add "$list.n"
+  awk 'substr($0, 1, 1) != "/" && $0 != ""' "$list" > "$list.rel"
+  awk 'substr($0, 1, 1) == "/"' "$list" > "$list.abs"
+  if [ -s "$list.rel" ]; then
+    jig_hash_list "$JIG_PROJECT" "$list.rel" > "$list.h" || return 1
+    paste "$list.h" "$list.rel"
+  fi
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    D="$dir/" awk '
+      BEGIN { d = ENVIRON["D"] }
+      index($0, d) == 1 { n = substr($0, length(d) + 1); if (index(n, "/") == 0) print n }
+    ' "$list.abs" > "$list.n"
+    jig_hash_list "$dir" "$list.n" > "$list.h" || return 1
+    paste "$list.h" <(D="$dir/" awk '{ print ENVIRON["D"] $0 }' "$list.n")
+  done < <(sed 's|/[^/]*$||' "$list.abs" | sort -u)
+  rm -f "$list.rel" "$list.abs" "$list.h" "$list.n"
+}
+
+# _ctx_linked_lines — resolve's `linked:` lines for the current task. A
+# document whose content differs from the hash the ledger holds for it says
+# so: the change reaches the agent at the next stage it enters.
+_ctx_linked_lines() {
+  local rows ledger changed="" list path ref why t
+  t=$(printf '\t')
+  [ -n "$CTX_TASK" ] || return 0
+  rows=$(_ctx_linked_rows "$CTX_TASK")
+  [ -n "$rows" ] || return 0
+  ledger=$(_ctx_ledger_file "$CTX_TASK")
+  if [ -f "$ledger" ]; then
+    list=$(mktemp "${TMPDIR:-/tmp}/jig-context-linked.XXXXXX")
+    jig_cleanup_add "$list"
+    printf '%s\n' "$rows" | awk -F '\t' '$1 != "-" { print $1 }' > "$list"
+    if [ -s "$list" ]; then
+      # $t, not a `\t` escape: BSD sed does not read one in a replacement.
+      changed=$({
+        sed "s/^/L$t/" "$ledger"
+        _ctx_hash_paths "$list" | sed "s/^/W$t/"
+      } | awk -F '\t' '$1 == "L" { have[$3] = $2; next } $1 == "W" && ($3 in have) && have[$3] != $2 { print $3 }')
+    fi
+    rm -f "$list"
+  fi
+  while IFS="$t" read -r path ref why; do
+    [ -n "$path" ] || continue
+    if [ "$path" = "-" ]; then
+      printf '%-10s %s  unreachable: %s\n' "linked:" "$ref" "$why"
+    elif [ -n "$changed" ] && jig_has_line "$path" "$changed"; then
+      printf '%-10s %s  (%s; changed since acknowledged)\n' "linked:" "$path" "$ref"
+    else
+      printf '%-10s %s  (%s)\n' "linked:" "$path" "$ref"
+    fi
+  done <<< "$rows"
+}
+
 ctx_resolve() {
   _ctx_parse_selectors "$@"
   # Only a task named with --task: one guessed from the branch is not a
@@ -837,6 +951,7 @@ ctx_resolve() {
     [ -n "$relpath" ] || continue
     printf '%-10s %s\n' "workspace:" "$relpath"
   done < <(_ctx_workspace_rows)
+  _ctx_linked_lines
   [ -z "$CTX_TASK" ] || _ctx_queue_lines "$CTX_TASK"
 
   rm -f "$rows"
@@ -865,6 +980,7 @@ _ctx_honour_pause() {
 
 # --- the context ledger ----------------------------------------------------------
 # One line per acknowledged document: `<git-hash><TAB><repo-relative-path>`,
+# or an absolute path for a document a `Linked:` line of the task reaches,
 # stored in the task workspace, which is gitignored — an acknowledgement is a
 # fact about one session, never durable knowledge (RULES.md).
 #
@@ -879,10 +995,22 @@ _ctx_ledger_file() {
 
 # _ctx_check_knowledge_path <relpath> — a caller-supplied path is validated
 # before it is joined to the project root (RULES.md invariant, ADR-0008).
+#
+# The one exception to "repository-relative" is a document a `Linked:` line of
+# the task reaches in a neighbouring repository: accepted when it is one of
+# the paths _ctx_linked_docs gives now (_CTX_LINKED_DOCS, which ctx_acknowledge
+# computes once), never any other absolute path
+# (adr-20261029-a-task-reads-a-neighbouring-repository-through-a-link).
+_CTX_LINKED_DOCS=""
 _ctx_check_knowledge_path() {
   local rel="$1"
   case "$rel" in
-    /*) jig_die "context acknowledge: path must be repository-relative: $rel" ;;
+    /*)
+      if [ -n "$_CTX_LINKED_DOCS" ] && jig_has_line "$rel" "$_CTX_LINKED_DOCS"; then
+        return 0
+      fi
+      jig_die "context acknowledge: path must be repository-relative: $rel (an absolute path only for a document a Linked: line of the task reaches)"
+      ;;
     *..*) jig_die "context acknowledge: path may not contain '..': $rel" ;;
   esac
   case "$rel" in
@@ -961,6 +1089,7 @@ ctx_acknowledge() {
   ledger=$(_ctx_ledger_file "$task_id")
   tmp="$ledger.tmp.$$"
   jig_cleanup_add "$tmp"
+  _CTX_LINKED_DOCS=$(_ctx_linked_docs "$task_id")
 
   # Rewrite through a temporary and `mv` (convention-shell): a crash must not
   # leave a half-written ledger, which would read as "already acknowledged".
@@ -973,9 +1102,9 @@ ctx_acknowledge() {
     done < "$ledger"
   fi
 
-  # Every path is validated before any is hashed, then all are hashed by one
-  # git process (jig_hash_list) and paired back by position — `paste` joins
-  # with a tab, which is the ledger's own separator.
+  # Every path is validated before any is hashed, then all are hashed —
+  # repository-relative ones by one git process, linked documents by one per
+  # directory (_ctx_hash_paths) — into the ledger's own `<hash><TAB><path>`.
   count=0
   : > "$tmp.rel"
   while IFS= read -r rel; do
@@ -984,11 +1113,12 @@ ctx_acknowledge() {
     printf '%s\n' "$rel" >> "$tmp.rel"
     count=$((count + 1))
   done < <(printf '%s\n' "$files")
-  if ! jig_hash_list "$JIG_PROJECT" "$tmp.rel" > "$tmp.hash"; then
+  jig_cleanup_add "$tmp.hash"
+  if ! _ctx_hash_paths "$tmp.rel" > "$tmp.hash"; then
     rm -f "$tmp" "$tmp.rel" "$tmp.hash"
     jig_die "context acknowledge: could not hash the documents"
   fi
-  paste "$tmp.hash" <(printf '%s\n' "$files") >> "$tmp"
+  cat "$tmp.hash" >> "$tmp"
   rm -f "$tmp.rel" "$tmp.hash"
 
   sort -o "$tmp" "$tmp"
@@ -997,20 +1127,26 @@ ctx_acknowledge() {
 }
 
 # _ctx_tracked_paths <rows-file> — every path whose reading is tracked: the
-# globals plus the required set. Workspace artifacts are returned by resolve
-# but never acknowledged; they are the task's own output, not knowledge it owes
-# a reading of.
+# globals, the required set, and the documents the task's `Linked:` lines reach
+# that exist now. Workspace artifacts are returned by resolve but never
+# acknowledged; they are the task's own output, not knowledge it owes a reading
+# of. A linked task's are another task's output, which this task owes a
+# reading of: that is what the link says.
 _ctx_tracked_paths() {
-  { _ctx_global_rows | cut -f1; _ctx_read_rows "$1" | cut -f1; } | sort -u
+  {
+    _ctx_global_rows | cut -f1
+    _ctx_read_rows "$1" | cut -f1
+    _ctx_linked_docs "$CTX_TASK"
+  } | sort -u
 }
 
 # _ctx_pending_paths <rows-file> <ledger> — tracked documents with no
 # acknowledgement, or whose content has changed since one. A changed document
 # becomes pending again: that is the point of hashing rather than listing.
 #
-# One git process hashes every tracked document and one awk compares them with
-# the ledger, in tracked-path order; the per-document loop started a git and an
-# awk for each. The two inputs are tagged rather than joined on NR == FNR,
+# One git process hashes every tracked document of this repository — one more
+# per directory of linked documents (_ctx_hash_paths) — and one awk compares
+# them with the ledger; the per-document loop started a git and an awk for each. The two inputs are tagged rather than joined on NR == FNR,
 # which goes wrong when the ledger is empty (conventions/shell.md).
 _ctx_pending_paths() {
   local rows="$1" ledger="$2" paths relpath tmp t
@@ -1023,14 +1159,15 @@ _ctx_pending_paths() {
     [ -n "$relpath" ] || continue
     printf '%s\n' "$relpath"
   done > "$tmp" < <(printf '%s\n' "$paths")
-  if ! jig_hash_list "$JIG_PROJECT" "$tmp" > "$tmp.hash"; then
+  jig_cleanup_add "$tmp.hash"
+  if ! _ctx_hash_paths "$tmp" > "$tmp.hash"; then
     rm -f "$tmp" "$tmp.hash"
     jig_die "context: could not hash the tracked documents"
   fi
   {
     # $t, not a `\t` escape: BSD sed does not read one in a replacement.
     if [ -f "$ledger" ]; then sed "s/^/L$t/" "$ledger"; fi
-    paste "$tmp.hash" <(printf '%s\n' "$paths" | sed '/^$/d') | sed "s/^/W$t/"
+    sed "s/^/W$t/" "$tmp.hash"
   } | awk -F '\t' '$1 == "L" { have[$3] = $2; next } $1 == "W" && have[$3] != $2 { print $3 }'
   rm -f "$tmp" "$tmp.hash"
 }

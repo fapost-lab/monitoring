@@ -1322,7 +1322,7 @@ EOF
     [ "$paused" = true ] || reason=""
     wt="" wt_note=""
     if [ -n "$branch" ]; then
-      wt=$(_task_worktree_for "$branch" "$_STATUS_WORKTREES")
+      _task_worktree_for_v wt "$branch" "$_STATUS_WORKTREES"
       [ -z "$wt" ] || wt_note=$(_task_worktree_note "$wt")
     fi
     # task_receipt_check exits 1 for stale and for a T4 with none; its line
@@ -1331,14 +1331,14 @@ EOF
     gate="" facts=""
     if [ "$page" = page ]; then
       case "$class" in
-        T3 | T4) gate=$(_task_gate_state "$id") ;;
+        T3 | T4) _task_gate_state_v gate "$id" ;;
       esac
-      [ -z "$autopilot" ] || facts=$(_task_autopilot_facts "$id")
+      [ -z "$autopilot" ] || _task_autopilot_facts_v facts "$id"
     fi
     # The task's route depth, as task.sh's rule answers it
     # (_task_route_depth_of) for the key the state row already holds and the
     # person's route.depth, read once above.
-    depth=$(_task_route_depth_of "$own_depth" "$setting")
+    _task_route_depth_of_v depth "$own_depth" "$setting"
     depth=${depth%%$'\t'*}
     _STATUS_LIVE="$_STATUS_LIVE$id$us$class$us$status$us$paused$us$reason$us$branch$us$base$us$autopilot$us$pr_url$us$kc$us$wt$us$wt_note$us$receipt$us$gate$us$depth$us$lowered$us$issue$us$setup$us$facts
 "
@@ -2259,6 +2259,9 @@ _status_json() {
   fi
   [ -f "$JIG_PROJECT/$JIG_AI_DIR/config.yaml" ] \
     || jig_fail not-initialised "status --json: project is not initialised; run: jig init"
+  # A read path: each task's state, the queue and the configuration are read
+  # once (jig_read_snapshot_begin), after the switch to the owner's checkout.
+  jig_read_snapshot_begin
   _status_load
   # The counts the last full run saved for the page. Without them, only the
   # two the items need are counted, and saved nowhere: what `jig upgrade`
@@ -2308,6 +2311,7 @@ ATTN
     json_str_or_null "$_STATUS_HK_FORGE"; hk="$hk,\"forge\":$_JSON,\"stale\":$stale}"
   fi
   json_str_or_null "$_SC_AT"
+  jig_read_snapshot_end
   printf '{"attention":[%s],"housekeeping":%s,"knowledge_counts_at":%s}\n' "$objs" "$hk" "$_JSON"
 }
 

@@ -58,7 +58,8 @@ Usage: jig <command> [args]
                                  --open writes it and opens it in the browser; once it
                                  exists, task, spec and housekeeping commands keep it current;
                                  --json prints what needs you as data (schemas/json.md)
-  task new|start|set|abandon ... task workspace and state (new files it, start begins it)
+  task new|start|set|abandon ... task workspace and state (new files it, start begins it;
+                                 abandon [--reason <text>] [--moved-to <repo>#<id>] says why)
   task changes <id> --base <ref> inventory all change layers; --files and --format paths
   task artifacts <id> [...]      fixed-route inputs; --provided names conversation outputs
   task finding add|set <id> ...  record a review finding and update its status
@@ -92,6 +93,7 @@ Usage: jig <command> [args]
   spec new <id>                  create .ai/specs/<id>/ from the specification templates
   spec list                      specifications under .ai/specs/ and their roadmap progress
   spec done <task-id>            check the roadmap items that name a spec-linked task
+  spec drop <task-id>            close the roadmap items of an abandoned or moved task, with why
   spec link <spec-id> <task-id>  link a filed, not-started task to the spec phase naming it
   spec stop <id> --phase <n> --reason <text>
                                  record a phase run's stop: the reason goes to your Telegram
