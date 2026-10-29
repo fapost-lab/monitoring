@@ -84,6 +84,12 @@ own change, the knowledge that applies to it, the design and the ledger.
 Then either apply the fixes or hand them back, depending on what the user asked. A review
 that ends without a decision on every finding is unfinished.
 
+A gap in durable knowledge — something `.ai/knowledge/` should now say about this change and does
+not, such as a new module `ARCHITECTURE.md` does not name — is not a finding. List it last, under
+**For consolidation**: consolidation writes knowledge after the review, before the commit, and
+that leaves the receipt current. Recorded in the ledger, it would stay open and travel past the
+merge to the triage task `task ship` files for open findings.
+
 A P3 is never fixed after the review, at any depth: it stays `open` in the ledger and is listed in
 the pull request, because a fix after the review makes the receipt stale and asks for another round
 for a nit. A person may still ask for the fix; then it is an ordinary edit and a re-review.

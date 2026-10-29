@@ -30,7 +30,8 @@
 #
 # Requires config.sh (cfg, jig_config_clone_root, jig_unattended, _cfg_chat_id,
 # JIG_CFG_MASK), and task.sh (task_dir, task_state_get, _task_goal,
-# _task_autopilot_mode, _task_likely_owner) for a task's messages and a waiting
+# _task_autopilot_mode, _task_likely_owner, _task_open_minor_findings,
+# _task_count_lines) for a task's messages and a waiting
 # session's; a phase run's (jig_notify_phase) need no task.sh.
 
 # jig_notify_token_ok <token> — exit 0 when <token> has a bot token's shape,
@@ -145,9 +146,10 @@ _notify_post() {
 # _notify_message <id> <event> <text> — the message text, lines joined by a
 # newline, no trailing one: the mark with `<project> · <id>`, the task's short
 # description (left out when there is none), the journal's text, and for `end`
-# the pull request URL when the task has one.
+# the open findings handed to a triage task and the pull request URL, each when
+# the task has one.
 _notify_message() {
-  local id="$1" event="$2" text="$3" mark desc url
+  local id="$1" event="$2" text="$3" mark desc url triage open n noun
   case "$event" in
     stop)
       # Nothing waits for the person in an unattended run: `resume` is refused
@@ -163,6 +165,21 @@ _notify_message() {
   [ -z "$desc" ] || printf '\n%s' "$(_notify_cut "$desc" 80)"
   [ -z "$text" ] || printf '\n%s' "$(_notify_cut "$text" 300)"
   if [ "$event" = end ]; then
+    # The open P2/P3 and where they went, when `task ship` handed them to a
+    # triage task (adr-20261029-a-ship-hands-open-findings-to-one-triage-task):
+    # the person learns of them even when nobody but the agent saw the pull
+    # request — and still learns of them when the hand-over only warned.
+    open=$(_task_open_minor_findings "$id")
+    if [ -n "$open" ]; then
+      n=$(_task_count_lines "$open")
+      if [ "$n" = 1 ]; then noun=finding; else noun=findings; fi
+      triage=$(task_state_get "$id" triage_task)
+      if [ -n "$triage" ]; then
+        printf '\n%s open %s → task %s' "$n" "$noun" "$triage"
+      else
+        printf '\n%s open %s, not handed to a triage task' "$n" "$noun"
+      fi
+    fi
     url=$(task_state_get "$id" pr_url)
     [ -z "$url" ] || printf '\n%s' "$url"
   fi

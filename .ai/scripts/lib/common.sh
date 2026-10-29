@@ -520,15 +520,178 @@ jig_physical_path() {
 # the task domain's; reading it here is allowed, writing it is not. An id that
 # is not a task id gets the configured base, never a path built from it.
 jig_task_base() {
-  local id="${1:-}" file value=""
-  if jig_valid_id "$id"; then
-    file="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$id/state"
-    if [ -f "$file" ]; then
-      value=$(sed -n 's/^base_branch:[[:space:]]*//p' "$file" | head -n 1)
-    fi
-  fi
-  [ -n "$value" ] || value=$(cfg git.base_branch main)
+  local value
+  jig_task_base_v value "${1:-}"
   printf '%s\n' "$value"
+}
+
+# jig_task_base_v <var> <task-id> — jig_task_base's answer into <var>, in the
+# caller's shell: no process, for a reader that asks it once per task.
+jig_task_base_v() {
+  local __jtb_value=""
+  jig_task_state_var __jtb_value "${2:-}" base_branch
+  [ -n "$__jtb_value" ] || cfg_v __jtb_value git.base_branch main
+  printf -v "$1" '%s' "$__jtb_value"
+}
+
+# --- the task state file, read in the caller's shell --------------------------
+#
+# One rule reads a task's `state` (schemas/state.md): the first line that
+# starts with `<key>:`, its value after the colon with the leading blanks
+# dropped. task_state_get (task.sh) is the reader every command asks;
+# jig_task_base and _jig_task_state_value read through the same function, so
+# the rule is written once, here, below the task library that owns the file.
+#
+# Builtins only, never a process: a reader ran a command substitution and an
+# awk per field, and `task list --json` paid ~28 of each per task.
+#
+# A snapshot serves the read paths. Between jig_read_snapshot_begin and
+# jig_read_snapshot_end (`task list`, `status`), a task's file is read once
+# and every later key comes from the shell's own variables — a guard asked in
+# a subshell inherits them. Outside it every read goes to the file, so a
+# command that writes and then reads never sees an old value; every writer of
+# a state file calls jig_task_state_forget as well, so a write inside the
+# read path is seen too.
+#
+# Bash 3.2 has no associative arrays: each task read into the snapshot gets a
+# slot number, its values live in `_JIG_TSV_<slot>_<key>` and its key list in
+# `_JIG_TSK_<slot>`. Only a key of the form [A-Za-z][A-Za-z0-9_]* becomes a
+# variable name; any other line is read by the plain path, never by eval.
+_JIG_TS_ON=0
+_JIG_TS_GEN=0
+_JIG_TS_SLOTS=$'\n'
+_JIG_TS_N=0
+_JIG_TS_FOUND=0
+
+# jig_read_snapshot_begin / jig_read_snapshot_end — open and close the read
+# path's snapshot: task state, the queue's lines and the configuration are
+# read once per process in between. Only a command that writes nothing in
+# between opens one.
+jig_read_snapshot_begin() {
+  jig_task_state_forget
+  _jig_queue_cache_drop
+  _cfg_cache_drop
+  # A memo kept beside the snapshot (task.sh's design hashes) is valid for
+  # one generation: each snapshot opened is a new one.
+  _JIG_TS_GEN=$((_JIG_TS_GEN + 1))
+  _JIG_TS_ON=1
+}
+jig_read_snapshot_end() {
+  _JIG_TS_ON=0
+  jig_task_state_forget
+  _jig_queue_cache_drop
+  _cfg_cache_drop
+}
+
+# jig_task_state_forget — drop every task the snapshot holds. Called by every
+# writer of a state file (task.sh), so the next read sees the write.
+jig_task_state_forget() {
+  local __jts_n=1 __jts_k __jts_keys
+  while [ "$__jts_n" -le "$_JIG_TS_N" ]; do
+    eval "__jts_keys=\${_JIG_TSK_$__jts_n-}"
+    for __jts_k in $__jts_keys; do
+      unset "_JIG_TSV_${__jts_n}_$__jts_k"
+    done
+    unset "_JIG_TSK_$__jts_n"
+    __jts_n=$((__jts_n + 1))
+  done
+  _JIG_TS_SLOTS=$'\n'
+  _JIG_TS_N=0
+  _JIG_TS_CUR=""
+  _JIG_TS_CUR_KEYS=""
+  _JIG_TS_SLOT=""
+}
+
+# _jig_task_state_trim <var> — <var> without its leading blanks, the part of
+# the rule after the colon ([[:space:]], as awk's class).
+_jig_task_state_trim() {
+  local __jtt_v
+  eval "__jtt_v=\$$1"
+  printf -v "$1" '%s' "${__jtt_v#"${__jtt_v%%[![:space:]]*}"}"
+}
+
+# _jig_task_state_select <id> — make task <id> the snapshot's current one:
+# _JIG_TS_CUR, _JIG_TS_SLOT and _JIG_TS_CUR_KEYS, its file read into a new
+# slot the first time it is asked for. The first line of a key wins; a
+# missing file is a slot with no keys. <id> is a valid id.
+_JIG_TS_CUR=""
+_JIG_TS_CUR_KEYS=""
+_JIG_TS_SLOT=""
+_jig_task_state_select() {
+  local __jtl_file __jtl_line __jtl_k __jtl_keys=" " __jtl_n __jtl_nl=$'\n' __jtl_t=$'\t'
+  case "$_JIG_TS_SLOTS" in
+    *"$__jtl_nl$1$__jtl_t"*)
+      __jtl_n=${_JIG_TS_SLOTS#*"$__jtl_nl$1$__jtl_t"}
+      __jtl_n=${__jtl_n%%"$__jtl_nl"*}
+      eval "__jtl_keys=\$_JIG_TSK_$__jtl_n" ;;
+    *)
+      __jtl_n=$((_JIG_TS_N + 1))
+      _JIG_TS_N=$__jtl_n
+      __jtl_file="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$1/state"
+      if [ -f "$__jtl_file" ]; then
+        while IFS= read -r __jtl_line || [ -n "$__jtl_line" ]; do
+          case "$__jtl_line" in *:*) ;; *) continue ;; esac
+          __jtl_k=${__jtl_line%%:*}
+          case "$__jtl_k" in [A-Za-z]*) ;; *) continue ;; esac
+          case "$__jtl_k" in *[!A-Za-z0-9_]*) continue ;; esac
+          case "$__jtl_keys" in *" $__jtl_k "*) continue ;; esac
+          __jtl_line=${__jtl_line#*:}
+          printf -v "_JIG_TSV_${__jtl_n}_$__jtl_k" '%s' "${__jtl_line#"${__jtl_line%%[![:space:]]*}"}"
+          __jtl_keys="$__jtl_keys$__jtl_k "
+        done < "$__jtl_file"
+      fi
+      printf -v "_JIG_TSK_$__jtl_n" '%s' "$__jtl_keys"
+      _JIG_TS_SLOTS="$_JIG_TS_SLOTS$1$__jtl_t$__jtl_n$__jtl_nl" ;;
+  esac
+  _JIG_TS_CUR=$1
+  _JIG_TS_SLOT=$__jtl_n
+  _JIG_TS_CUR_KEYS=$__jtl_keys
+}
+
+# jig_task_state_var <var> <id> <key> — the value of <key> in task <id>'s
+# state file into <var>, empty when the task, the file or the key does not
+# exist; _JIG_TS_FOUND is 1 when the key has a line, 0 when it has none. An
+# id that is not a task id has no state: no path is built from it. Never
+# dies, never starts a process.
+jig_task_state_var() {
+  local __jtv_file __jtv_line
+  _JIG_TS_FOUND=0
+  if [ "$_JIG_TS_ON" = 1 ]; then
+    if [ -z "$2" ] || [ "$2" != "$_JIG_TS_CUR" ]; then
+      jig_valid_id "$2" || { printf -v "$1" '%s' ""; return 0; }
+      _jig_task_state_select "$2"
+    fi
+    case "$_JIG_TS_CUR_KEYS" in
+      *" $3 "*)
+        # A key in the list is one the select took as a variable name.
+        _JIG_TS_FOUND=1
+        eval "$1=\$_JIG_TSV_${_JIG_TS_SLOT}_$3"
+        return 0 ;;
+    esac
+    printf -v "$1" '%s' ""
+    # A key that could be a variable name and is not in the list has no line;
+    # any other is looked for in the file itself, below.
+    case "$3" in
+      [A-Za-z]*)
+        case "$3" in *[!A-Za-z0-9_]*) ;; *) return 0 ;; esac ;;
+    esac
+  else
+    printf -v "$1" '%s' ""
+    jig_valid_id "$2" || return 0
+  fi
+  __jtv_file="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$2/state"
+  [ -f "$__jtv_file" ] || return 0
+  while IFS= read -r __jtv_line || [ -n "$__jtv_line" ]; do
+    case "$__jtv_line" in
+      "$3:"*)
+        __jtv_line=${__jtv_line#"$3:"}
+        _jig_task_state_trim __jtv_line
+        _JIG_TS_FOUND=1
+        printf -v "$1" '%s' "$__jtv_line"
+        return 0 ;;
+    esac
+  done < "$__jtv_file"
+  return 0
 }
 
 # jig_base_ref <name> — the ref a base branch is judged by:
@@ -1690,20 +1853,33 @@ jig_ship_leave() {
 # to read would be a guess. Here rather than in spec.sh because `task start`
 # needs it too, and one command library never sources another.
 jig_spec_link() {
-  awk '
-    /^Spec: \.ai\/specs\/[A-Za-z0-9._-]+\/([[:space:]]+(—|-|--)[[:space:]]+Phase[[:space:]]+[0-9]+)?[[:space:]]*$/ {
-      id = $0
-      sub(/^Spec: \.ai\/specs\//, "", id)
-      sub(/\/.*$/, "", id)
-      if (id ~ /^[.-]/) next
-      if (found == "") found = id
-      else if (found != id) conflict = 1
-    }
-    END {
-      if (conflict) exit 2
-      if (found != "") print found
-    }
-  ' "$1"
+  local id rc=0
+  jig_spec_link_v id "$1" || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ -z "$id" ] || printf '%s\n' "$id"
+}
+
+# jig_spec_link_v <var> <task.md> — the same id into <var>, read in the
+# caller's shell; exit 2 on two different specs, as above, or when the file
+# cannot be read.
+jig_spec_link_v() {
+  local __jsl_line __jsl_id __jsl_found="" __jsl_conflict=0
+  local __jsl_re='^Spec: \.ai/specs/([A-Za-z0-9._-]+)/([[:space:]]+(—|-|--)[[:space:]]+Phase[[:space:]]+[0-9]+)?[[:space:]]*$'
+  printf -v "$1" '%s' ""
+  [ -r "$2" ] && [ -f "$2" ] || return 2
+  while IFS= read -r __jsl_line || [ -n "$__jsl_line" ]; do
+    case "$__jsl_line" in "Spec: "*) ;; *) continue ;; esac
+    [[ $__jsl_line =~ $__jsl_re ]] || continue
+    __jsl_id=${BASH_REMATCH[1]}
+    case "$__jsl_id" in .* | -*) continue ;; esac
+    if [ -z "$__jsl_found" ]; then
+      __jsl_found=$__jsl_id
+    elif [ "$__jsl_found" != "$__jsl_id" ]; then
+      __jsl_conflict=1
+    fi
+  done < "$2"
+  [ "$__jsl_conflict" -eq 0 ] || return 2
+  printf -v "$1" '%s' "$__jsl_found"
 }
 
 # jig_spec_epic <roadmap.md|-> — "<branch> open" or "<branch> finished" when
@@ -1769,6 +1945,109 @@ jig_task_epic() {
   _JIG_TASK_EPIC=${line% *}
   _JIG_TASK_EPIC_STATE=${line##* }
   return 0
+}
+
+# --- task references and links ------------------------------------------------
+#
+# A task reference names a task or a spec in a repository next to this one
+# (adr-20261029-a-task-reads-a-neighbouring-repository-through-a-link):
+#
+#   <repo>#<task-id>          a task in <repo>
+#   <repo>#spec/<spec-id>     a spec in <repo>
+#
+# <repo> is a path relative to the clone's main checkout (jig_config_clone_root),
+# not to a worktree: a worktree lacks what the main checkout ignores, such as
+# `packages/`. `..` is allowed — a neighbour may sit beside the clone, not
+# inside it — but not an absolute path, `~`, a drive letter, a backslash,
+# whitespace or a second `#`. The ids follow jig_valid_id. This is the one
+# grammar every reader of a reference uses: a task's `Linked:` lines today,
+# and a moved task's target (`jig task abandon --moved-to`).
+
+_JIG_REF_REPO=""
+_JIG_REF_KIND=""
+_JIG_REF_ID=""
+_JIG_REF_DIR=""
+_JIG_REF_ERROR=""
+
+# jig_task_ref <ref> — parse a task reference. Sets _JIG_REF_REPO,
+# _JIG_REF_KIND (`task` or `spec`) and _JIG_REF_ID; returns 1 with
+# _JIG_REF_ERROR saying what is wrong. Sets variables rather than printing:
+# a caller in `$(...)` would lose them.
+jig_task_ref() {
+  local ref="$1" repo id kind=task
+  _JIG_REF_REPO=""
+  _JIG_REF_KIND=""
+  _JIG_REF_ID=""
+  _JIG_REF_DIR=""
+  _JIG_REF_ERROR=""
+  case "$ref" in
+    *'#'*'#'*) _JIG_REF_ERROR="more than one #"; return 1 ;;
+    *'#'*) ;;
+    *) _JIG_REF_ERROR="no # between the repository and the id"; return 1 ;;
+  esac
+  repo=${ref%%#*}
+  id=${ref#*#}
+  case "$repo" in
+    '') _JIG_REF_ERROR="no repository path before #"; return 1 ;;
+    /* | '~'* | [A-Za-z]:*) _JIG_REF_ERROR="the repository path must be relative to the clone's main checkout"; return 1 ;;
+    *[[:space:]\\]*) _JIG_REF_ERROR="the repository path may not hold whitespace or a backslash"; return 1 ;;
+  esac
+  case "$id" in
+    spec/*) kind=spec; id=${id#spec/} ;;
+  esac
+  jig_valid_id "$id" || { _JIG_REF_ERROR="not a valid $kind id: $id"; return 1; }
+  _JIG_REF_REPO=$repo
+  _JIG_REF_KIND=$kind
+  _JIG_REF_ID=$id
+}
+
+# jig_task_ref_dir — after jig_task_ref, find the directory holding the
+# referenced task's workspace or spec. Sets _JIG_REF_DIR to its absolute path
+# (the repository part canonical, `cd -P`); returns 1 with _JIG_REF_ERROR when
+# the repository or the task or spec is not there. Not being there is an
+# ordinary answer — another clone, another machine, a workspace that is
+# local to the machine that filed the task — never a reason to die. Reads
+# only: nothing is ever written to the other repository.
+jig_task_ref_dir() {
+  local root dir abs
+  _JIG_REF_DIR=""
+  root=$(jig_config_clone_root)
+  dir="$root/$_JIG_REF_REPO"
+  if [ ! -d "$dir" ] || ! abs=$(cd -P "$dir" 2>/dev/null && pwd -P); then
+    _JIG_REF_ERROR="no repository at $dir"
+    return 1
+  fi
+  if [ "$_JIG_REF_KIND" = spec ]; then
+    dir="$abs/$JIG_AI_DIR/specs/$_JIG_REF_ID"
+    if [ ! -f "$dir/spec.md" ] && [ ! -f "$dir/roadmap.md" ]; then
+      _JIG_REF_ERROR="no spec $_JIG_REF_ID in $abs"
+      return 1
+    fi
+  else
+    dir="$abs/$JIG_AI_DIR/workspace/tasks/$_JIG_REF_ID"
+    if [ ! -f "$dir/task.md" ]; then
+      _JIG_REF_ERROR="no task $_JIG_REF_ID in $abs (a task workspace exists only in the clone that filed it)"
+      return 1
+    fi
+  fi
+  _JIG_REF_DIR=$dir
+}
+
+# jig_task_links <task.md> — the references a task links to, one per line, as
+# written: each whole line `Linked: <ref>`, trimmed. Not validated here — a
+# reader says what is wrong with a line rather than skipping it in silence.
+jig_task_links() {
+  [ -f "$1" ] || return 0
+  awk '
+    {
+      sub(/\r$/, "")
+      if ($0 !~ /^Linked:[[:space:]]/) next
+      v = $0
+      sub(/^Linked:[[:space:]]+/, "", v)
+      sub(/[[:space:]]+$/, "", v)
+      if (v != "") print v
+    }
+  ' "$1"
 }
 
 # jig_tracked_changes — the tracked-and-uncommitted lines of
@@ -2417,9 +2696,18 @@ jig_revision_claim() {
 # jig_queue_file — the queue's path in the clone's main checkout
 # (jig_config_clone_root), shared by every worktree.
 jig_queue_file() {
-  local root
-  root=$(jig_config_clone_root) || jig_die "queue: cannot find the clone's main checkout"
-  printf '%s/%s/runtime/queue\n' "$root" "$JIG_AI_DIR"
+  local file
+  jig_queue_file_v file
+  printf '%s\n' "$file"
+}
+
+# jig_queue_file_v <var> — jig_queue_file's path into <var>, in the caller's
+# shell (jig_config_clone_root_v always answers: the clone's main checkout,
+# or JIG_PROJECT itself).
+jig_queue_file_v() {
+  local __jqf_root
+  jig_config_clone_root_v __jqf_root
+  printf -v "$1" '%s/%s/runtime/queue' "$__jqf_root" "$JIG_AI_DIR"
 }
 
 # _jig_queue_readable <file> — exit 0 when the queue <file> exists and is of
@@ -2427,11 +2715,63 @@ jig_queue_file() {
 # this jig can read, as the writer refuses to rewrite it.
 _JIG_QUEUE_FORMAT=1
 _jig_queue_readable() {
+  local line=""
   [ -f "$1" ] || return 1
-  Q_FORMAT=$_JIG_QUEUE_FORMAT awk '
-    FNR == 1 { if ($0 ~ /^# jig queue /) { split($0, w, " "); if (w[4] != ENVIRON["Q_FORMAT"]) bad = 1 } exit }
-    END { exit bad }
-  ' "$1"
+  IFS= read -r line < "$1" || [ -n "$line" ] || return 0
+  _jig_queue_line_readable "$line"
+}
+
+# _jig_queue_line_readable <first-line> — the version check of
+# _jig_queue_readable on the file's first line: a `# jig queue <n>` header
+# whose fourth blank-separated word is not this jig's version is unreadable;
+# any other first line is read.
+_jig_queue_line_readable() {
+  local w4 rest
+  case "$1" in
+    "# jig queue "*) ;;
+    *) return 0 ;;
+  esac
+  # The header's words as awk's split() counts them: blank runs separate.
+  read -r _ _ _ w4 rest <<EOF
+$1
+EOF
+  [ "$w4" = "$_JIG_QUEUE_FORMAT" ]
+}
+
+# The queue as the read path's snapshot holds it (jig_read_snapshot_begin):
+# _JIG_QUEUE_CACHED is 1 once the file was read, _JIG_QUEUE_CACHE its lines
+# (empty when there is no file or it is of another version). Outside a
+# snapshot every reader reads the file.
+_JIG_QUEUE_CACHED=0
+_JIG_QUEUE_CACHE=""
+_jig_queue_cache_drop() {
+  _JIG_QUEUE_CACHED=0
+  _JIG_QUEUE_CACHE=""
+}
+
+# _jig_queue_lines_v <var> — the queue's lines into <var>, empty when there
+# is no queue or it is of another format version; read once per snapshot.
+_jig_queue_lines_v() {
+  local __jql_file __jql_line __jql_text="" __jql_first=1
+  if [ "$_JIG_TS_ON" = 1 ] && [ "$_JIG_QUEUE_CACHED" = 1 ]; then
+    printf -v "$1" '%s' "$_JIG_QUEUE_CACHE"
+    return 0
+  fi
+  jig_queue_file_v __jql_file
+  if [ -f "$__jql_file" ]; then
+    while IFS= read -r __jql_line || [ -n "$__jql_line" ]; do
+      if [ "$__jql_first" = 1 ]; then
+        __jql_first=0
+        _jig_queue_line_readable "$__jql_line" || { __jql_text=""; break; }
+      fi
+      __jql_text="$__jql_text$__jql_line"$'\n'
+    done < "$__jql_file"
+  fi
+  if [ "$_JIG_TS_ON" = 1 ]; then
+    _JIG_QUEUE_CACHE=$__jql_text
+    _JIG_QUEUE_CACHED=1
+  fi
+  printf -v "$1" '%s' "$__jql_text"
 }
 
 # jig_queue_items <file|-> [<ref>] — every item of the queue <file> in the
@@ -2517,18 +2857,24 @@ EOF
 _JIG_PAUSE_AT=""
 _JIG_PAUSE_REASON=""
 jig_pause_request() {
-  local file line
+  local lines line rest ref="task:$1" t=$'\t'
   _JIG_PAUSE_AT=""
   _JIG_PAUSE_REASON=""
-  file=$(jig_queue_file)
-  _jig_queue_readable "$file" || return 1
-  line=$(Q_REF="task:$1" awk -F '\t' '
-    $1 == "request" && $2 == ENVIRON["Q_REF"] && $3 == "pause" && NF >= 4 { print $4 "\t" $5; exit }
-  ' "$file")
-  [ -n "$line" ] || return 1
-  _JIG_PAUSE_AT=${line%%$'\t'*}
-  _JIG_PAUSE_REASON=${line#*$'\t'}
-  return 0
+  _jig_queue_lines_v lines
+  # Split field by field as `awk -F '\t'` does: one tab, one separator, so an
+  # empty field stays a field and a fifth field ends at the next tab.
+  while IFS= read -r line; do
+    case "$line" in "request$t$ref${t}pause$t"*) ;; *) continue ;; esac
+    rest=${line#"request$t$ref${t}pause$t"}
+    _JIG_PAUSE_AT=${rest%%"$t"*}
+    case "$rest" in
+      *"$t"*) rest=${rest#*"$t"}; _JIG_PAUSE_REASON=${rest%%"$t"*} ;;
+    esac
+    return 0
+  done <<EOF
+$lines
+EOF
+  return 1
 }
 
 # jig_utc_epoch <UTC ISO time> — seconds since the epoch, or nothing. BSD date
@@ -2559,10 +2905,9 @@ jig_utc_ago() {
 # a peer's file directly is allowed, ARCHITECTURE.md). The id passes
 # jig_valid_id before it becomes a path (RULES.md); an invalid one has no state.
 _jig_task_state_value() {
-  jig_valid_id "$1" || return 0
-  local file="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$1/state"
-  [ -f "$file" ] || return 0
-  awk -v k="$2:" 'index($0, k) == 1 { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "$file"
+  local value
+  jig_task_state_var value "$1" "$2"
+  [ "$_JIG_TS_FOUND" = 0 ] || printf '%s\n' "$value"
 }
 
 # jig_pause_request_refusal <id> — why `jig queue request task:<id> pause`
@@ -2573,7 +2918,7 @@ _jig_task_state_value() {
 # <id> is a valid id of a task that exists; the caller checked.
 jig_pause_request_refusal() {
   local refusal
-  refusal=$(jig_pause_request_state_refusal "$1")
+  jig_pause_request_state_refusal_v refusal "$1"
   if [ -n "$refusal" ]; then
     printf '%s\n' "$refusal"
     return 0
@@ -2589,16 +2934,24 @@ jig_pause_request_refusal() {
 # nothing. `jig queue request` refuses it with `failed`, and only a refusal
 # past it — a request already pending — with `already-exists`.
 jig_pause_request_state_refusal() {
-  local id="$1" status
-  status=$(_jig_task_state_value "$id" status)
-  case "$status" in
+  local refusal
+  jig_pause_request_state_refusal_v refusal "$1"
+  [ -z "$refusal" ] || printf '%s\n' "$refusal"
+}
+
+# jig_pause_request_state_refusal_v <var> <id> — the same refusal into <var>,
+# empty for none.
+jig_pause_request_state_refusal_v() {
+  local __prs_v
+  printf -v "$1" '%s' ""
+  jig_task_state_var __prs_v "$2" status
+  case "$__prs_v" in
     consolidated | abandoned | archived)
-      printf 'queue request: task %s is %s\n' "$id" "$status"
+      printf -v "$1" 'queue request: task %s is %s' "$2" "$__prs_v"
       return 0 ;;
   esac
-  if [ "$(_jig_task_state_value "$id" paused)" = true ]; then
-    printf 'queue request: task %s is already paused\n' "$id"
-  fi
+  jig_task_state_var __prs_v "$2" paused
+  [ "$__prs_v" != true ] || printf -v "$1" 'queue request: task %s is already paused' "$2"
   return 0
 }
 

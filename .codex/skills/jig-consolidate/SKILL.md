@@ -32,6 +32,14 @@ Read the task's workspace artifacts and the diff. Look for: a decision with alte
 a constraint discovered the hard way, a term used inconsistently, an assumption that
 turned out wrong, a rule the codebase now depends on.
 
+Read what the review left for this stage too: its **For consolidation** list, and the ledger
+(`.ai/scripts/jig task findings <id>`). A gap in durable knowledge a review named — a new module
+`ARCHITECTURE.md` does not mention, a term the glossary lacks — is this stage's to close, here,
+before the commit, never the triage task's after the merge. Write it as §2–§4 say. One already
+recorded as a finding keeps its status — a ledger edit after the review makes the receipt stale —
+and the pull request body says `F<n>: written into <document>`, so the person triaging the open
+findings closes it at a glance.
+
 Found nothing? That is `NO_DURABLE_KNOWLEDGE`: skip to §5.
 
 ## 2. Route each finding
@@ -143,6 +151,10 @@ the checkmark reaches the base branch in the same change as the work; for a task
 it says so and changes nothing. If it reports that no roadmap item names the task, the roadmap
 and the task disagree: ask the human, and do not edit the roadmap by hand.
 
+A task that was abandoned or moved instead of finished has no checkmark to earn: `jig task abandon
+<id> --reason` closed its item with why (`jig spec drop`). What the move decided about the system —
+which repository owns the concern — is knowledge like any other, recorded here, not in `task.md`.
+
 When it prints `roadmap complete`, the spec is closed in this same change: its decisions are knowledge
 now. Run the command it names. It first lists what knowledge does not hold — unchecked items, fog,
 open questions, untested assumptions; ask the human about each one, move it where they say (another
@@ -167,6 +179,10 @@ it by hand with git. The first line of the message is the pull request's title, 
 body: the task's goal and what verified it. When the task edited a file a stub links, the body carries
 the block `jig knowledge changed --task <id> --to-review` prints, as it is (an autopilot run's
 report holds the same block): only a human approves the new text, in `jig-accept`.
+
+Once a pull request exists, `task ship` hands every P2 and P3 still `open` to one triage task,
+`<id>-findings`, filed not started and not queued, and says so; a second ship files no second
+one. Name it in your report: it is where a person decides what the review left.
 
 The status stays `ready`: the task is still current, and fixes from review of the commit
 or PR continue in it — stage the fix and run `task ship` again. If review changes the implementation, update the same documents; do

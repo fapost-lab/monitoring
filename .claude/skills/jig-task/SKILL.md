@@ -85,6 +85,12 @@ T0 and T1 that fit in one session need no workspace. Otherwise:
 The id is short and kebab-case, derived from the work (`fix-trigger-idempotency`), not a
 ticket number unless the project uses one. Fill in `task.md`: goal, scope, notes.
 
+**The goal comes before the start.** `task start` warns when `## Goal` is empty or holds only the
+template's comment, and refuses a T3 or T4 task until it is written. Write it from what you were
+given — `task new --goal` or `--from`, or `jig task artifact write <id> task --from <file>` — and
+never invent one: with nothing that says what the task is for, ask, and an unattended run that
+cannot ask ends there with a report naming what is missing.
+
 **Two commands, because filing and beginning are different acts.** `task new` records the
 intent: no branch, no checkout change. `task start` cuts the branch and records the commit
 it forked from, which is why it belongs at the moment work actually begins — a fork point
@@ -201,6 +207,15 @@ the task. A task stopped at `ready` is never cleaned up.
 
 A stage whose output the user already supplied is not re-run; see the next section.
 
+**Giving a task up, or moving it.** When the person drops a task, or decides its work belongs in
+another repository, run `jig task abandon <id> --reason "<their why>"`, adding
+`--moved-to <repo>#<task-id>` (the `Linked:` form) for a move. The decision lives where the next
+agent reads it — the task's `state`, and the roadmap item `jig spec drop` closes for a spec-linked
+task — never only in a note in `task.md`, which is gitignored. For a spec without an epic that leaves
+the checkout on `spec/<spec-id>`, with the edit committed when your git level allows; finish it with
+`jig spec ship <spec-id>`, as the command's last line says. When the move also changes what the
+project knows (which package owns a concern), record it in knowledge through `jig-consolidate`.
+
 ## When the task arrives written
 
 A task handed over as a written document has usually been through discovery and design
@@ -220,6 +235,11 @@ already. Run the stage that is missing, not the ones the author has done.
 - **A task linked to a spec** carries a `Spec: .ai/specs/<id>/ — Phase <n>` line: it was filed
   from that spec's roadmap. Read every file of the spec as input and check the premises the task
   rests on, as for any written design. The roadmap items that name the task are its boundary.
+- **A task that continues work in a neighbouring repository** — a package next to the project,
+  a sibling service — gets a `Linked: <repo>#<task-id>` (or `<repo>#spec/<spec-id>`) line in the
+  `task.md` you file, `<repo>` being the path from this clone's main checkout
+  (`packages/fapost-saas`). `jig context resolve` then lists that task's documents on `linked:`
+  lines; read them as input. An `unreachable:` line means they are not on this machine: say so.
 
 ## Human gate (T3, T4)
 

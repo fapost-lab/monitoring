@@ -89,6 +89,27 @@ jig_config_file() { printf '%s/%s/config.yaml\n' "$JIG_PROJECT" "$JIG_AI_DIR"; }
 # commondir), a separate git dir or a bare repository (common dir not named
 # .git) — answers JIG_PROJECT itself.
 jig_config_clone_root() {
+  local root
+  jig_config_clone_root_v root
+  printf '%s\n' "$root"
+}
+
+# jig_config_clone_root_v <var> — jig_config_clone_root's answer into <var>.
+# Inside a read snapshot (jig_read_snapshot_begin) it is worked out once per
+# process; a main checkout costs no process at all, a worktree one subshell.
+_CFG_CLONE_ROOT=""
+jig_config_clone_root_v() {
+  if [ "$_JIG_TS_ON" = 1 ] && [ -n "$_CFG_CLONE_ROOT" ]; then
+    printf -v "$1" '%s' "$_CFG_CLONE_ROOT"
+    return 0
+  fi
+  local __ccr_root
+  __ccr_root=$(_jig_config_clone_root_find)
+  [ "$_JIG_TS_ON" != 1 ] || _CFG_CLONE_ROOT=$__ccr_root
+  printf -v "$1" '%s' "$__ccr_root"
+}
+
+_jig_config_clone_root_find() {
   local line="" gitdir root
   if [ -f "$JIG_PROJECT/.git" ]; then
     IFS= read -r line < "$JIG_PROJECT/.git" || [ -n "$line" ] || line=""
@@ -112,7 +133,18 @@ jig_config_clone_root() {
 }
 
 # Path of the local config file for the current clone.
-jig_config_local_file() { printf '%s/%s/config.local.yaml\n' "$(jig_config_clone_root)" "$JIG_AI_DIR"; }
+jig_config_local_file() {
+  local file
+  jig_config_local_file_v file
+  printf '%s\n' "$file"
+}
+
+# jig_config_local_file_v <var> — the same path into <var>, in the caller's shell.
+jig_config_local_file_v() {
+  local __clf_root
+  jig_config_clone_root_v __clf_root
+  printf -v "$1" '%s/%s/config.local.yaml' "$__clf_root" "$JIG_AI_DIR"
+}
 
 # jig_config_local_key <key> — exit 0 when <key> may be set in the local file.
 jig_config_local_key() {
@@ -144,8 +176,8 @@ jig_config_local_only_key() {
 # a fact is a second thing to keep true. jig_config_key_scope reads them.
 #
 # This list is written by hand, and `tests/config.t.sh` is what keeps it
-# honest. That test greps scripts/ for every `cfg`, `cfg_bool`, `cfg_list` and
-# `cfg_list_lines` call and refuses to pass unless the call sites, this list,
+# honest. That test greps scripts/ for every `cfg`, `cfg_v`, `cfg_bool`, `cfg_list`
+# and `cfg_list_lines` call and refuses to pass unless the call sites, this list,
 # schemas/config.md, templates/config.yaml and docs/configuration.mdx agree on
 # one set of keys and one set of defaults. A list nothing computes is a list
 # that lapses — RULES.md says exactly that about its own deletion paragraph —
@@ -320,9 +352,73 @@ jig_config_local_entries() {
 
 # _cfg_read <file> <key> — the value of <key> in one file, or nothing.
 # The first matching line wins; a trailing `# comment` is not part of it.
+#
+# The key is matched as a pattern, as the sed this replaced matched it (keys
+# are [A-Za-z0-9_.-], where an extended and a basic expression agree): a line
+# `notify_telegram_token:` answers for `notify.telegram.token`, and
+# _config_print_masked relies on that. Builtins only — `cfg` is asked once or
+# more per task by the listings — and, inside a read snapshot
+# (jig_read_snapshot_begin), each file is read once per process.
 _cfg_read() {
-  [ -f "$1" ] || return 0
-  sed -n "s/^${2}:[[:space:]]*//p" "$1" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//' | head -n 1
+  local value
+  _cfg_read_v value "$1" "$2" || return 0
+  printf '%s\n' "$value"
+}
+
+# _cfg_read_v <var> <file> <key> — _cfg_read's value into <var>; exit 1, with
+# <var> empty, when no line sets <key> (or there is no file).
+_cfg_read_v() {
+  local __cr_text __cr_line __cr_re="^${3}:[[:space:]]*"
+  printf -v "$1" '%s' ""
+  _cfg_text_v __cr_text "$2" || return 1
+  while IFS= read -r __cr_line; do
+    [[ $__cr_line =~ $__cr_re ]] || continue
+    __cr_line=${__cr_line#"${BASH_REMATCH[0]}"}
+    __cr_line=${__cr_line%%#*}
+    __cr_line=${__cr_line%"${__cr_line##*[![:space:]]}"}
+    printf -v "$1" '%s' "$__cr_line"
+    return 0
+  done <<EOF
+$__cr_text
+EOF
+  return 1
+}
+
+# The files a read snapshot holds: `_CFG_CACHE` is one record per file read,
+# "<path><US><text><RS>". Outside a snapshot every read goes to the file.
+_CFG_CACHE=""
+_CFG_MEMO=$'\n'
+_cfg_cache_drop() {
+  _CFG_CACHE=""
+  _CFG_MEMO=$'\n'
+  _CFG_CLONE_ROOT=""
+}
+
+# _cfg_text_v <var> <file> — the text of <file> into <var>; exit 1 when it is
+# not a file. Read once per snapshot.
+_cfg_text_v() {
+  local __ct_rest __ct_line __ct_text="" __ct_us=$'\037' __ct_rs=$'\036'
+  if [ "$_JIG_TS_ON" = 1 ]; then
+    case "$_CFG_CACHE" in
+      *"$__ct_rs$2$__ct_us"*)
+        __ct_rest=${_CFG_CACHE#*"$__ct_rs$2$__ct_us"}
+        __ct_rest=${__ct_rest%%"$__ct_rs"*}
+        [ "$__ct_rest" != "$__ct_us" ] || { printf -v "$1" '%s' ""; return 1; }
+        printf -v "$1" '%s' "$__ct_rest"
+        return 0 ;;
+    esac
+  fi
+  if [ ! -f "$2" ]; then
+    # A missing file is remembered as one, so it is not looked for again.
+    [ "$_JIG_TS_ON" != 1 ] || _CFG_CACHE="$_CFG_CACHE$__ct_rs$2$__ct_us$__ct_us"
+    printf -v "$1" '%s' ""
+    return 1
+  fi
+  while IFS= read -r __ct_line || [ -n "$__ct_line" ]; do
+    __ct_text="$__ct_text$__ct_line"$'\n'
+  done < "$2"
+  [ "$_JIG_TS_ON" != 1 ] || _CFG_CACHE="$_CFG_CACHE$__ct_rs$2$__ct_us$__ct_text"
+  printf -v "$1" '%s' "$__ct_text"
 }
 
 # cfg <key> [default] — print the scalar value of <key>: the local file when
@@ -331,14 +427,36 @@ _cfg_read() {
 # after the local file: its project layer is never read, by design (see the
 # comment above that list).
 cfg() {
-  local key="$1" default="${2:-}" value=""
-  if jig_config_local_key "$key"; then
-    value=$(_cfg_read "$(jig_config_local_file)" "$key")
+  local value
+  cfg_v value "$@"
+  printf '%s\n' "$value"
+}
+
+# cfg_v <var> <key> [default] — cfg's value into <var>, in the caller's shell.
+#
+# Inside a read snapshot the layered value of each key is kept too
+# (`_CFG_MEMO`, "<key><TAB><value>" lines): a listing asks the same few keys
+# for every task, and each answer is otherwise a walk over both files.
+cfg_v() {
+  local __cv_key="$2" __cv_default="${3:-}" __cv_value="" __cv_file __cv_nl=$'\n' __cv_t=$'\t'
+  if [ "$_JIG_TS_ON" = 1 ]; then
+    case "$_CFG_MEMO" in
+      *"$__cv_nl$__cv_key$__cv_t"*)
+        __cv_value=${_CFG_MEMO#*"$__cv_nl$__cv_key$__cv_t"}
+        __cv_value=${__cv_value%%"$__cv_nl"*}
+        printf -v "$1" '%s' "${__cv_value:-$__cv_default}"
+        return 0 ;;
+    esac
   fi
-  if [ -z "$value" ] && ! jig_config_local_only_key "$key"; then
-    value=$(_cfg_read "$(jig_config_file)" "$key")
+  if jig_config_local_key "$__cv_key"; then
+    jig_config_local_file_v __cv_file
+    _cfg_read_v __cv_value "$__cv_file" "$__cv_key" || true
   fi
-  printf '%s\n' "${value:-$default}"
+  if [ -z "$__cv_value" ] && ! jig_config_local_only_key "$__cv_key"; then
+    _cfg_read_v __cv_value "$JIG_PROJECT/$JIG_AI_DIR/config.yaml" "$__cv_key" || true
+  fi
+  [ "$_JIG_TS_ON" != 1 ] || _CFG_MEMO="$_CFG_MEMO$__cv_key$__cv_t$__cv_value$__cv_nl"
+  printf -v "$1" '%s' "${__cv_value:-$__cv_default}"
 }
 
 # cfg_list <key> [default-list] — print an inline list as space-separated words.
@@ -370,7 +488,9 @@ cfg_list_lines() {
 
 # cfg_bool <key> [default] — exit 0 when the value is true/yes/1.
 cfg_bool() {
-  case "$(cfg "$1" "${2:-false}")" in
+  local value
+  cfg_v value "$1" "${2:-false}"
+  case "$value" in
     true|yes|1|on) return 0 ;;
     *) return 1 ;;
   esac
@@ -384,7 +504,7 @@ cfg_bool() {
 # they do use in a command that may fairly refuse to run at all.
 jig_agent_git() {
   local value
-  value=$(cfg agent.git none)
+  cfg_v value agent.git none
   printf '%s\n' "$value"
   _cfg_agent_git_level "$value"
 }
@@ -398,16 +518,25 @@ jig_agent_git() {
 # autopilot.git never falls back to agent.git, because the person who set it
 # did not mean agent.git.
 jig_autopilot_git() {
-  local value
-  value=$(cfg autopilot.git "")
-  if [ -n "$value" ]; then
-    printf '%s\tautopilot.git\n' "$value"
-    _cfg_agent_git_level "$value"
+  local line rc=0
+  jig_autopilot_git_v line || rc=$?
+  printf '%s\n' "$line"
+  return "$rc"
+}
+
+# jig_autopilot_git_v <var> — the same `<level><TAB><key>` into <var>, with
+# the same exit status, in the caller's shell.
+jig_autopilot_git_v() {
+  local __jag_value
+  cfg_v __jag_value autopilot.git ""
+  if [ -n "$__jag_value" ]; then
+    printf -v "$1" '%s\tautopilot.git' "$__jag_value"
+    _cfg_agent_git_level "$__jag_value"
     return
   fi
-  value=$(cfg agent.git none)
-  printf '%s\tagent.git\n' "$value"
-  _cfg_agent_git_level "$value"
+  cfg_v __jag_value agent.git none
+  printf -v "$1" '%s\tagent.git' "$__jag_value"
+  _cfg_agent_git_level "$__jag_value"
 }
 
 # _cfg_agent_git_level <value> — exit 0 when <value> is an agent.git level.
@@ -447,7 +576,9 @@ _cfg_minutes() {
 # autopilot start`, which records the answer for the run, and by `spec ship`,
 # whose epic finish has no run to record it in.
 jig_unattended() {
-  [ "$(cfg autopilot.unattended false)" = true ]
+  local value
+  cfg_v value autopilot.unattended false
+  [ "$value" = true ]
 }
 
 # jig_autopilot_parallel — print autopilot.parallel, how many tasks of a

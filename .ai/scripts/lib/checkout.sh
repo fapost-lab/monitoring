@@ -205,9 +205,13 @@ _jig_checkout_name_from_head() {
     id=${d%/}
     id=${id##*/}
     jig_valid_id "$id" || continue
-    branch=$(_jig_checkout_value "$d/state" branch)
+    # _jig_checkout_read, not `$(_jig_checkout_value …)`: a fork per task
+    # directory on every command grew with the number of tasks.
+    _jig_checkout_read "$d/state" branch || _JIG_CHECKOUT_READ=""
+    branch=$_JIG_CHECKOUT_READ
     [ "$branch" = "$head" ] || continue
-    status=$(_jig_checkout_value "$d/state" status)
+    _jig_checkout_read "$d/state" status || _JIG_CHECKOUT_READ=""
+    status=$_JIG_CHECKOUT_READ
     case "$status" in
       active | ready)
         printf '%s\n' "$id"

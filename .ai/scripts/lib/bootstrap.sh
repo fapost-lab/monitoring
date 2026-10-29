@@ -901,11 +901,39 @@ _bootstrap_dangling() {
   return 0
 }
 
+# _bootstrap_winpid <pid> — the Windows process id behind the MSYS/Cygwin
+# process <pid>, or nothing when there is none to read.
+_bootstrap_winpid() {
+  cat "/proc/$1/winpid" 2>/dev/null || true
+}
+
+# _bootstrap_stop_tree <pid> — under Git Bash, end the Windows process tree of
+# <pid> before its group is signalled. MSYS delivers a signal only to its own
+# processes: a native program the command started — `php` under `composer`,
+# `docker` — never hears it and goes on running. `taskkill /T` walks the tree
+# by parent, so it runs first, while <pid> is still there to be its root.
+# Elsewhere, or with no taskkill or winpid, nothing: the group signal that
+# follows is the whole stop. MSYS rewrites `/T` into a path unless argument
+# conversion is off, as for _jig_junction.
+_bootstrap_stop_tree() {
+  local winpid
+  case "$(uname -s 2>/dev/null)" in
+    MINGW* | MSYS* | CYGWIN*) ;;
+    *) return 0 ;;
+  esac
+  command -v taskkill >/dev/null 2>&1 || return 0
+  winpid=$(_bootstrap_winpid "$1")
+  case "$winpid" in '' | *[!0-9]*) return 0 ;; esac
+  MSYS2_ARG_CONV_EXCL='*' taskkill /T /F /PID "$winpid" >/dev/null 2>&1 || true
+  return 0
+}
+
 # _bootstrap_setup_stop — the exit action that stops a `worktree.setup` still
-# running when Jig itself ends: its whole group, as the timeout does.
+# running when Jig itself ends: its whole tree, as the timeout does.
 _JIG_SETUP_PID=""
 _bootstrap_setup_stop() {
   [ -n "$_JIG_SETUP_PID" ] || return 0
+  _bootstrap_stop_tree "$_JIG_SETUP_PID"
   kill -TERM -- "-$_JIG_SETUP_PID" 2>/dev/null || kill -TERM "$_JIG_SETUP_PID" 2>/dev/null || true
   _JIG_SETUP_PID=""
   return 0
@@ -932,8 +960,10 @@ _bootstrap_setup_stop() {
 # Bounded by `worktree.setup_timeout`. The command runs in a process group of
 # its own (`set -m`), so that at the limit the whole group — `make`, the
 # `docker exec` under it, the `composer` under that — is sent SIGTERM, and
-# SIGKILL five seconds later. A process a container started inside itself may
-# not get the signal; that boundary is the container's. Rolled by hand like
+# SIGKILL five seconds later; under Git Bash, where native programs hear no
+# signal, its Windows process tree is ended first (_bootstrap_stop_tree). A
+# process a container started inside itself may not get the signal; that
+# boundary is the container's. Rolled by hand like
 # jig_ls_remote_tags: no `timeout` is guaranteed to exist (ADR-0002).
 #
 # Never fatal, like the carry before it: the task is started either way and
@@ -977,6 +1007,7 @@ jig_bootstrap_setup() {
     max_ticks=$((secs * 5))
     while kill -0 "$pid" 2>/dev/null; do
       if [ "$ticks" -ge "$max_ticks" ]; then
+        _bootstrap_stop_tree "$pid"
         kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
         waited=0
         while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 25 ]; do
