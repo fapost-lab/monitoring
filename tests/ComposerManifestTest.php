@@ -31,4 +31,11 @@ final class ComposerManifestTest extends TestCase
 
         $this->assertArrayHasKey('laravel/telescope', $manifest['require']);
     }
+
+    public function test_sentry_is_a_dependency_of_the_package_not_of_the_host(): void
+    {
+        $manifest = json_decode((string) file_get_contents(dirname(__DIR__) . '/composer.json'), true, flags: JSON_THROW_ON_ERROR);
+
+        $this->assertArrayHasKey('sentry/sentry-laravel', $manifest['require']);
+    }
 }

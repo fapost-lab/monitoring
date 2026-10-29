@@ -7,6 +7,7 @@ namespace Fapost\Monitoring;
 use Carbon\CarbonImmutable;
 use Fapost\Foundation\Operator\Enums\OperatorSurface;
 use Fapost\Monitoring\Access\OperatorGate;
+use Fapost\Monitoring\ErrorReporting\ErrorReporting;
 use Fapost\Monitoring\Health\HealthReader;
 use Fapost\Monitoring\Http\Middleware\AllowHealth;
 use Fapost\Monitoring\Http\Middleware\AllowLogs;
@@ -79,6 +80,8 @@ final class MonitoringServiceProvider extends ServiceProvider
         $this->app->singleton(OperatorGate::class);
         $this->app->bind(HealthReader::class);
 
+        (new ErrorReporting($this->app))->register();
+
         $this->app->register(PulseServiceProvider::class);
         $this->app->register(LogViewerServiceProvider::class);
         $this->app->register(TelescopeServiceProvider::class);
@@ -99,6 +102,9 @@ final class MonitoringServiceProvider extends ServiceProvider
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'monitoring');
 
         $this->registerHealth();
+
+        // Sentry reports only with a DSN; the privacy settings are forced either way (see ErrorReporting).
+        (new ErrorReporting($this->app))->enable();
 
         // After every provider has booted, so that no other definition of the abilities wins. The user is
         // optional: the contract reads the request's own sign-in, and a guest is asked too.
