@@ -1,8 +1,9 @@
 # The housekeeping log, read: which tasks the last `jig housekeeping` run
 # flagged, and which of those flags still stand. A shared parser
 # (ARCHITECTURE.md, Scripts layout): `status` reads it for its report and the
-# status page, `task list --json` for the data it prints, and the answer "does
-# this flag still stand" is decided here once so the three cannot disagree.
+# status page, `task list --json` for the data it prints, `spec` for the tasks
+# it found merged, and the answer "does this flag still stand" is decided here
+# once so the readers cannot disagree.
 #
 # The log is the housekeeping domain's (domains/housekeeping); this file only
 # reads it. The rechecks ask a task's own state through `task_state_get`, so a
@@ -18,7 +19,24 @@
 hklog_ids() {
   local hk_log="$JIG_PROJECT/$JIG_AI_DIR/runtime/housekeeping.log"
   [ -f "$hk_log" ] || return 0
-  hklog_ids_in "$hk_log" "$1"
+  hklog_last_run_lines "$hk_log" | hklog_ids_in - "$1"
+}
+
+# hklog_last_run_lines <log> — the lines of the last run in <log>: from its
+# last `--- run` marker to the end, or the whole file when it has none. Every
+# reader here wants only the newest run, and the log is only ever appended to:
+# on a project with 54 runs the last one was 4 KB of 8.8 MB, and an awk over
+# all of it cost a third of a second per reader. grep finds the marker without
+# awk's work on every line, and the run is cut at its byte offset: `tail -c`
+# seeks there, where `tail -n +<line>` counts every line before it again. A log
+# grep calls binary answers no offset, and is then read whole: slower, never
+# wrong, since every reader still resets on each marker.
+hklog_last_run_lines() {
+  local off
+  off=$(LC_ALL=C grep -b '^--- run ' "$1" 2>/dev/null | tail -n 1) || off=""
+  off=${off%%:*}
+  case "$off" in '' | *[!0-9]*) off=0 ;; esac
+  tail -c "+$((off + 1))" "$1"
 }
 
 hklog_ids_in() {
@@ -50,7 +68,7 @@ hklog_last_run() {
       for (i = 4; i <= NF; i++) if ($i ~ /^forge=/) forge = substr($i, 7)
     }
     END { if (at != "") printf "%s\t%s\n", at, forge }
-  ' "$hk_log"
+  ' < <(hklog_last_run_lines "$hk_log")
 }
 
 # hklog_flagged_ids <flag> — the tasks <flag> still stands for: the ones the
@@ -164,6 +182,6 @@ hklog_worktree() {
       if (a > 0 && b > a) p = substr($0, a + 10, b - a - 10)
     }
     END { if (p != "") print p }
-  ' "$hk_log"
+  ' < <(hklog_last_run_lines "$hk_log")
 }
 

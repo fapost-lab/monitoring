@@ -165,6 +165,9 @@ _status_load() {
   # After task.sh: its rechecks ask task_state_get.
   # shellcheck source=lib/hklog.sh
   . "$JIG_LIB/hklog.sh"
+  # After task.sh too: it finds the owner's runtime through it.
+  # shellcheck source=lib/forgecache.sh
+  . "$JIG_LIB/forgecache.sh"
   # shellcheck source=lib/notify.sh
   . "$JIG_LIB/notify.sh"
   # The advice line is `jig queue next`'s own answer (_status_next_line).
@@ -218,8 +221,9 @@ _status_report() {
   if manifest_exists; then
     local proj_version
     proj_version=$(manifest_header_get jig.version)
-    printf '%s\n' "manifest: version=$proj_version mode=$(manifest_header_get jig.mode) source=$(manifest_source)"
+    printf '%s\n' "manifest: version=$proj_version mode=$(manifest_header_get jig.mode) source=$(manifest_source 2>/dev/null || manifest_header_get jig.source)"
     _status_framework_versions "$proj_version"
+    _status_upgrade_pr_lines
   else
     printf '%s\n' "manifest: missing"
   fi
@@ -627,6 +631,7 @@ _status_terminal() {
         _STT_INSTALL+=("framework"$'\t'"${t%% *} (global jig unavailable)")
         ;;
       "framework versions: "*) _status_need warn "$l"; prev_need=1 ;;
+      "upgrade pull request: "*) _status_need warn "$l" ;;
       "drift: 0 modified, 0 missing, 0 pending")
         _STT_INSTALL+=("drift"$'\t'"$(out_join "0 modified" "0 missing" "0 pending")")
         ;;
@@ -1900,15 +1905,15 @@ _status_card() {
 # `jig status --json` reports the same items (_status_json), so the page and
 # the data cannot disagree about what needs the reader.
 _status_html_needs() {
-  local attn rec kind stype sid tasks title detail todo url label badge
+  local attn rec kind stype sid tasks title detail todo url extra label badge
   attn=$(_status_attention)
   printf '<section id="needs">\n<h2>Needs you</h2>\n'
   if [ -n "$attn" ]; then
     printf '<div class="cards">\n'
     while IFS= read -r rec; do
       [ -n "$rec" ] || continue
-      # shellcheck disable=SC2034 # tasks is the JSON's field; a card names its subject
-      IFS="$_STATUS_US" read -r kind stype sid tasks title detail todo url <<REC
+      # shellcheck disable=SC2034 # tasks and extra are the JSON's fields; a card names its subject
+      IFS="$_STATUS_US" read -r kind stype sid tasks title detail todo url extra <<REC
 $rec
 REC
       case "$stype" in
@@ -1934,14 +1939,16 @@ ATTN
 }
 
 # _status_attn <kind> <subject-type> <subject-id> <tasks> <title> <detail>
-# <todo> [url] — one attention item as a record: the fields joined by \037 on
-# one line. <kind> is the stable word a program reads (schemas/json.md);
-# <subject-type> is `task`, `phase` or `project` (whose <subject-id> is
-# empty); <tasks> the ids the item is about, space-separated.
+# <todo> [url] [extra] — one attention item as a record: the fields joined by
+# \037 on one line. <kind> is the stable word a program reads
+# (schemas/json.md); <subject-type> is `task`, `phase` or `project` (whose
+# <subject-id> is empty); <tasks> the ids the item is about, space-separated;
+# <extra> the data of a kind that carries its own, tab-separated, read only by
+# `jig status --json` (_status_json).
 _status_attn() {
   local us="$_STATUS_US"
-  printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' "$1" "$us" "$2" "$us" "$3" "$us" "$4" "$us" \
-    "$5" "$us" "$6" "$us" "$7" "$us" "${8:-}"
+  printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' "$1" "$us" "$2" "$us" "$3" "$us" "$4" "$us" \
+    "$5" "$us" "$6" "$us" "$7" "$us" "${8:-}" "$us" "${9:-}"
 }
 
 # _status_attention — what only the reader can do, one record (_status_attn)
@@ -1979,8 +1986,35 @@ _status_attention() {
   # same as an item. Only when both are release versions and this machine's
   # is newer; the other direction is `jig self-update`, which the release
   # item already names.
-  local up_from up_to
-  if up_from=$(_status_project_behind); then
+  #
+  # 0c. An upgrade waits on its pull request, or was merged and not brought
+  # here yet (task upgrade-land): one item per upgrade branch the forge cache
+  # knows. While one stands, 0b is not said: what is left of that upgrade is
+  # a merge and `jig upgrade --land`, and `jig upgrade` again would only cut a
+  # second branch for the same version.
+  local up_from up_to upr ub ust uat uurl uto uhave ubase
+  upr=$(_status_upgrade_prs)
+  if [ -n "$upr" ]; then
+    while IFS="$(printf '\t')" read -r ust ub ubase uto uhave uat uurl; do
+      [ -n "$ub" ] || continue
+      [ "$uurl" != "-" ] || uurl=""
+      if [ "$ust" = open ]; then
+        _status_attn upgrade-pull-request-waiting project "" "" \
+          "An upgrade of Jig waits for its pull request to be merged" \
+          "$ub into $ubase, open as of $uat" \
+          "Review and merge the pull request, then run jig upgrade --land to bring it here." \
+          "$uurl" "$ub	$ubase	open	$uat	$uto"
+      else
+        _status_attn upgrade-pull-request-merged project "" "" \
+          "An upgrade of Jig was merged but is not here yet" \
+          "$ub merged into $ubase as of $uat; $ubase here is still at $uhave" \
+          "jig upgrade --land" \
+          "$uurl" "$ub	$ubase	merged	$uat	$uto"
+      fi
+    done <<UPR
+$upr
+UPR
+  elif up_from=$(_status_project_behind); then
     up_to=${up_from#* }
     up_from=${up_from%% *}
     _status_attn upgrade-available project "" "" "Jig in this project is older than on this machine" \
@@ -2241,7 +2275,8 @@ _status_attention_phase_stops() {
 
 # _status_json [--json] — the producer json_run runs for `jig status --json`.
 _status_json() {
-  local arg attn rec kind stype sid tasks title detail todo url objs="" o t tl hk stale root vers
+  local arg attn rec kind stype sid tasks title detail todo url extra objs="" o t tl hk stale root vers
+  local xb xbase xst xat xto
   for arg in "$@"; do
     [ "$arg" = --json ] || jig_fail usage "status --json: unknown argument: $arg (usage: jig status --json)"
   done
@@ -2276,7 +2311,7 @@ _status_json() {
   attn=$(_status_attention)
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
-    IFS="$_STATUS_US" read -r kind stype sid tasks title detail todo url <<REC
+    IFS="$_STATUS_US" read -r kind stype sid tasks title detail todo url extra <<REC
 $rec
 REC
     json_quote "$kind"; o="{\"kind\":$_JSON"
@@ -2298,6 +2333,22 @@ REC
       json_quote "${vers%% *}"; o="$o,\"versions\":{\"from\":$_JSON"
       json_quote "${vers#* }"; o="$o,\"to\":$_JSON}"
     fi
+    # An upgrade's pull request: which branch, into what, as of when, and the
+    # version it brings (schemas/json.md).
+    case "$kind" in
+      upgrade-pull-request-*)
+        IFS="$(printf '\t')" read -r xb xbase xst xat xto <<X
+$extra
+X
+        [ "$xto" != "-" ] || xto=""
+        [ "$xat" != "-" ] || xat=""
+        json_quote "$xb"; o="$o,\"pull_request\":{\"branch\":$_JSON"
+        json_quote "$xbase"; o="$o,\"base\":$_JSON"
+        json_quote "$xst"; o="$o,\"state\":$_JSON"
+        json_str_or_null "$xat"; o="$o,\"fetched_at\":$_JSON}"
+        json_str_or_null "$xto"; o="$o,\"versions\":{\"to\":$_JSON}"
+        ;;
+    esac
     o="$o}"
     objs="$objs${objs:+,}$o"
   done <<ATTN
@@ -2735,6 +2786,78 @@ _status_html_summary() {
   agent_git=$(_status_autopilot_git)
   [ -z "$agent_git" ] || _status_html_item "autopilot.git" "${agent_git#autopilot.git: }" 0
   printf '</dl>\n</section>\n'
+}
+
+# _status_upgrade_prs — the upgrade pull requests that still need the reader,
+# from the forge cache housekeeping wrote (forgecache_upgrades): no forge is
+# asked. One line each:
+#   <state><TAB><branch><TAB><base><TAB><to><TAB><have><TAB><fetched_at><TAB><url>
+# <state> `open`: waits for its merge — unless the base here already records
+# <to> or newer, as it does right after `jig upgrade --land` and before the next
+# housekeeping hears the merge. `merged`: merged, and the base branch
+# here (refs/heads/<git.base_branch>) still records an older Jig than <to>,
+# the version the branch is named for (`jig/upgrade-<to>[-<n>]`), so
+# `jig upgrade --land` has something to bring. <have> is that older version,
+# `-` for an open one. A merged upgrade whose version the base here already
+# carries, or whose version cannot be read from its name, is history. <url>
+# is `-` when the cache does not know it.
+_status_upgrade_prs() {
+  local base cache line b st at url to have
+  cache=$(forgecache_read)
+  [ -n "$cache" ] || return 0
+  base=$(cfg git.base_branch main)
+  have=$(jig_git_show_path "refs/heads/$base" "$JIG_AI_DIR/manifest" 2>/dev/null \
+    | sed -n 's/^jig\.version:[[:space:]]*//p' | head -n 1) || have=""
+  while IFS="$(printf '\t')" read -r b st at url; do
+    [ -n "$b" ] || continue
+    jig_branch_is_jigs "$b" || continue
+    to=$(_status_upgrade_version "$b")
+    case "$st" in
+      open)
+        if [ -n "$to" ] && [ -n "$have" ] && ! jig_version_newer "$to" "$have"; then
+          continue
+        fi
+        printf '%s\t%s\t%s\t%s\t-\t%s\t%s\n' open "$b" "$base" "${to:--}" "$at" "$url"
+        ;;
+      merged)
+        [ -n "$to" ] && [ -n "$have" ] || continue
+        jig_version_newer "$to" "$have" || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' merged "$b" "$base" "$to" "$have" "$at" "$url"
+        ;;
+    esac
+  done <<CACHE
+$(forgecache_upgrades "$cache" "$base")
+CACHE
+}
+
+# _status_upgrade_version <branch> — the version `jig/upgrade-<to>[-<n>]` is
+# named for; nothing when the name holds no release version.
+_status_upgrade_version() {
+  local v="${1#jig/upgrade-}"
+  if jig_release_version "v$v" >/dev/null 2>&1; then
+    printf '%s\n' "$v"
+    return 0
+  fi
+  v=${v%-*}
+  jig_release_version "v$v" 2>/dev/null || true
+}
+
+# _status_upgrade_pr_lines — the text report's line per upgrade pull request
+# (_status_upgrade_prs), the same facts `jig status --json` reports as
+# upgrade-pull-request-waiting and upgrade-pull-request-merged.
+_status_upgrade_pr_lines() {
+  local st b base to have at url
+  while IFS="$(printf '\t')" read -r st b base to have at url; do
+    [ -n "$b" ] || continue
+    [ "$url" != "-" ] || url=""
+    if [ "$st" = open ]; then
+      printf '%s\n' "upgrade pull request: $b into $base open as of $at${url:+ ($url)}; merge it, then run \`jig upgrade --land\`"
+    else
+      printf '%s\n' "upgrade pull request: $b merged into $base as of $at, $base here is still at $have; run \`jig upgrade --land\`"
+    fi
+  done <<UPR
+$(_status_upgrade_prs)
+UPR
 }
 
 # _status_framework_versions <project-version> — compares the project's

@@ -127,12 +127,27 @@ manifest_hash_of() {
 # from `git rev-parse --show-toplevel`, which resolves symlinks, while
 # <source> may not have been (e.g. a TMPDIR under a symlinked /var on
 # macOS) even though both name the same directory.
+#
+# When <source> is the global framework — the checkout behind the `jig` PATH
+# selects — record "global" for the same reason: the manifest is committed,
+# and `/Users/<someone>/.local/share/jig` is one person's install, which every
+# other clone of the project would read as a source that is not there. Each
+# machine reads "global" as its own global framework (manifest_source,
+# adr-20261029-the-manifest-names-the-global-framework-not-its-path). The
+# project is asked first, so a framework checkout that is both its own source
+# and the global jig keeps ".". Any other checkout is still recorded as its
+# path: on a machine without a global jig it is the only way back.
 manifest_write_entries() {
   local version="$1" source="$2" adapters="$3" mode="$4" section="${5:-}" file tmp
-  local source_real project_real
+  local source_real project_real global_real
   source_real=$(cd "$source" 2>/dev/null && pwd -P) || source_real="$source"
   project_real=$(cd "$JIG_PROJECT" 2>/dev/null && pwd -P) || project_real="$JIG_PROJECT"
-  [ "$source_real" = "$project_real" ] && source="."
+  global_real=$(jig_global_source 2>/dev/null) || global_real=""
+  if [ "$source_real" = "$project_real" ]; then
+    source="."
+  elif [ -n "$global_real" ] && [ "$source_real" = "$global_real" ]; then
+    source="global"
+  fi
   file=$(manifest_file)
   tmp="$file.tmp.$$"
   jig_cleanup_add "$tmp"
@@ -156,15 +171,19 @@ manifest_write_entries() {
 
 # manifest_source
 # Prints the manifest's jig.source header, resolving "." (written when the
-# project installed itself as its own source) back to JIG_PROJECT.
+# project installed itself as its own source) back to JIG_PROJECT and "global"
+# to this machine's global framework (jig_global_source). Prints nothing and
+# fails for "global" on a machine without one. A recorded path is printed as
+# it is, whether or not it exists here: it may be another machine's, and a
+# caller that is about to read from it checks (upgrade_source).
 manifest_source() {
   local src
   src=$(manifest_header_get jig.source)
-  if [ "$src" = "." ]; then
-    printf '%s\n' "$JIG_PROJECT"
-  else
-    printf '%s\n' "$src"
-  fi
+  case "$src" in
+    .) printf '%s\n' "$JIG_PROJECT" ;;
+    global) jig_global_source ;;
+    *) printf '%s\n' "$src" ;;
+  esac
 }
 
 # manifest_instructions_section

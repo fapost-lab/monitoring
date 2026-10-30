@@ -161,8 +161,11 @@ open questions, untested assumptions; ask the human about each one, move it wher
 spec through `jig-idea`, or a task) or drop it, and run it again with `--leftovers-handled`. A spec on
 an epic is closed on the epic by `--finish`, not here.
 
-Then hand the change over. Stage the task's changes — only this task's, hunk by hunk when
-the tree holds other work — write the commit message with
+Then hand the change over. Stage the new files the task added (`git add <path>`); with nothing
+else staged, `task ship` stages the tracked changes itself and lists them, and it refuses while a
+new file is neither staged nor ignored. When the tree holds other work, stage only this task's
+changes, hunk by hunk: a staged index is committed as it is, and ship names what it left out. Write
+the commit message with
 `jig task artifact write <id> commit-message --from <file>` (it prints the path, in the task's
 workspace and not in a shared directory), and run:
 
