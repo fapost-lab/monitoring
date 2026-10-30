@@ -160,7 +160,7 @@ cmd_self_update() {
 
   [ $# -eq 0 ] || jig_die "self-update: unknown argument: $1"
 
-  source="${global%/scripts/jig}"
+  source=$(jig_global_source) || jig_die "self-update: no global jig on PATH"
   _self_update_validate_source "$source"
 
   if git -C "$source" symbolic-ref -q HEAD >/dev/null 2>&1; then

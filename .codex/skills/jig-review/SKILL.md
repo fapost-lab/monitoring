@@ -107,9 +107,11 @@ be narrow, and the script decides, not you.
   `fixed` finding against the new code, and the surrounding code only as far as judging the
   interdiff needs: callers of a changed function yes, the rest of the task's diff no. Record only
   findings the interdiff introduced; a P0 or P1 you notice anywhere is still recorded. A P2 or P3
-  outside the interdiff is not: the first review saw that code.
-- **`full`** (exit 1, with the reason) — no usable receipt, or the design or the knowledge moved:
-  review as for a first one, from §1.
+  outside the interdiff is not: the first review saw that code. When it also prints
+  `knowledge changed since review`, read each global document's diff too and judge the reviewed
+  change against what it added or removed; a finding that diff exposes counts as introduced.
+- **`full`** (exit 1, with the reason) — no usable receipt, the design moved, or the knowledge for
+  the task's files did: review as for a first one, from §1.
 - **`none`** — the receipt is current; there is nothing to re-review.
 
 The receipt at the end is the same: `jig task receipt <id> --stage review`.

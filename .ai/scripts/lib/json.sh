@@ -38,7 +38,7 @@ _JSON=""
 _JSON_CTRL=$(printf '\001\002\003\004\005\006\007\010\013\014\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037')
 
 json_quote() {
-  local s="$1" out="" c i n code
+  local s="$1" c i n code
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
   s=${s//$'\n'/\\n}
@@ -46,22 +46,25 @@ json_quote() {
   s=${s//$'\t'/\\t}
   case "$s" in
     *["$_JSON_CTRL"]*)
-      # Rare (a hand-edited state file, an escape sequence in a reason), so a
-      # byte-by-byte pass is paid only when one is there.
-      n=${#s}
+      # Rare (a hand-edited state file, an escape sequence in a reason or a
+      # task document), so the pass is paid only when one is there. One
+      # substitution per control byte, not a loop over the string's
+      # characters: `task artifact read --json` quotes whole documents, and a
+      # per-character loop that appends grows with the square of their size.
+      # The replacement is quoted, so neither `\` nor `&` (bash 5.2's
+      # patsub_replacement) means anything in it.
+      n=${#_JSON_CTRL}
       i=0
       while [ "$i" -lt "$n" ]; do
-        c=${s:$i:1}
-        case "$c" in
-          ["$_JSON_CTRL"])
+        c=${_JSON_CTRL:$i:1}
+        case "$s" in
+          *"$c"*)
             printf -v code '\\u%04x' "'$c"
-            out="$out$code"
+            s=${s//"$c"/"$code"}
             ;;
-          *) out="$out$c" ;;
         esac
         i=$((i + 1))
       done
-      s=$out
       ;;
   esac
   _JSON="\"$s\""

@@ -392,8 +392,9 @@ spec_phase_items() {
 # whether the ref is the remote's as of the last fetch; with no ref at all it
 # has no rows, and spec_list_rows already says `branch missing`.
 spec_phase_rows() {
-  local root id roadmap loc ref source
+  local root id roadmap loc ref source _SPEC_MERGED_MEMO _SPEC_MERGED
   root=$(spec_dir)
+  _spec_merged_memo
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     roadmap="$root/$id/roadmap.md"
@@ -483,11 +484,13 @@ spec_list() {
 _spec_list_json() {
   local arg root id dir title missing line branch state here checked_out
   local loc rc ref src content release epic phases progress
+  local _SPEC_MERGED_MEMO _SPEC_MERGED
   for arg in "$@"; do
     [ "$arg" = --json ] || jig_fail usage "spec list: unexpected argument: $arg"
   done
   jig_require_repo
   root=$(spec_dir)
+  _spec_merged_memo
   here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
   printf '{"specs":['
   local sep=""
@@ -591,8 +594,9 @@ _spec_json_phases() {
 # renders it (ARCHITECTURE.md, Scripts layout: a reporting command consumes a
 # peer's answer, never recomputes it).
 spec_list_rows() {
-  local root id title state missing
+  local root id title state missing _SPEC_MERGED_MEMO _SPEC_MERGED
   root=$(spec_dir)
+  _spec_merged_memo
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     title="" missing=""
@@ -1052,7 +1056,30 @@ ROW
 # "merged" shares — the roadmap counts (spec_phase_counts) and `spec plan` —
 # read offline: no fetch, no forge call. Both sources are local and
 # gitignored, so a clone holding neither knows only the roadmap's checkmarks.
+#
+# Inside a walk over every spec the answer is the one _spec_merged_memo read
+# at its start, not read again per spec.
 spec_merged_task_ids() {
+  if [ "${_SPEC_MERGED_MEMO:-}" = 1 ]; then
+    [ -z "$_SPEC_MERGED" ] || printf '%s\n' "$_SPEC_MERGED"
+    return 0
+  fi
+  _spec_merged_task_ids_read
+}
+
+# _spec_merged_memo — read spec_merged_task_ids once for a walk over every
+# spec. The walk declares `local _SPEC_MERGED_MEMO _SPEC_MERGED` and calls this
+# before its loop; bash scopes locals dynamically, so every spec_phase_counts
+# under it, subshells included, answers from that one read, and the memo ends
+# with the walk -- a later reader in the same process reads again. Asked per
+# spec, the read cost 20 specs a pass over every task's state and the whole
+# housekeeping log each: 6.8 s where 0.37.0 took 0.76.
+_spec_merged_memo() {
+  _SPEC_MERGED=$(_spec_merged_task_ids_read)
+  _SPEC_MERGED_MEMO=1
+}
+
+_spec_merged_task_ids_read() {
   local ws closed=""
   # A roadmap read outside a project (a library sourced on its own) has no
   # tasks to ask.
@@ -1085,24 +1112,14 @@ spec_merged_task_ids() {
 
 # _spec_plan_hk_merged — the task ids the newest housekeeping run found merged
 # into their base (`remote=merged` on a task line after the last `--- run`
-# marker; domains/housekeeping documents the log's line shape). Nothing when
-# housekeeping never ran here.
+# marker; domains/housekeeping documents the log's line shape), read by the
+# log's shared parser. Nothing when housekeeping never ran here.
 _spec_plan_hk_merged() {
-  local log="$JIG_PROJECT/$JIG_AI_DIR/runtime/housekeeping.log"
-  [ -f "$log" ] || return 0
-  awk '
-    # split("", seen) clears the array portably.
-    /^--- run / { split("", seen); n = 0; next }
-    / remote=merged( |$)/ {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^task=/) {
-          id = substr($i, 6)
-          if (!(id in seen)) { seen[id] = 1; ids[++n] = id }
-        }
-      }
-    }
-    END { for (i = 1; i <= n; i++) print ids[i] }
-  ' "$log"
+  command -v hklog_ids >/dev/null 2>&1 || {
+    # shellcheck source=lib/hklog.sh
+    . "$JIG_LIB/hklog.sh"
+  }
+  hklog_ids ' remote=merged( |$)'
 }
 
 # _spec_plan_decide — the enriched rows on stdin, the phase in JIG_SP_PHASE and

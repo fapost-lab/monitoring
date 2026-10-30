@@ -14,7 +14,7 @@
 # it lives in these run-scoped globals and in the log.
 _HK_VIA=""          # tier that decided the last remote state: forge|ancestry|none
 _HK_FORGE_KIND=""   # github|gitlab|none — resolved once per run
-_HK_FORGE_PRS=""    # "<head><TAB><base><TAB><state><TAB><head-commit>" lines, fetched once per run (C1)
+_HK_FORGE_PRS=""    # "<head><TAB><base><TAB><state><TAB><head-commit><TAB><url>" lines, fetched once per run (C1)
 _HK_STALE_REMOTE=0  # 1 when the fetch or the forge tier could not answer
 _HK_FORGE_TOKEN=""  # github|gitlab|none|failed — the run marker's forge= field
 _HK_VERBOSE=0       # 1 with --verbose: also print one decision line per task
@@ -84,6 +84,9 @@ cmd_housekeeping() {
     # change of the clone, counted once when the run ends, however it ends
     # (jig_revision_bump, common.sh). Registered before the first write.
     jig_on_exit 'jig_revision_bump'
+    # Under the lock and before this run's marker, so no other run writes
+    # the log while it is rewritten and the run about to start is never cut.
+    _hk_log_trim "$runtime/housekeeping.log"
   fi
 
   _HK_DEFAULT_BASE=$(cfg git.base_branch main)
@@ -660,10 +663,11 @@ _hk_check_latest_release() {
 # call per run, not per task: this command may fire at the start of every
 # agent session.
 #
-# One row per pull request: `<head>\t<base>\t<state>\t<head-commit>`. The
-# fourth column is read only by the branch sweep (_hk_branch_sweep), as the
+# One row per pull request: `<head>\t<base>\t<state>\t<head-commit>\t<url>`.
+# The fourth column is read by the branch sweep (_hk_branch_sweep), as the
 # commit a merged branch may be deleted at on origin; a row without it never
-# deletes anything there.
+# deletes anything there. The fourth and fifth go into the forge cache, where
+# `jig status` names an upgrade's pull request by them (lib/forgecache.sh).
 _hk_forge_init() {
   _HK_FORGE_PRS=""
   _HK_FORGE_KIND=$(jig_forge_kind) || exit 1
@@ -672,14 +676,15 @@ _hk_forge_init() {
   case "$_HK_FORGE_KIND" in
     github)
       _HK_FORGE_PRS=$(gh pr list --state all --limit 200 \
-        --json headRefName,baseRefName,state,headRefOid \
-        --jq '.[] | "\(.headRefName)\t\(.baseRefName)\t\(.state)\t\(.headRefOid)"' 2>/dev/null || printf '__failed__')
+        --json headRefName,baseRefName,state,headRefOid,url \
+        --jq '.[] | "\(.headRefName)\t\(.baseRefName)\t\(.state)\t\(.headRefOid)\t\(.url)"' 2>/dev/null || printf '__failed__')
       ;;
     gitlab)
       # A row needs a branch and a state; jig_glab_fields (common.sh) splits
-      # glab's compact array and drops objects without a source branch.
+      # glab's compact array and drops objects without a source branch. The
+      # merge request's own web_url, not its author's, which comes first.
       _HK_FORGE_PRS=$(glab mr list --all --output json 2>/dev/null \
-        | jig_glab_fields source_branch target_branch state sha \
+        | jig_glab_fields source_branch target_branch state sha web_url@/merge_requests/ \
         | awk -F '\t' '$3 != ""' \
         || printf '__failed__')
       ;;
@@ -753,7 +758,8 @@ _HK_PR_STATE_AWK='
 
 # _hk_forge_cache_write — keep what this run heard from the forge in the forge
 # cache (lib/forgecache.sh) for the reads that never ask it: one line per pull
-# request, `<head>\t<base>\t<state>\t<ci>\t<fetched_at>`, the state normalised
+# request, `<head>\t<base>\t<state>\t<ci>\t<fetched_at>\t<head-commit>\t<url>`,
+# the state normalised
 # as _hk_forge_state normalises it. Only after a list the forge answered: a run
 # without a forge or with a failed one leaves the last cache as it is, every
 # entry still carrying the time it was heard. Never fails the run.
@@ -779,7 +785,10 @@ _hk_forge_cache_write() {
       c = "-"
       if (s == "open" && (($2 FS $3) in ci)) c = ci[$2 FS $3]
       if (c != "green" && c != "red" && c != "pending" && c != "none") c = "-"
-      print $2 "\t" $3 "\t" s "\t" c "\t" at
+      h = $5; u = $6
+      if (h !~ /^[0-9a-f]+$/) h = "-"
+      if (u == "" || u ~ /[[:space:]]/ || u == "null") u = "-"
+      print $2 "\t" $3 "\t" s "\t" c "\t" at "\t" h "\t" u
     }') || return 0
   forgecache_write "$rows"
 }
@@ -1778,6 +1787,65 @@ _hk_log() {
   local runtime="$JIG_PROJECT/$JIG_AI_DIR/runtime"
   mkdir -p "$runtime"
   printf '%s\n' "$1" >> "$runtime/housekeeping.log"
+}
+
+# _hk_log_keep_runs, _hk_log_keep_output — how much of the log a trim keeps:
+# the last runs whole, and per run that many lines that are not a record (the
+# report on stdout, a runaway's stderr). A normal run prints under 200 lines;
+# one session hook out of file descriptors printed 55 000. Not configurable,
+# like _hk_lock_ttl: a bound nobody has to set.
+_hk_log_keep_runs() { printf '10\n'; }
+_hk_log_keep_output() { printf '200\n'; }
+
+# _hk_log_trim <log> — keep the log from growing without bound.
+#
+# A block is a `--- run` marker and what follows it, or what precedes the
+# first marker in a log older than markers. The last _hk_log_keep_runs blocks
+# stay; of the older ones only the `action=purge` lines do, in their order and
+# ahead of the kept runs, because `jig measure` reads them from the whole
+# history (ADR-0027) and every other reader reads only the newest run
+# (hklog.sh). In a kept block every record stays -- the marker and each line
+# that starts with a UTC time -- and of the other lines the first
+# _hk_log_keep_output, then one note counting the rest. The note carries no
+# `task=` and does not begin with `--- run`, so no reader takes it for a
+# record, and it is exempt from the cap, so trimming again changes nothing.
+#
+# Rewritten in place, never moved over: the session hook and the schedulers
+# hold the log open for appending, and a renamed file would take their output
+# into an unlinked inode. Only a smaller result is written back, and a failed
+# trim leaves the log as it was without failing the run. The copy is not
+# atomic: when it fails, the trimmed text is left in `<log>.trim` rather than
+# removed, since the log is the only copy of the purge history. One fixed
+# name, so a run killed mid-trim leaves one file, overwritten by the next.
+_hk_log_trim() {
+  local log="$1" tmp runs pre
+  [ -s "$log" ] || return 0
+  runs=$(LC_ALL=C grep -c '^--- run ' "$log" 2>/dev/null) || runs=0
+  pre=1
+  case "$(head -n 1 "$log" 2>/dev/null)" in '--- run '*) pre=0 ;; esac
+  tmp="$log.trim"
+  if JIG_HK_FIRST=$((runs + pre - $(_hk_log_keep_runs) + 1)) JIG_HK_OUT=$(_hk_log_keep_output) \
+    JIG_HK_PRE="$pre" LC_ALL=C awk '
+    function flush() {
+      if (over > 0) printf "housekeeping: log trimmed: %d more lines of output in this run dropped\n", over
+      out = 0; over = 0
+    }
+    BEGIN { b = ENVIRON["JIG_HK_PRE"] + 0; first = ENVIRON["JIG_HK_FIRST"] + 0; cap = ENVIRON["JIG_HK_OUT"] + 0 }
+    /^--- run / { flush(); b++ }
+    b < first {
+      if ($0 ~ /(^| )action=purge( |$)/) print
+      next
+    }
+    /^--- run / || /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z / || /^housekeeping: log trimmed: / { print; next }
+    { if (++out <= cap) print; else over++ }
+    END { flush() }
+  ' "$log" 2>/dev/null > "$tmp"; then
+    if [ "$(wc -c < "$tmp")" -lt "$(wc -c < "$log")" ]; then
+      { cat "$tmp" > "$log"; } 2>/dev/null || return 0
+    fi
+  fi 2>/dev/null
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
 }
 
 # _hk_task_facts <id> — the attributes a purged task takes with it, as log

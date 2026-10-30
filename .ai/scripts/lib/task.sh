@@ -76,10 +76,11 @@ _task_usage() {
     show) printf 'usage: jig task show <id>\n' ;;
     current) printf 'usage: jig task current\n' ;;
     changes) printf 'usage: jig task changes <id> --base <ref> [--files <list>|-] [--format report|paths]\n' ;;
-    artifacts) printf 'usage: jig task artifacts <id> [--provided discovery,design,...]\n' ;;
+    artifacts) printf 'usage: jig task artifacts <id> [--provided discovery,design,...] | [--json]\n' ;;
     artifact)
       printf 'usage: jig task artifact write <id> <kind> [--from <file>|-]\n'
       printf '       jig task artifact append <id> <kind> [--from <file>|-]\n'
+      printf '       jig task artifact read <id> <kind> [--json]\n'
       printf '       <kind>: task discovery spec alternatives design plan review verification handoff knowledge-map commit-message pr-body\n'
       ;;
     finding)
@@ -3291,8 +3292,25 @@ _task_receipt_diff_hash() {
 # merge base — changes it. Fails when it cannot be computed; "-" when there is
 # no merge base to find the task's files from.
 _task_receipt_context_hash() {
-  local id="$1" dir="$2" mb files full own domains matched path lines=""
-  mb=$(_task_review_merge_base "$id" "$dir") || { printf -- '-\n'; return 0; }
+  local id="$1" dir="$2" lines
+  _task_review_merge_base "$id" "$dir" >/dev/null || { printf -- '-\n'; return 0; }
+  lines=$(_task_receipt_context_lines "$id" "$dir") || return 1
+  if [ -n "$lines" ]; then
+    printf '%s\n' "$lines"
+  fi | git hash-object --stdin
+}
+
+# _task_receipt_context_lines <id> <dir> [--write] — the "<path> <content
+# hash>" lines _task_receipt_context_hash hashes, sorted, one per document the
+# review relied on; nothing when there is no merge base. The receipt keeps
+# them as `context_doc:` lines so `--since-review` can tell which document
+# moved (adr-20261029-a-global-knowledge-edit-narrows-a-re-review). With
+# `--write` each document's content is also stored as a blob — the same id
+# jig_hash gives, `--no-filters` — so the re-review can be shown what changed
+# in it; the gates call this without `--write` and write nothing.
+_task_receipt_context_lines() {
+  local id="$1" dir="$2" write="${3:-}" mb files full own domains matched path hash lines=""
+  mb=$(_task_review_merge_base "$id" "$dir") || return 0
   files=$(_task_review_changed_files "$id" "$dir") || return 1
   full=$(_task_review_tree "$dir" --all) || return 1
   own=$(git -C "$dir" diff-tree -r --no-renames --name-only "$mb" "$full" \
@@ -3310,19 +3328,24 @@ _task_receipt_context_hash() {
     [ -n "$path" ] || continue
     if jig_has_line "$path" "$own"; then
       git -C "$dir" cat-file -e "$mb:$path" 2>/dev/null || continue
-      lines="$lines$path $(git -C "$dir" cat-file --filters "$mb:$path" | jig_hash_stdin)
-"
-      continue
-    fi
-    if [ -f "$dir/$path" ]; then
-      lines="$lines$path $(jig_hash "$dir/$path")
-"
+      if [ "$write" = --write ]; then
+        hash=$(git -C "$dir" cat-file --filters "$mb:$path" | git -C "$dir" hash-object -w --no-filters --stdin) || return 1
+      else
+        hash=$(git -C "$dir" cat-file --filters "$mb:$path" | jig_hash_stdin)
+      fi
+    elif [ -f "$dir/$path" ]; then
+      if [ "$write" = --write ]; then
+        hash=$(git -C "$dir" hash-object -w --no-filters -- "$path") || return 1
+      else
+        hash=$(jig_hash "$dir/$path")
+      fi
     else
-      lines="$lines$path -
-"
+      hash=-
     fi
+    lines="$lines$path $hash
+"
   done < <(printf '%s\n' "$matched")
-  printf '%s' "$lines" | LC_ALL=C sort | git hash-object --stdin
+  printf '%s' "$lines" | LC_ALL=C sort
 }
 
 # _task_receipt_design_hash <id> — the receipt's `design` field: the hash of
@@ -3539,6 +3562,12 @@ task_receipt_write() {
   tree=$(_task_review_tree "$review_dir") || jig_die "task receipt: could not read the working tree"
   diff=$(_task_receipt_diff_hash "$id" "$review_dir") || jig_die "task receipt: could not read the task's change"
   context=$(_task_receipt_context_hash "$id" "$review_dir") || jig_die "task receipt: could not resolve the knowledge for the task's change"
+  # Which documents `context` hashed, with their content stored, so a re-review
+  # can tell a global document moving from the set under the task's files moving
+  # (adr-20261029-a-global-knowledge-edit-narrows-a-re-review). Never compared.
+  local context_docs
+  context_docs=$(_task_receipt_context_lines "$id" "$review_dir" --write) \
+    || jig_die "task receipt: could not resolve the knowledge for the task's change"
   # What `diff` was measured from: read by `task receipt --since-review`, never
   # compared (adr-20261019-a-re-review-reads-what-changed-since-review).
   merge_base=$(_task_review_merge_base "$id" "$review_dir") || merge_base=""
@@ -3570,6 +3599,7 @@ task_receipt_write() {
     printf 'head: %s\n' "$head"
     printf 'design: %s\n' "$design"
     printf 'findings: %s\n' "$findings"
+    [ -z "$context_docs" ] || printf '%s\n' "$context_docs" | sed 's/^/context_doc: /'
   } > "$tmp"
   mv "$tmp" "$file"
   jig_record_changed
@@ -3619,12 +3649,15 @@ task_receipt_check() {
 # the task never touched is left out.
 #
 # Exit 0 with `re-review: narrow (...)` and the interdiff when only the task's
-# diff or the ledger moved; exit 0 with `re-review: none` when the receipt is
-# current; exit 1 with `re-review: full — <why>` when the re-review must read
-# everything: no receipt, the design or the knowledge under the review moved,
-# or what the receipt pinned can no longer be read. With `paths` only the
-# interdiff's files are printed, and the verdict of none or full goes to
-# stderr, so the list can be piped into `jig context resolve`.
+# diff, the ledger or a global knowledge document moved — then the diff of each
+# such document follows the interdiff; exit 0 with `re-review: none` when the
+# receipt is current; exit 1 with `re-review: full — <why>` when the re-review
+# must read everything: no receipt, the design moved, the documents resolved for
+# the task's files changed as a set or in one that is not global
+# (_task_since_review_knowledge), or what the receipt pinned can no longer be
+# read. With `paths` only the interdiff's code files are printed, and the
+# verdict of none or full goes to stderr, so the list can be piped into
+# `jig context resolve`.
 _task_receipt_since_review() {
   local id="$1" format="$2" changed dir old_tree old_mb new_tree old_files new_files paths diffed files="" path
   if [ ! -f "$(task_dir "$id")/receipt" ]; then
@@ -3646,8 +3679,16 @@ _task_receipt_since_review() {
   fi
   case ", $changed, " in
     *", design, "*) _task_since_review_full "$format" "the approved design changed since the review"; return 1 ;;
-    *", context, "*) _task_since_review_full "$format" "the knowledge the review relied on changed"; return 1 ;;
     *", tree, "*) _task_since_review_full "$format" "the receipt predates the task's own diff; it pins the whole tree"; return 1 ;;
+  esac
+  _TASK_SR_KNOWLEDGE=""
+  case ", $changed, " in
+    *", context, "*)
+      if ! _task_since_review_knowledge "$id" "$dir"; then
+        _task_since_review_full "$format" "$_TASK_SR_WHY"
+        return 1
+      fi
+      ;;
   esac
   old_tree=$(_task_receipt_get "$id" tree)
   old_mb=$(_task_receipt_get "$id" merge_base)
@@ -3682,8 +3723,71 @@ _task_receipt_since_review() {
   printf 're-review: narrow (%s)\n' "$changed"
   printf 'task: %s\nreviewed: %s (tree %s)\n' "$id" "$(_task_receipt_get "$id" reviewed_at)" "$old_tree"
   printf 'changed since review: %s paths\n' "$(printf '%s' "$files" | sed '/^$/d' | wc -l | tr -d ' ')"
-  [ -n "$files" ] || return 0
-  printf '%s' "$files" | tr '\n' '\0' | (cd "$dir" && xargs -0 git --literal-pathspecs diff --no-color --no-ext-diff "$old_tree" "$new_tree" --)
+  if [ -n "$files" ]; then
+    printf '%s' "$files" | tr '\n' '\0' | (cd "$dir" && xargs -0 git --literal-pathspecs diff --no-color --no-ext-diff "$old_tree" "$new_tree" --)
+  fi
+  [ -n "$_TASK_SR_KNOWLEDGE" ] || return 0
+  printf 'knowledge changed since review: %s documents\n' "$(printf '%s' "$_TASK_SR_KNOWLEDGE" | sed '/^$/d' | wc -l | tr -d ' ')"
+  local old_hash new_hash
+  while IFS=$'\t' read -r path old_hash new_hash; do
+    [ -n "$path" ] || continue
+    printf 'knowledge: %s\n' "$path"
+    git -C "$dir" diff --no-color --no-ext-diff "$old_hash" "$new_hash"
+  done < <(printf '%s' "$_TASK_SR_KNOWLEDGE")
+}
+
+# _task_since_review_knowledge <id> <dir> — whether a re-review may stay narrow
+# although `context` moved (adr-20261029-a-global-knowledge-edit-narrows-a-re-review).
+# It may when the same documents resolve for the task's files as at the review
+# and only global ones (jig_knowledge_is_global) changed: those resolve for any
+# file, so an edit to them is most often another task's consolidation, and the
+# re-reviewer is shown it. Sets _TASK_SR_KNOWLEDGE to "<path>\t<old>\t<new>"
+# lines, one per changed global document, and returns 0; otherwise sets
+# _TASK_SR_WHY to the reason the re-review must be full and returns 1 — a
+# document that newly resolves or no longer does, a changed document that
+# resolves through the task's paths or domains, a receipt that does not list
+# its documents, or content the review read that is no longer stored.
+_task_since_review_knowledge() {
+  local id="$1" dir="$2" old new old_paths new_paths path hash old_hash moved=""
+  _TASK_SR_KNOWLEDGE=""
+  _TASK_SR_WHY="the knowledge the review relied on changed"
+  old=$(sed -n 's/^context_doc:[[:space:]]*//p' "$(task_dir "$id")/receipt")
+  if [ -z "$old" ]; then
+    _TASK_SR_WHY="the knowledge the review relied on changed, and the receipt does not list which documents it read"
+    return 1
+  fi
+  new=$(_task_receipt_context_lines "$id" "$dir" --write) || {
+    _TASK_SR_WHY="could not resolve the knowledge for the task's change"
+    return 1
+  }
+  old_paths=$(printf '%s\n' "$old" | sed 's/ [^ ]*$//' | LC_ALL=C sort -u)
+  new_paths=$(printf '%s\n' "$new" | sed '/^$/d' | sed 's/ [^ ]*$//' | LC_ALL=C sort -u)
+  if [ "$old_paths" != "$new_paths" ]; then
+    path=$(LC_ALL=C comm -3 <(printf '%s\n' "$old_paths") <(printf '%s\n' "$new_paths") | sed 's/^[[:space:]]*//' | sed -n 1p)
+    _TASK_SR_WHY="a document resolves for the task's files that did not at the review, or no longer does: $path"
+    return 1
+  fi
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    hash=${path##* }
+    path=${path% *}
+    old_hash=$(printf '%s\n' "$old" | awk -v p="$path" '{ h = $NF; sub(/ [^ ]*$/, ""); if ($0 == p) { print h; exit } }')
+    [ "$hash" != "$old_hash" ] || continue
+    if ! jig_knowledge_is_global "$JIG_PROJECT/$path"; then
+      _TASK_SR_WHY="$path, which resolves for the task's files, changed since the review"
+      return 1
+    fi
+    if [ "$hash" = - ] || [ "$old_hash" = - ] \
+      || ! git -C "$dir" cat-file -e "$old_hash^{blob}" 2>/dev/null; then
+      _TASK_SR_WHY="what the review read in $path is no longer in the repository"
+      return 1
+    fi
+    moved="$moved$(printf '%s\t%s\t%s' "$path" "$old_hash" "$hash")
+"
+  done < <(printf '%s\n' "$new")
+  [ -n "$moved" ] || return 1
+  _TASK_SR_KNOWLEDGE=$moved
+  return 0
 }
 
 # _task_since_review_full <format> <why> — the `re-review: full` verdict of
@@ -5276,7 +5380,7 @@ task_changes() {
 _task_workspace_root() {
   local id="$1" cmd="$2" root tasks_root real
   root=$(task_dir "$id") || return 1
-  [ -f "$root/state" ] || jig_die "$cmd: unknown task: $id"
+  [ -f "$root/state" ] || jig_fail not-found "$cmd: unknown task: $id"
   tasks_root=$(_task_tasks_root "$cmd")
   if [ -L "$root" ]; then
     real=$(cd -P "$root" 2>/dev/null && pwd -P) || real=""
@@ -5326,26 +5430,46 @@ _task_artifact_kind() {
   case "$1" in discovery | spec | alternatives | design | plan | review | verification | handoff) return 0 ;; *) return 1 ;; esac
 }
 
-# Resolve links without readlink -f. Do not read an artifact outside the workspace.
-_task_artifact_fact() {
-  local root="$1" kind="$2" provided="$3" path target parent hops=0
-  if jig_has_line "$kind" "$provided"; then
-    printf 'provided-claim (caller must substantiate)\n'; return 0
-  fi
+# _task_artifact_locate <root> <kind> — where <kind>.md of the workspace
+# <root> really is, and whether it may be read. Sets, in the caller's shell
+# (called as a plain command, never inside $(...)):
+#   _TASK_ART_PATH    the physical path, links resolved; empty when unresolved
+#   _TASK_ART_STATE   present | empty | missing | unavailable
+#   _TASK_ART_REASON  why, in the words `task artifacts` prints in parentheses
+# The one check every reader of an artifact passes: the text report, the JSON
+# list and `task artifact read`. Links are resolved without readlink -f, and a
+# path that leaves the workspace is never read.
+_task_artifact_locate() {
+  local root="$1" kind="$2" path target parent hops=0
+  _TASK_ART_PATH="" _TASK_ART_STATE=unavailable _TASK_ART_REASON=""
   path="$root/$kind.md"
   while [ -L "$path" ]; do
     hops=$((hops + 1))
-    if [ "$hops" -gt 40 ]; then printf 'unavailable (symlink loop)\n'; return 0; fi
-    target=$(readlink "$path") || { printf 'unavailable (unreadable link)\n'; return 0; }
+    if [ "$hops" -gt 40 ]; then _TASK_ART_REASON="symlink loop"; return 0; fi
+    target=$(readlink "$path") || { _TASK_ART_REASON="unreadable link"; return 0; }
     case "$target" in /*) path="$target" ;; *) path="$(dirname "$path")/$target" ;; esac
   done
-  parent=$(cd -P "$(dirname "$path")" 2>/dev/null && pwd -P) || { printf 'unavailable (missing parent)\n'; return 0; }
+  parent=$(cd -P "$(dirname "$path")" 2>/dev/null && pwd -P) || { _TASK_ART_REASON="missing parent"; return 0; }
   path="$parent/$(basename "$path")"
-  case "$path" in "$root"/*) ;; *) printf 'unavailable (outside workspace)\n'; return 0 ;; esac
-  if [ ! -f "$path" ]; then printf 'unavailable (missing or not a regular file)\n'
-  elif [ ! -r "$path" ]; then printf 'unavailable (unreadable)\n'
-  elif [ ! -s "$path" ]; then printf 'unavailable (empty)\n'
-  else printf 'present\n'; fi
+  case "$path" in "$root"/*) ;; *) _TASK_ART_REASON="outside workspace"; return 0 ;; esac
+  _TASK_ART_PATH=$path
+  if [ ! -e "$path" ]; then _TASK_ART_STATE=missing; _TASK_ART_REASON="missing or not a regular file"
+  elif [ ! -f "$path" ]; then _TASK_ART_REASON="missing or not a regular file"
+  elif [ ! -r "$path" ]; then _TASK_ART_REASON="unreadable"
+  elif [ ! -s "$path" ]; then _TASK_ART_STATE=empty; _TASK_ART_REASON="empty"
+  else _TASK_ART_STATE=present; fi
+}
+
+# _task_artifact_fact <root> <kind> <provided> — the text report's word for
+# one artifact: `present`, `unavailable (<reason>)`, or the provided claim.
+_task_artifact_fact() {
+  local root="$1" kind="$2" provided="$3"
+  if jig_has_line "$kind" "$provided"; then
+    printf 'provided-claim (caller must substantiate)\n'; return 0
+  fi
+  _task_artifact_locate "$root" "$kind"
+  if [ "$_TASK_ART_STATE" = present ]; then printf 'present\n'
+  else printf 'unavailable (%s)\n' "$_TASK_ART_REASON"; fi
 }
 
 # stage|documentary inputs|unassessed semantic prerequisites, for <class> at
@@ -5365,7 +5489,19 @@ _task_artifact_route() {
   esac
 }
 
+# task_artifacts <id> [--provided ...] [--json] — `--json` anywhere runs the
+# JSON list instead (_task_artifacts_json), as the producer of json_run
+# (conventions/json-output.md).
 task_artifacts() {
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _task_artifacts_json "$@"
+      return
+    fi
+  done
   jig_require_init
   [ $# -ge 1 ] || jig_die "$(_task_usage artifacts)"
   local id="$1" root class provided="" seen=0 kinds kind fact stage inputs semantic availability facts="" t depth
@@ -5411,6 +5547,108 @@ task_artifacts() {
   printf 'Presence and provided claims do not prove approval, quality or completion; state unchanged.\n'
 }
 
+# _task_artifact_stat — _TASK_ART_PATH's mtime as UTC into _TASK_ART_AT and
+# its size in bytes into _TASK_ART_BYTES; each empty when it cannot be read.
+_task_artifact_stat() {
+  local mtime
+  _TASK_ART_AT="" _TASK_ART_BYTES=""
+  if mtime=$(jig_file_mtime "$_TASK_ART_PATH"); then
+    _TASK_ART_AT=$(jig_utc_from_epoch "$mtime") || _TASK_ART_AT=""
+  fi
+  _TASK_ART_BYTES=$(wc -c < "$_TASK_ART_PATH" 2>/dev/null | tr -d ' ') || _TASK_ART_BYTES=""
+}
+
+# _task_artifacts_json <id> [--json] — the producer of `task artifacts --json`
+# (schemas/json.md): every kind `task artifact` writes, in its order, each with
+# its state, the reason when it is unavailable, and for a file that is there its
+# mtime and size. A listing, not a route report: it asks nothing of the class,
+# and `--provided` (a claim from a conversation) has no place in it.
+_task_artifacts_json() {
+  local arg args=()
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  set -- ${args[@]+"${args[@]}"}
+  jig_require_init
+  [ $# -ge 1 ] || jig_fail usage "$(_task_usage artifacts)"
+  case "$1" in -*) jig_fail usage "$(_task_usage artifacts)" ;; esac
+  local id="$1" root kind out sep="" reason at bytes
+  shift
+  [ $# -eq 0 ] || case "$1" in
+    --provided) jig_fail usage "task artifacts: --provided cannot be combined with --json" ;;
+    *) jig_fail usage "task artifacts: unknown argument: $1" ;;
+  esac
+  _task_valid_id "$id" || jig_fail usage "task artifacts: invalid task id: $id"
+  root=$(_task_workspace_root "$id" "task artifacts") || return 1
+  json_quote "$id"
+  out="{\"task\":$_JSON,\"artifacts\":["
+  for kind in $_TASK_ARTIFACT_KINDS; do
+    _task_artifact_locate "$root" "$kind"
+    reason=null at=null bytes=null
+    case "$_TASK_ART_STATE" in
+      present | empty)
+        _task_artifact_stat
+        json_str_or_null "$_TASK_ART_AT"; at=$_JSON
+        json_int_or_null "$_TASK_ART_BYTES"; bytes=$_JSON
+        ;;
+      unavailable) json_quote "$_TASK_ART_REASON"; reason=$_JSON ;;
+    esac
+    out="$out$sep{\"kind\":\"$kind\",\"state\":\"$_TASK_ART_STATE\",\"reason\":$reason,\"updated_at\":$at,\"bytes\":$bytes}"
+    sep=,
+  done
+  printf '%s]}\n' "$out"
+}
+
+# _task_artifact_read <as_json> <id> <kind> — one artifact, read from where the
+# task's workspace really is (_task_workspace_root, ADR-0029): its bytes as
+# they are, or with <as_json> 1 an object holding them as a string beside its
+# mtime and size (schemas/json.md). Nothing is written. An empty artifact
+# reads as empty; a missing one is `not-found`; one the check refuses (a link
+# out of the workspace, not a regular file, unreadable) is `failed`.
+_task_artifact_read() {
+  local as_json="$1" id="$2" kind="$3" root content
+  _task_valid_id "$id" || jig_fail usage "task artifact: invalid task id: $id"
+  _task_artifact_writable_kind "$kind" \
+    || jig_fail usage "task artifact: unknown kind: $kind (one of: $_TASK_ARTIFACT_KINDS)"
+  root=$(_task_workspace_root "$id" "task artifact") || return 1
+  _task_artifact_locate "$root" "$kind"
+  case "$_TASK_ART_STATE" in
+    present | empty) ;;
+    missing) jig_fail not-found "task artifact: $id has no $kind" ;;
+    *) jig_die "task artifact: $kind of $id is unavailable ($_TASK_ART_REASON)" ;;
+  esac
+  if [ "$as_json" != 1 ]; then
+    cat "$_TASK_ART_PATH"
+    return 0
+  fi
+  _task_artifact_stat
+  # The sentinel keeps the trailing newlines $(...) would strip.
+  content=$(cat "$_TASK_ART_PATH" && printf x) || jig_die "task artifact: cannot read $kind of $id"
+  content=${content%x}
+  local out
+  json_quote "$id"; out="{\"task\":$_JSON,\"kind\":\"$kind\","
+  json_str_or_null "$_TASK_ART_AT"; out="$out\"updated_at\":$_JSON,"
+  json_int_or_null "$_TASK_ART_BYTES"; out="$out\"bytes\":$_JSON,"
+  json_quote "$content"
+  printf '%s"content":%s}\n' "$out" "$_JSON"
+}
+
+# _task_artifact_read_json <args...> — the producer json_run runs for
+# `task artifact … --json`: `--json` goes with `read` only.
+_task_artifact_read_json() {
+  local arg args=()
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  set -- ${args[@]+"${args[@]}"}
+  jig_require_init
+  [ "${1:-}" = read ] || jig_fail usage "task artifact: --json goes with read only"
+  shift
+  [ $# -eq 2 ] || jig_fail usage "$(_task_usage artifact)"
+  case "$1$2" in -*) jig_fail usage "$(_task_usage artifact)" ;; esac
+  _task_artifact_read 1 "$1" "$2"
+}
+
 # --- artifact writes (ADR-0029: a worktree never writes through the link) ----
 
 # The kinds `task artifact` will write. Wider than _task_artifact_kind above,
@@ -5424,8 +5662,10 @@ task_artifacts() {
 #     kept is broken. They are inputs to nothing `task artifacts` reports.
 # The two predicates stay separate on purpose — widening the `--provided`
 # vocabulary would let a caller claim an input that is never an input.
+_TASK_ARTIFACT_KINDS="task discovery spec alternatives design plan review verification handoff knowledge-map commit-message pr-body"
 _task_artifact_writable_kind() {
-  case "$1" in task | discovery | spec | alternatives | design | plan | review | verification | handoff | knowledge-map | commit-message | pr-body) return 0 ;; *) return 1 ;; esac
+  case "$1" in '' | *[!a-z-]*) return 1 ;; esac
+  case " $_TASK_ARTIFACT_KINDS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
 
 # task_artifact write|append <id> <kind> [--from <file>|-]
@@ -5457,12 +5697,27 @@ _task_artifact_writable_kind() {
 # where a `{{TASK_ID}}` is text and not a placeholder. The duplication between
 # the two is one `mv`, and deliberate.
 task_artifact() {
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _task_artifact_read_json "$@"
+      return
+    fi
+  done
   jig_require_init
   [ $# -ge 1 ] || jig_die "$(_task_usage artifact)"
   local mode="$1"
   shift
   case "$mode" in
     write | append) ;;
+    read)
+      [ $# -eq 2 ] || jig_die "$(_task_usage artifact)"
+      case "$1$2" in -*) jig_die "$(_task_usage artifact)" ;; esac
+      _task_artifact_read 0 "$1" "$2"
+      return
+      ;;
     *) jig_die "$(_task_usage artifact)" ;;
   esac
   [ $# -ge 2 ] || jig_die "$(_task_usage artifact)"
@@ -5480,7 +5735,7 @@ task_artifact() {
     esac
   done
   _task_artifact_writable_kind "$kind" \
-    || jig_die "task artifact: unknown kind: $kind (one of: task discovery spec alternatives design plan review verification handoff knowledge-map commit-message pr-body)"
+    || jig_die "task artifact: unknown kind: $kind (one of: $_TASK_ARTIFACT_KINDS)"
 
   # Validated before the workspace is touched, so an unreadable source never
   # gets as far as the temporary file (task_new --from does the same).
@@ -5841,6 +6096,9 @@ task_ship() {
   [ "$has_message" -eq 1 ] || jig_die "task ship: --message-file is required"
   [ -f "$message_file" ] || jig_die "task ship: --message-file: no such file: $message_file"
   [ -z "$body_file" ] || [ -f "$body_file" ] || jig_die "task ship: --body-file: no such file: $body_file"
+  # The files as given, before any copy below replaces them: wherever they
+  # sit, they are the ship's inputs and never part of the change it stages.
+  local inputs_msg="$message_file" inputs_body="$body_file"
 
   local dir
   dir=$(task_dir "$id")
@@ -5926,8 +6184,9 @@ EOF
   # apart, "stopped at push" alone would not say whose setting stopped it.
   printf 'task ship: git level %s (%s)\n' "$level" "$key"
 
+  jig_ship_stage_tracked "task ship" "$inputs_msg" "$inputs_body"
   jig_ship_check_staged "task ship"
-  jig_ship_commit "task ship" "$message_file"
+  jig_ship_commit "task ship" "$message_file" "$inputs_msg" "$inputs_body"
 
   # Before the first step that leaves this machine (common.sh, "what a ship
   # may send out"). Asked here rather than just before the push: "this branch

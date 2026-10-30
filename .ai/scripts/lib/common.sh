@@ -389,6 +389,18 @@ jig_global_executable() {
   printf '%s\n' "$path"
 }
 
+# jig_global_source — the global framework: the checkout behind
+# jig_global_executable, physical, without the trailing /scripts/jig. Fails,
+# printing nothing, when there is none. The one answer to "which Jig is on this
+# machine" that `status`, `self-update` and `upgrade` share, and what a
+# manifest's `jig.source: global` names on whichever machine reads it
+# (adr-20261029-the-manifest-names-the-global-framework-not-its-path).
+jig_global_source() {
+  local exe
+  exe=$(jig_global_executable) || return 1
+  printf '%s\n' "${exe%/scripts/jig}"
+}
+
 # --- directory links ----------------------------------------------------------
 
 # How this machine links one directory to another: symlink, junction or none.
@@ -566,7 +578,10 @@ _JIG_TS_FOUND=0
 # jig_read_snapshot_begin / jig_read_snapshot_end — open and close the read
 # path's snapshot: task state, the queue's lines and the configuration are
 # read once per process in between. Only a command that writes nothing in
-# between opens one.
+# between opens one. A snapshot holds one project: its caches are keyed by task
+# id and config key, not by JIG_PROJECT, so nothing on the read path may switch
+# JIG_PROJECT while a snapshot is open (as _task_touched_in does for another
+# checkout); such a read must run outside it or in a subshell of its own.
 jig_read_snapshot_begin() {
   jig_task_state_forget
   _jig_queue_cache_drop
@@ -1041,15 +1056,24 @@ jig_forge_kind() {
 # array, so it is split into one object per line first: a greedy `.*` across
 # the whole line would keep only the last merge request. Each field is taken
 # at its first occurrence, whatever the key order: nested objects (author,
-# assignees) carry a `state` of their own, later on. Housekeeping and
+# assignees) carry a `state` of their own, later on. A key written
+# `<key>@<text>` takes the first occurrence whose value contains <text>
+# instead: an object's `web_url` comes after its author's. Housekeeping and
 # jig_ship_pr both read `glab` through this, so they cannot disagree on it.
 jig_glab_fields() {
   sed 's/},[[:space:]]*{/}\
 {/g' | awk -v keys="$*" '
-    function field(key,   k) {
+    function field(key,   k, need, rest, v) {
+      need = ""
+      if (index(key, "@")) { need = substr(key, index(key, "@") + 1); key = substr(key, 1, index(key, "@") - 1) }
       k = "\"" key "\":\""
-      if (!match($0, k "[^\"]*\"")) return ""
-      return substr($0, RSTART + length(k), RLENGTH - length(k) - 1)
+      rest = $0
+      while (match(rest, k "[^\"]*\"")) {
+        v = substr(rest, RSTART + length(k), RLENGTH - length(k) - 1)
+        if (need == "" || index(v, need)) return v
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+      return ""
     }
     BEGIN { n = split(keys, want, " ") }
     {
@@ -1111,8 +1135,73 @@ $bad"
   fi
 }
 
-# jig_ship_commit <who> <message-file> — commit the index as it is: only what
-# is staged, never `-a`; hooks run, never --no-verify.
+# _jig_ship_abs <file> — <file> as an absolute path with symlinks resolved in
+# its directory, so a file named through /tmp and through /private/tmp compare
+# equal; empty when its directory does not exist.
+_jig_ship_abs() {
+  local d
+  d=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || return 0
+  printf '%s/%s\n' "$d" "$(basename "$1")"
+}
+
+# jig_ship_untracked [<file>...] — the files git neither tracks nor ignores,
+# one per line, leaving out .ai/workspace/, .ai/runtime/ and each <file>
+# given: the commit message and the pull request's body are inputs to the
+# ship, not part of the change, wherever the caller happened to write them.
+jig_ship_untracked() {
+  local root p abs f skip
+  root=$(cd "$JIG_PROJECT" && pwd -P)
+  git -C "$JIG_PROJECT" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in
+      "$JIG_AI_DIR/workspace" | "$JIG_AI_DIR/workspace/"* | "$JIG_AI_DIR/runtime" | "$JIG_AI_DIR/runtime/"*) continue ;;
+    esac
+    abs="$root/$p"
+    skip=0
+    for f in "$@"; do
+      [ -n "$f" ] || continue
+      [ "$abs" != "$(_jig_ship_abs "$f")" ] || skip=1
+    done
+    [ "$skip" -eq 1 ] || printf '%s\n' "$p"
+  done
+}
+
+# jig_ship_stage_tracked <who> [<file>...] — when nothing is staged, stage the
+# change for the caller
+# (adr-20261029-task-ship-stages-tracked-changes-and-refuses-new-files).
+#
+# An empty index at ship time is an agent that forgot `git add`, not a choice
+# to ship nothing, and refusing it only sends the agent round to stage and run
+# again. So the tracked files' changes are staged here, as `git commit -a`
+# would: no new path enters history that way, only new content of files the
+# repository already holds. New files are where staging on the agent's behalf
+# would cost the most — a secret or a scratch file pushed to the forge is not
+# taken back — so any new file that is not ignored refuses, before anything
+# is staged, naming each one; the <file>s (message and body) do not count.
+# .ai/workspace/ and .ai/runtime/ are never staged (RULES.md). With something
+# already staged it does nothing: that index is the caller's choice.
+jig_ship_stage_tracked() {
+  local who="$1" untracked staged
+  shift
+  [ -z "$(jig_ship_staged)" ] || return 0
+  untracked=$(jig_ship_untracked "$@")
+  if [ -n "$untracked" ]; then
+    jig_die "$who: nothing is staged, and these files are not tracked by git:
+$untracked
+A new file is never staged for you: stage the ones that belong to the change (git add <path>), ignore or remove the rest, and run again."
+  fi
+  git -C "$JIG_PROJECT" add -u -- . \
+    ":(exclude)$JIG_AI_DIR/workspace" ":(exclude)$JIG_AI_DIR/runtime" \
+    || jig_die "$who: git add -u failed"
+  staged=$(jig_ship_staged)
+  [ -z "$staged" ] || printf '%s: nothing was staged; staged the tracked changes:\n%s\n' "$who" "$staged"
+}
+
+# jig_ship_commit <who> <message-file> [<file>...] — commit the index as it
+# is: only what is staged, never `-a`; hooks run, never --no-verify. What a
+# non-empty index leaves out — tracked changes and new files, but not the
+# message or the <file>s — is named in a warning: the commit is what the
+# caller staged, and a file left out of it should be visible, not silent.
 #
 # An empty index used to be an outcome rather than a question: the step
 # printed `nothing staged; no commit` and the ship carried on. That is right
@@ -1124,15 +1213,21 @@ $bad"
 # reads as a failure afterwards — at `agent.git: merge` a pull request without
 # the change has nothing to make CI red, so it goes green and merges itself.
 # So it is a refusal here, before the commit step returns, and not a line in
-# the log. Untracked files are warned about, not refused: a scratch file, the
-# commit message itself or a build artefact is nobody's shipped change, and a
-# refusal on those is one every caller would learn to work around.
+# the log. Untracked files are warned about here, not refused: a scratch file
+# or a build artefact is nobody's shipped change. `task ship` reaches this
+# point with an empty index only when jig_ship_stage_tracked found nothing to
+# stage and no new file, so the refusal is `spec ship`'s.
 jig_ship_commit() {
   local who="$1" message_file="$2" unstaged untracked
+  shift 2
   if [ -n "$(jig_ship_staged)" ]; then
     git -C "$JIG_PROJECT" commit -F "$message_file" >/dev/null \
       || jig_die "$who: git commit failed"
     printf 'committed %s\n' "$(git -C "$JIG_PROJECT" rev-parse --short HEAD)"
+    unstaged=$( { git -C "$JIG_PROJECT" diff --name-only 2>/dev/null
+                  jig_ship_untracked "$message_file" "$@"; } | sed '/^$/d')
+    [ -z "$unstaged" ] || jig_warn "$who: these changes are not part of this commit; stage them and ship again if they belong to it:
+$unstaged"
     return 0
   fi
   unstaged=$(git -C "$JIG_PROJECT" diff --name-only 2>/dev/null | sed '/^$/d')
@@ -1141,7 +1236,7 @@ jig_ship_commit() {
 $unstaged
 Shipping now would carry whatever the branch already holds and leave the change behind. Stage it and run again."
   fi
-  untracked=$(git -C "$JIG_PROJECT" ls-files --others --exclude-standard 2>/dev/null | sed '/^$/d')
+  untracked=$(jig_ship_untracked "$message_file" "$@")
   [ -z "$untracked" ] || jig_warn "$who: nothing is staged, and these files are not tracked by git:
 $untracked"
   printf 'nothing staged; no commit\n'
@@ -3302,6 +3397,13 @@ jig_verify_busy_ttl() {
 # output line by line and skips what is not numeric. This reads one file, so it
 # checks the value it got instead.
 _jig_verify_busy_mtime() {
+  jig_file_mtime "$1"
+}
+
+# jig_file_mtime <file> — the file's mtime in seconds since the epoch, or
+# nothing (status 1). The BSD-then-GNU pair, chosen on the value and never on
+# the exit status, for the reason _jig_verify_busy_mtime's comment above gives.
+jig_file_mtime() {
   local out
   out=$(stat -f '%m' "$1" 2>/dev/null) || out=""
   case "$out" in
@@ -3311,6 +3413,20 @@ _jig_verify_busy_mtime() {
     '' | *[!0-9]*) return 1 ;;
   esac
   printf '%s\n' "$out"
+}
+
+# jig_utc_from_epoch <seconds> — the time as UTC `YYYY-MM-DDTHH:MM:SSZ`, or
+# nothing (status 1). GNU `date -d @<n>` first: GNU's `-r` takes a file, so
+# the BSD form tried first would read a file that happens to be named <n>.
+jig_utc_from_epoch() {
+  local out
+  case "$1" in '' | *[!0-9]*) return 1 ;; esac
+  out=$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
+    || out=$(date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || out=""
+  case "$out" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) printf '%s\n' "$out" ;;
+    *) return 1 ;;
+  esac
 }
 
 # _jig_verify_busy_value <file> <key> — the first `<key>: <value>` line, read by the

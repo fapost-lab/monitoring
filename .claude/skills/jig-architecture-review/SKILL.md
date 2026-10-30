@@ -57,7 +57,7 @@ rather than resolving it yourself.
 
 A re-review starts from `jig task receipt <id> --since-review`, as
 [jig-review](../jig-review/SKILL.md) §5 says: on `narrow`, check the five things against the
-interdiff and the `fixed` findings instead of loading the whole change; on `full`, start from §1.
+interdiff, any knowledge diff it prints and the `fixed` findings instead of loading the whole change; on `full`, start from §1.
 Its receipt is `--stage architecture-review` again.
 
 Then hand the ADR candidates to `jig-consolidate`.

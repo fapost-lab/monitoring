@@ -211,7 +211,7 @@ _upgrade_same_dir() {
 _upgrade_records_source() {
   local recorded
   [ "$2" = 0 ] || return 0
-  recorded=$(manifest_source)
+  recorded=$(manifest_source 2>/dev/null) || recorded=""
   _upgrade_same_dir "$1" "$recorded"
 }
 
@@ -244,11 +244,82 @@ _upgrade_summary() {
 # another checkout, and the command that does change it. `init` is that
 # command: choosing where a project's framework comes from is an install
 # decision, and `upgrade` only carries an existing install forward.
+#
+# Silent when the recorded source is not a directory on this machine: then it
+# is most likely another person's install path in a committed manifest, which
+# is no checkout to stay on, and printing it would put a foreign path in this
+# run's report. The first upgrade that places a file replaces it
+# (adr-20261029-the-manifest-names-the-global-framework-not-its-path).
 _upgrade_kept_source_note() {
-  local source="$1" link_flag=""
+  local source="$1" link_flag="" recorded
+  recorded=$(manifest_source 2>/dev/null) || recorded=""
+  [ -n "$recorded" ] && [ -d "$recorded" ] || return 0
   if [ "$2" = link ]; then link_flag=" --link"; fi
-  _upgrade_note warn "nothing was placed from $source, so this project stays installed from $(manifest_source)" \
+  _upgrade_note warn "nothing was placed from $source, so this project stays installed from $recorded" \
     "to install it from that checkout instead, run \`jig init$link_flag --from $source\`"
+}
+
+# upgrade_source — the framework checkout a plain `jig upgrade` (no --from)
+# reads from on this machine, or nothing (exit 1) when there is none:
+#
+#   1. the checkout this jig runs from (jig_source_root): link mode, the
+#      global jig itself, a handed-off run;
+#   2. the source the manifest records, when it is a framework checkout here —
+#      "." is this project and "global" is already this machine's global
+#      framework (manifest_source);
+#   3. the global framework (jig_global_source): the Jig `jig status` compares
+#      this project with and `jig self-update` moves — but only when it is not
+#      older than this install (_upgrade_global_usable). An older global jig
+#      is no source for this project: reading from it would plan a downgrade,
+#      count it as pending, and have `jig verify` ask for it (ADR-0017).
+#
+# The recorded checkout is asked before the global one so that a project
+# somebody deliberately installed from another checkout keeps upgrading from
+# it while it exists; what changes is only the case that used to die — a
+# recorded path from another machine, or a checkout since deleted
+# (adr-20261029-the-manifest-names-the-global-framework-not-its-path).
+#
+# The age check applies whichever step reached the global framework: a
+# recorded "global" (or a recorded path that is this machine's global jig) is
+# the same checkout as step 3, and an older one is no source either way.
+upgrade_source() {
+  local src global
+  src=$(jig_source_root)
+  if [ -z "$src" ]; then
+    src=$(manifest_source 2>/dev/null) || src=""
+    if [ -n "$src" ] && ! jig_is_source_root "$src"; then src=""; fi
+    global=$(jig_global_source 2>/dev/null) || global=""
+    [ -n "$src" ] || src="$global"
+    if [ -n "$src" ] && _upgrade_same_dir "$src" "$global" \
+       && ! _upgrade_global_usable "$src"; then
+      src=""
+    fi
+  fi
+  [ -n "$src" ] || return 1
+  printf '%s\n' "$src"
+}
+
+# _upgrade_global_usable <global-source> — whether the global framework may
+# stand in for a recorded source that is not here: false only when both it and
+# this install declare release versions and it is the older. Anything it
+# cannot compare is allowed, as `--from` would be.
+_upgrade_global_usable() {
+  local global_v project_v
+  global_v=$(jig_declared_version "$1") || return 0
+  project_v=$(manifest_header_get jig.version) || return 0
+  ! jig_version_newer "$project_v" "$global_v"
+}
+
+# _upgrade_no_source_message — why a plain upgrade found nothing to read from,
+# naming where it looked and never the path the manifest records.
+_upgrade_no_source_message() {
+  local global
+  global=$(jig_global_source 2>/dev/null) || global=""
+  if [ -n "$global" ]; then
+    printf '%s\n' "upgrade: cannot determine the framework source root: the global jig ($(jig_declared_version "$global" 2>/dev/null || printf '?')) is older than this project ($(manifest_header_get jig.version)); run \`jig self-update\`, or pass --from <dir>"
+  else
+    printf '%s\n' "upgrade: cannot determine the framework source root: this jig is not a framework checkout, no global jig is on PATH, and the source the manifest records is not on this machine; install Jig or pass --from <dir>"
+  fi
 }
 
 # _upgrade_config_note <dry-run> — after a real run, one line when the
@@ -795,7 +866,10 @@ _upgrade_link() {
   if _upgrade_records_source "$source" "$created_count"; then
     record_source="$source"
   elif [ "$reconciled_count" != 0 ]; then
-    record_source=$(manifest_source)
+    # "global" on a machine without one resolves to nothing: keep the value
+    # as recorded rather than lose the reconciled record with it.
+    record_source=$(manifest_source 2>/dev/null) \
+      || record_source=$(manifest_header_get jig.source)
   fi
 
   if [ -n "$record_source" ]; then
@@ -1046,14 +1120,14 @@ EOF
 }
 
 # _upgrade_custom_profiles — active profile names (profiles_active) that are
-# not part of the project's recorded source (manifest_source): a profile
+# not part of the checkout a plain upgrade reads from (upgrade_source): a profile
 # somebody wrote themselves rather than one the framework ships. `generic` is
 # never included: it is the framework's own fallback and already declares
 # `verifies: nothing`. Silent (prints nothing) when the source cannot be
 # read, rather than guessing.
 _upgrade_custom_profiles() {
   local source p
-  source=$(manifest_source 2>/dev/null) || source=""
+  source=$(upgrade_source) || source=""
   [ -n "$source" ] || return 0
   for p in $(profiles_active); do
     [ "$p" != generic ] || continue
@@ -1305,14 +1379,27 @@ _UPGRADE_J_STOPS=""
 # producer of json_run (conventions/json-output.md); the text it prints goes to
 # stderr unchanged.
 cmd_upgrade() {
-  local a json=0
+  local a json=0 land=0
   local -a rest=()
   for a in "$@"; do
     case "$a" in
       --json) json=1 ;;
+      --land) land=1; rest+=("$a") ;;
       *) rest+=("$a") ;;
     esac
   done
+  # `--land` brings a merged upgrade here (_upgrade_land_run); no source is
+  # read, so nothing is handed to a newer jig.
+  if [ "$land" = 1 ]; then
+    if [ "$json" = 0 ]; then
+      _upgrade_land_run "$@"
+      return
+    fi
+    # shellcheck source=lib/json.sh
+    . "$JIG_LIB/json.sh"
+    json_run _upgrade_land_json_body "${rest[@]}"
+    return
+  fi
   if [ "$json" = 0 ]; then
     _upgrade_run "$@"
     return
@@ -1408,11 +1495,9 @@ _upgrade_run() {
     [ -d "$from" ] || jig_die "upgrade: --from directory does not exist: $from"
     source=$(cd "$from" && pwd)
   else
-    source=$(jig_source_root)
-    [ -n "$source" ] || source=$(manifest_source)
-  fi
-  if [ -z "$source" ] || [ ! -d "$source" ]; then
-    jig_die "upgrade: cannot determine the framework source root; pass --from <dir>"
+    # Where it looked, never what the manifest records: that may be another
+    # machine's path, meaningless here.
+    source=$(upgrade_source) || jig_die "$(_upgrade_no_source_message)"
   fi
   jig_is_source_root "$source" \
     || jig_die "upgrade: not a framework source root (missing skills/, templates/ or scripts/jig): $source"
@@ -1605,4 +1690,250 @@ upgrade_pending() {
 
   printf '%s\n' "$out" | grep -E '^(install|link|replace) ' || true
   return 0
+}
+
+# --- jig upgrade --land ------------------------------------------------------
+#
+# An upgrade that ended in a pull request (agent.git: pr, or a merge Jig left
+# to the person) leaves this checkout on the base branch at the old Jig, with
+# the upgrade's branch still here. Once the forge has merged it, `--land` is
+# the step that brings it here: back on git.base_branch, fetched, fast-forwarded
+# to origin's, and the upgrade's branch let go the way Jig lets go of a branch
+# after a merge it made itself (jig_ship_leave). It asks the forge, because
+# only the forge knows whether the pull request is merged; it never stashes,
+# never forces, and changes nothing when anything stands in its way.
+
+# What --land did, for its `--json` data (_upgrade_land_json_data).
+_UPGRADE_L_OUTCOME=""
+_UPGRADE_L_FROM=""
+_UPGRADE_L_TO=""
+_UPGRADE_L_BASE=""
+_UPGRADE_L_BRANCH=""
+_UPGRADE_L_URL=""
+_UPGRADE_L_COMMIT=""
+_UPGRADE_L_LEVEL=""
+_UPGRADE_L_DELETED=0
+_UPGRADE_L_DELETED_ORIGIN=0
+
+# _upgrade_land_prs <forge> <base> — the forge's pull requests from Jig's
+# upgrade branches into <base>, newest first, one line each:
+#   <head><TAB><state><TAB><head-commit><TAB><url>
+# <state> open|merged|closed. Exit 1 when the forge did not answer.
+_upgrade_land_prs() {
+  local forge="$1" base="$2" rows
+  case "$forge" in
+    github)
+      rows=$(gh pr list --state all --base "$base" --limit 100 \
+        --json headRefName,state,headRefOid,url \
+        --jq '.[] | "\(.headRefName)\t\(.state)\t\(.headRefOid)\t\(.url)"' 2>/dev/null) || return 1
+      ;;
+    gitlab)
+      rows=$(glab mr list --all --target-branch "$base" --output json 2>/dev/null \
+        | jig_glab_fields source_branch state sha web_url@/merge_requests/) || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$rows" | awk -F '\t' '
+    index($1, "jig/upgrade-") == 1 && length($1) > 12 {
+      s = tolower($2)
+      if (s == "opened") s = "open"
+      if (s == "locked") s = "closed"
+      if (s != "open" && s != "merged" && s != "closed") next
+      print $1 "\t" s "\t" $3 "\t" $4
+    }'
+}
+
+# _upgrade_land_version <ref> — the Jig version the manifest records at <ref>;
+# nothing when <ref> or its manifest does not exist.
+_upgrade_land_version() {
+  jig_git_show_path "$1" "$JIG_AI_DIR/manifest" 2>/dev/null \
+    | sed -n 's/^jig\.version:[[:space:]]*//p' | head -n 1 || true
+}
+
+# _upgrade_land_to <branch> — the version `jig/upgrade-<to>[-<n>]` is named
+# for; nothing when the name holds no release version.
+_upgrade_land_to() {
+  local v="${1#"$_UPGRADE_BRANCH_PREFIX"}"
+  if jig_release_version "v$v" >/dev/null 2>&1; then
+    printf '%s\n' "$v"
+    return 0
+  fi
+  jig_release_version "v${v%-*}" 2>/dev/null || true
+}
+
+# _upgrade_land_run [--quiet] — `jig upgrade --land`.
+_upgrade_land_run() {
+  local quiet=0 a base forge prs cur have line head st sha url to pick="" open_url="" open_head=""
+  local reasons="" tracked leave level
+  for a in "$@"; do
+    case "$a" in
+      --land) ;;
+      --quiet) quiet=1 ;;
+      *) jig_fail usage "upgrade: --land takes no other argument: $a" ;;
+    esac
+  done
+  jig_require_init
+  # shellcheck source=lib/manifest.sh
+  . "$JIG_LIB/manifest.sh"
+  base=$(cfg git.base_branch main)
+  _UPGRADE_L_BASE=$base
+  git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1 \
+    || jig_die "upgrade --land: no remote named origin, so there is no pull request to bring here; nothing was changed"
+  forge=$(jig_forge_kind) || exit 1
+  [ "$forge" != none ] \
+    || jig_die "upgrade --land: no GitHub or GitLab CLI is signed in here, so whether the upgrade was merged cannot be asked; nothing was changed"
+  prs=$(_upgrade_land_prs "$forge" "$base") \
+    || jig_die "upgrade --land: the forge did not answer; nothing was changed"
+  jig_fetch_branches "upgrade" "$base"
+  have=$(_upgrade_land_version "refs/heads/$base")
+  cur=$(_upgrade_current_branch)
+
+  # Which upgrade to land: the newest merged one that has something left to
+  # do here — its version not on the base here yet, or its branch still here.
+  # Standing on an upgrade branch, only that branch's own pull request.
+  while IFS="$(printf '\t')" read -r head st sha url; do
+    [ -n "$head" ] || continue
+    jig_branch_is_jigs "$head" || continue
+    case "$cur" in
+      "$_UPGRADE_BRANCH_PREFIX"*) [ "$head" = "$cur" ] || continue ;;
+    esac
+    case "$st" in
+      open)
+        if [ -z "$open_head" ]; then open_head=$head; open_url=$url; fi
+        ;;
+      merged)
+        to=$(_upgrade_land_to "$head")
+        if [ "$cur" = "$head" ] \
+           || git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$head" \
+           || { [ -n "$to" ] && { [ -z "$have" ] || jig_version_newer "$to" "$have"; }; }; then
+          pick="$head	$sha	$url"
+          break
+        fi
+        ;;
+    esac
+  done <<PRS
+$prs
+PRS
+
+  if [ -z "$pick" ]; then
+    if [ -n "$open_head" ]; then
+      jig_fail not-merged "upgrade --land: the pull request of $open_head is not merged yet${open_url:+ ($open_url)}; merge it, then run \`jig upgrade --land\` again. Nothing was changed"
+    fi
+    _UPGRADE_L_OUTCOME=nothing-to-do
+    _UPGRADE_L_FROM=$have
+    _UPGRADE_L_TO=$have
+    _upgrade_out "upgrade: no merged upgrade waits to be brought here"
+    return 0
+  fi
+  IFS="$(printf '\t')" read -r head sha url <<PICK
+$pick
+PICK
+  case "$sha" in '' | *[!0-9a-f]*) sha="" ;; esac
+  case "$url" in '' | null | -) url="" ;; esac
+  _UPGRADE_L_BRANCH=$head
+  _UPGRADE_L_URL=$url
+
+  # Everything that stands in the way, all at once, before anything moves.
+  tracked=$(git -C "$JIG_PROJECT" status --porcelain 2>/dev/null | grep -v '^??' || true)
+  if [ -n "$tracked" ]; then
+    reasons="${reasons}the working tree has uncommitted changes; commit them or finish the task they belong to, then run \`jig upgrade --land\` again
+"
+  fi
+  if [ "$cur" != "$base" ] && [ "$cur" != "$head" ]; then
+    reasons="${reasons}this checkout is on ${cur:-a detached HEAD}, not on $base or $head; switch to $base (\`git checkout $base\`), then run \`jig upgrade --land\` again
+"
+  elif [ "$cur" != "$base" ] && jig_branch_checked_out "$base"; then
+    reasons="${reasons}$base is checked out in another worktree; run \`jig upgrade --land\` there
+"
+  fi
+  if ! git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$base" >/dev/null 2>&1; then
+    reasons="${reasons}origin/$base is not known here (the fetch failed, or origin has no $base); check the remote, then run \`jig upgrade --land\` again
+"
+  elif git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base" >/dev/null 2>&1 \
+       && ! git -C "$JIG_PROJECT" merge-base --is-ancestor "refs/heads/$base" "refs/remotes/origin/$base" 2>/dev/null; then
+    reasons="${reasons}$base here has commits origin/$base does not have, so it cannot be fast-forwarded; push or reconcile them, then run \`jig upgrade --land\` again
+"
+  else
+    # The forge said merged, but origin/<base> here is only as new as the last
+    # fetch that worked (jig_fetch_branches only warns): without the version
+    # the branch is named for, landing would report the old Jig as landed
+    # and let the branch go.
+    to=$(_upgrade_land_to "$head")
+    if [ -n "$to" ]; then
+      a=$(_upgrade_land_version "refs/remotes/origin/$base")
+      if [ -z "$a" ] || jig_version_newer "$to" "$a"; then
+        reasons="${reasons}origin/$base here does not record Jig $to yet (the fetch failed, or the merge has not reached it); check the remote, then run \`jig upgrade --land\` again
+"
+      fi
+    fi
+  fi
+  if [ -n "$reasons" ]; then
+    jig_fail upgrade-blocked "upgrade --land: nothing was changed:
+$(printf '%s' "$reasons" | sed 's/^/  - /')"
+  fi
+
+  _UPGRADE_L_FROM=$have
+  if [ "$cur" != "$base" ]; then
+    git -C "$JIG_PROJECT" checkout -q "$base" >/dev/null 2>&1 \
+      || jig_die "upgrade --land: could not switch to $base; you are still on $cur"
+  fi
+  git -C "$JIG_PROJECT" merge --ff-only -q "refs/remotes/origin/$base" >/dev/null 2>&1 \
+    || jig_die "upgrade --land: on $base, which could not be fast-forwarded to origin/$base"
+  _UPGRADE_L_COMMIT=$(git -C "$JIG_PROJECT" rev-parse HEAD 2>/dev/null || true)
+  _UPGRADE_L_TO=$(_upgrade_land_version HEAD)
+  _UPGRADE_L_OUTCOME=landed
+  _upgrade_out "upgrade: landed $head${url:+ ($url)}; on $base at ${_UPGRADE_L_COMMIT:0:12}, Jig ${_UPGRADE_L_TO:-unknown}"
+
+  # Origin is shared: its copy of the branch goes only for a person whose
+  # agent may push, as in housekeeping's sweep; without the merged head the
+  # local branch alone is let go, and only if git sees its work merged.
+  level=$(jig_agent_git 2>/dev/null) || level=none
+  _UPGRADE_L_LEVEL=$level
+  case "$level" in
+    push | pr | merge) ;;
+    *) sha="" ;;
+  esac
+  # shellcheck disable=SC2034 # read by jig_ship_leave (common.sh)
+  JIG_SHIP_MERGED=1
+  leave=$(jig_ship_leave "upgrade" "$head" "$base" "$sha")
+  if [ -n "$leave" ]; then
+    _upgrade_out "$leave"
+    jig_has_line "upgrade: deleted branch $head" "$leave" && _UPGRADE_L_DELETED=1
+    jig_has_line "upgrade: deleted branch $head on origin" "$leave" && _UPGRADE_L_DELETED_ORIGIN=1
+  fi
+  if [ "$_UPGRADE_L_DELETED" = 0 ] && ! git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$head"; then
+    _UPGRADE_L_DELETED=1
+  fi
+  return 0
+}
+
+# _upgrade_land_json_body … — the producer of `jig upgrade --land --json`: the
+# text on stderr, then the data on what was stdout.
+_upgrade_land_json_body() {
+  exec 3>&1 1>&2
+  _upgrade_land_run "$@"
+  _upgrade_land_json_data >&3
+}
+
+# _upgrade_land_json_data — the data object, in the shape of `jig upgrade
+# --json` with `land` beside it (schemas/json.md, `jig upgrade --land --json`).
+_upgrade_land_json_data() {
+  local o mode
+  mode=$(manifest_header_get jig.mode 2>/dev/null || true)
+  json_str_or_null "$mode"; o="{\"mode\":$_JSON,\"dry_run\":false"
+  json_str_or_null "$_UPGRADE_L_FROM"; o="$o,\"from\":$_JSON"
+  json_str_or_null "$_UPGRADE_L_TO"; o="$o,\"to\":$_JSON"
+  json_quote "$_UPGRADE_L_OUTCOME"; o="$o,\"outcome\":$_JSON,\"files\":null"
+  if [ "$_UPGRADE_L_OUTCOME" = landed ]; then
+    json_quote "$_UPGRADE_L_LEVEL"; o="$o,\"git\":{\"level\":$_JSON"
+    json_quote "$_UPGRADE_L_BRANCH"; o="$o,\"branch\":$_JSON"
+    json_str_or_null "$_UPGRADE_L_COMMIT"; o="$o,\"commit\":$_JSON,\"pushed\":true"
+    json_str_or_null "$_UPGRADE_L_URL"; o="$o,\"pull_request\":$_JSON,\"merged\":true}"
+    json_quote "$_UPGRADE_L_BASE"; o="$o,\"land\":{\"base\":$_JSON"
+    json_bool "$( [ "$_UPGRADE_L_DELETED" = 1 ] && printf true )"; o="$o,\"branch_deleted\":$_JSON"
+    json_bool "$( [ "$_UPGRADE_L_DELETED_ORIGIN" = 1 ] && printf true )"; o="$o,\"origin_branch_deleted\":$_JSON}"
+  else
+    o="$o,\"git\":null,\"land\":null"
+  fi
+  printf '%s\n' "$o,\"manual_steps\":[],\"would_stop\":[]}"
 }

@@ -324,8 +324,10 @@ _doctor_check_upgrade() {
     return 0
   fi
   # upgrade_pending returned 0, so its dry run resolved the source root; a
-  # source that cannot be read at all lands in the fail branch above.
-  src=$(manifest_source 2>/dev/null) || src=""
+  # source that cannot be read at all lands in the fail branch above. Named
+  # as the dry run found it (upgrade_source), not as the manifest records it:
+  # the record may be another machine's path.
+  src=$(upgrade_source 2>/dev/null) || src=""
   if [ "$version_state" = current ] && [ -n "$src" ]; then
     _doctor_warn "upgrade check" \
       "$n pending item(s) although the version is the same ($version_project): pending measures this install against its source, $src" \

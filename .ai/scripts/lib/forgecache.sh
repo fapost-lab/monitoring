@@ -6,11 +6,13 @@
 #
 #   .ai/runtime/forge-cache, one line per pull request, newest first as the
 #   forge listed them:
-#     <head><TAB><base><TAB><state><TAB><ci><TAB><fetched_at>
+#     <head><TAB><base><TAB><state><TAB><ci><TAB><fetched_at><TAB><head-commit><TAB><url>
 #   <state> open|merged|closed; <ci> green|red|pending|none, `-` when it was
 #   not asked (a pull request that is not open, a forge that does not list it);
-#   <fetched_at> UTC, when the forge said so. Lines starting with `#` are
-#   comments.
+#   <fetched_at> UTC, when the forge said so; <head-commit> and <url> the pull
+#   request's head and address, `-` when the forge did not say. A line written
+#   before the last two columns existed ends at <fetched_at> and reads as if
+#   both were `-`. Lines starting with `#` are comments.
 #
 # The file lives in the runtime directory of the checkout that owns the task
 # workspaces: a worktree that borrows the owner's `tasks/` (ADR-0029) reads the
@@ -50,7 +52,7 @@ forgecache_write() {
   jig_cleanup_add "$tmp"
   mkdir -p "${file%/*}" 2>/dev/null || return 0
   {
-    printf '# jig forge cache: <head> <base> <state> <ci> <fetched_at>, written by jig housekeeping\n'
+    printf '# jig forge cache: <head> <base> <state> <ci> <fetched_at> <head-commit> <url>, written by jig housekeeping\n'
     [ -z "$rows" ] || printf '%s\n' "$rows"
   } > "$tmp" 2>/dev/null || return 0
   mv "$tmp" "$file" 2>/dev/null || return 0
@@ -94,9 +96,26 @@ forgecache_entry() {
   esac
   rest=${rest#*"$nl$head$t$base$t"}
   line=${rest%%"$nl"*}
-  IFS="$t" read -r _FORGECACHE_STATE _FORGECACHE_CI _FORGECACHE_AT <<EOF
+  IFS="$t" read -r _FORGECACHE_STATE _FORGECACHE_CI _FORGECACHE_AT _ <<EOF
 $line
 EOF
   [ "$_FORGECACHE_CI" != "-" ] || _FORGECACHE_CI=""
   return 0
+}
+
+# forgecache_upgrades <cache> <base> — the pull requests of Jig's own upgrade
+# branches (`jig/upgrade-*`) into <base>, from <cache> (forgecache_read's
+# output), the newest of each branch only, one line each:
+#   <head><TAB><state><TAB><fetched_at><TAB><url>
+# <url> is `-` when the cache does not know it. `jig status` reads an upgrade
+# still waiting for its merge from this.
+forgecache_upgrades() {
+  [ -n "$1" ] && [ -n "$2" ] || return 0
+  printf '%s\n' "$1" | awk -F '\t' -v base="$2" '
+    $2 == base && index($1, "jig/upgrade-") == 1 && length($1) > 12 && !($1 in seen) {
+      seen[$1] = 1
+      u = $7
+      if (u == "") u = "-"
+      print $1 "\t" $3 "\t" $5 "\t" u
+    }'
 }

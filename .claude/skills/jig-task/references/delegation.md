@@ -69,8 +69,8 @@ requirements, design, actual diff, applicable knowledge and the review skill. Co
 only when selected. The reviewer reports findings with severity, path, line and a
 reproducible reason; it does not edit code, ledger or receipt. The process cannot run Jig, so
 for a re-review the coordinator runs `jig task receipt <id> --since-review` itself and puts its
-verdict in the prompt: on `narrow`, the interdiff and the `fixed` findings in place of the actual
-diff; on `full`, the actual diff as for a first review.
+verdict in the prompt: on `narrow`, the interdiff, any knowledge diff and the `fixed` findings in
+place of the actual diff; on `full`, the actual diff as for a first review.
 
 The coordinator checks the process exit and denials, compares its reviewed diff with the
 current diff, enters every finding through `jig task finding`, and records the receipt
