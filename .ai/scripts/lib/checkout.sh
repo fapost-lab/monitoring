@@ -428,6 +428,11 @@ _jig_checkout_record_inner() {
   fi
   _jig_checkout_write "$runtime/checkout" "$body" || true
 
+  # Which task this session has taken, for the clone: written before the
+  # working record is named, because that naming may give up on a run that
+  # still works a task (one whose branch is checked out elsewhere).
+  _jig_checkout_take "$@" || true
+
   name=""
   if ! name=$(_jig_checkout_name_from_args "$head" "$@"); then
     if ! name=$(_jig_checkout_name_from_head "$head"); then
@@ -439,6 +444,168 @@ _jig_checkout_record_inner() {
   [ -d "$runtime/working" ] || mkdir -p "$runtime/working" 2>/dev/null || return 0
   _jig_checkout_write "$runtime/working/$name" "command: $*
 " || true
+  return 0
+}
+
+# --- taken: which session works which task, for the clone ----------------------
+#
+# `runtime/working/` answers "is this checkout busy", and only for this
+# checkout. `jig queue next` asks another question — has some other session
+# taken this task — from any worktree of the clone, and a record named by a
+# task cannot say which session wrote it. So a second record answers it
+# (adr-20261030-a-task-another-session-works-on-is-not-advised):
+#
+#   <clone root>/.ai/runtime/taken/<task-id>/<session-id>
+#
+# one file per task and session, in the clone's main checkout, found the way
+# the queue's own file is (jig_config_clone_root). Which session holds which
+# task is a fact about the clone, as the queue's order is (ADR-0008, the
+# per-clone runtime exception). The body is a flat record:
+#
+#   checkout: <the checkout the command ran in>
+#   since: <UTC, when this session took the task>
+#   command: <the words of the jig command>
+#
+# and the file's mtime is when the session was last active. The session id is
+# only a file name, compared with the caller's own id and never shown. Nothing
+# here is deleted: a record lapses after checkout.busy_ttl, as a working
+# record does.
+
+# _jig_checkout_works <command-words...> — the task this command works on, or
+# exit 1. Working a task is how a session takes it; there is no other way.
+# Reading about a task (`task show`, `route`, `findings`, `list`), filing it
+# (`task new`), ordering it (`queue set <id>`), shipping or closing it is not
+# taking it: a coordinator does all of those for tasks other sessions take.
+# The task is the first argument that is a valid id with a workspace, the
+# test rule 1 of the working record's naming makes.
+_jig_checkout_works() {
+  local a
+  case "${1:-}" in
+    task)
+      case "${2:-}" in
+        start | bootstrap | set | artifact | finding | autopilot | gate | receipt) ;;
+        *) return 1 ;;
+      esac
+      shift 2
+      ;;
+    context) shift ;;
+    *) return 1 ;;
+  esac
+  for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    jig_valid_id "$a" || continue
+    [ -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$a/state" ] || continue
+    printf '%s\n' "$a"
+    return 0
+  done
+  return 1
+}
+
+# _jig_checkout_take <command-words...> — write this session's record for the
+# task the command works on. Nothing without a session id: a record that
+# cannot say whose it is could not tell the caller's own task from another's.
+# `since` is carried over while the record is still live and starts again
+# once it has lapsed.
+_jig_checkout_take() {
+  local id session root dir file since="" mtime f age ttl cmd
+  id=$(_jig_checkout_works "$@") || return 0
+  session=$(jig_checkout_session)
+  [ -n "$session" ] || return 0
+  root=$(jig_config_clone_root 2>/dev/null) || return 0
+  [ -n "$root" ] || return 0
+  dir="$root/$JIG_AI_DIR/runtime/taken/$id"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 0
+  file="$dir/$session"
+  if [ -f "$file" ] && _jig_checkout_read "$file" since; then
+    since=$_JIG_CHECKOUT_READ
+    ttl=$(_jig_checkout_ttl)
+    age=""
+    # Every line is read and only a numeric one kept: GNU stat answers the
+    # BSD form with lines of its own before the fallback answers.
+    while read -r mtime f; do
+      case "$mtime" in '' | *[!0-9]*) continue ;; esac
+      age=$(($(date +%s) - mtime))
+    done < <(_jig_checkout_mtimes "$file")
+    if [ -z "$age" ] || [ "$age" -gt "$ttl" ]; then since=""; fi
+  fi
+  [ -n "$since" ] || since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  # One line per key: a line break inside an argument must not start a key,
+  # and a tab must not become a field of the lines jig_checkout_taken prints.
+  cmd=$*
+  cmd=${cmd//$'\n'/ }
+  cmd=${cmd//$'\t'/ }
+  _jig_checkout_write "$file" "checkout: $JIG_PROJECT
+since: $since
+command: $cmd
+" || return 0
+  # `jig queue next --json` reports this record, so its write raises the
+  # clone's revision like every other record a read reports
+  # (conventions/json-output.md, adr-20261016-the-clone-revision-is-a-claimed-name).
+  # Every rewrite raises it, not only a new holding: which session is the
+  # newest holder, and what it last ran, change with any rewrite. Most of
+  # the commands that write it raise the revision themselves anyway.
+  jig_record_changed >/dev/null 2>&1 || true
+  return 0
+}
+
+# jig_checkout_taken_begin — read once per command what every
+# jig_checkout_taken call compares with: this session's id, the window, the
+# clock and the clone root. A listing asks per task; the session lookup is a
+# subshell that sources the adapters, so it is not paid per task.
+_JIG_TK_READY=""
+_JIG_TK_SELF=""
+_JIG_TK_TTL=43200
+_JIG_TK_NOW=0
+_JIG_TK_ROOT=""
+jig_checkout_taken_begin() {
+  _JIG_TK_READY=1
+  _JIG_TK_SELF=$(jig_checkout_session)
+  _JIG_TK_TTL=$(_jig_checkout_ttl)
+  _JIG_TK_NOW=$(date +%s)
+  _JIG_TK_ROOT=$(jig_config_clone_root 2>/dev/null) || _JIG_TK_ROOT=""
+  return 0
+}
+
+# jig_checkout_taken <id> — "<checkout>\t<since>\t<idle seconds>\t<command>"
+# when another session holds task <id>, nothing when nobody does or the
+# caller does.
+#
+# **The newest live record holds the task.** That is also how a person takes
+# over a task whose session died: they work on it in their own session, and
+# their record becomes the newest. On a tie of mtimes the caller's own record
+# wins, so a session is never told its own task is taken. A caller with no
+# session id of its own holds nothing, so every live record is another's.
+jig_checkout_taken() {
+  local id="$1" dir mtime f name best=-1 bestf="" age checkout since cmd
+  [ -n "$_JIG_TK_READY" ] || jig_checkout_taken_begin
+  [ -n "$_JIG_TK_ROOT" ] || return 0
+  jig_valid_id "$id" || return 0
+  dir="$_JIG_TK_ROOT/$JIG_AI_DIR/runtime/taken/$id"
+  [ -d "$dir" ] || return 0
+  while read -r mtime f; do
+    case "$mtime" in '' | *[!0-9]*) continue ;; esac
+    [ -f "$f" ] || continue
+    name=${f##*/}
+    jig_valid_id "$name" || continue
+    if [ "$_JIG_TK_NOW" -lt "$mtime" ]; then age=0; else age=$((_JIG_TK_NOW - mtime)); fi
+    [ "$age" -le "$_JIG_TK_TTL" ] || continue
+    if [ "$mtime" -gt "$best" ] \
+      || { [ "$mtime" -eq "$best" ] && [ -n "$_JIG_TK_SELF" ] && [ "$name" = "$_JIG_TK_SELF" ]; }; then
+      best=$mtime
+      bestf=$f
+    fi
+  done < <(_jig_checkout_mtimes "$dir"/*)
+  [ -n "$bestf" ] || return 0
+  name=${bestf##*/}
+  if [ -n "$_JIG_TK_SELF" ] && [ "$name" = "$_JIG_TK_SELF" ]; then return 0; fi
+  if [ "$_JIG_TK_NOW" -lt "$best" ]; then age=0; else age=$((_JIG_TK_NOW - best)); fi
+  # `-` for a key the record does not hold: a reader splits these lines on
+  # tabs, and `read` folds two adjacent tabs into one.
+  checkout="-" since="-" cmd="-"
+  if _jig_checkout_read "$bestf" checkout && [ -n "$_JIG_CHECKOUT_READ" ]; then checkout=$_JIG_CHECKOUT_READ; fi
+  if _jig_checkout_read "$bestf" since && [ -n "$_JIG_CHECKOUT_READ" ]; then since=$_JIG_CHECKOUT_READ; fi
+  if _jig_checkout_read "$bestf" command && [ -n "$_JIG_CHECKOUT_READ" ]; then cmd=$_JIG_CHECKOUT_READ; fi
+  printf '%s\t%s\t%s\t%s\n' "$checkout" "$since" "$age" "$cmd"
   return 0
 }
 

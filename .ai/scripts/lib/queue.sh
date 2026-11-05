@@ -653,7 +653,8 @@ _queue_request_json() {
 
 # _queue_list — the queue for a person: the top level in order, each epic's
 # tasks indented under it (an epic not queued itself is listed after the top
-# level), every item with its priority and what it waits for.
+# level), every item with its priority, what it waits for and, for a task
+# another session holds, who and since when (jig_checkout_taken).
 _queue_list() {
   [ $# -eq 0 ] || jig_fail usage "queue list: unexpected argument: $1"
   jig_require_init
@@ -676,14 +677,35 @@ _queue_list() {
     _queue_list_json "$canonical"
     return 0
   fi
+  # Who holds each active task, as `tk <ref> <words>` lines after the queue's
+  # own: the same answer `jig queue next` skips a task by.
+  local kind f2 f3 f4 f5 tk taken="" c s a
+  jig_checkout_taken_begin
+  while IFS=$'\t' read -r kind f2 f3 f4 f5; do
+    [ "$kind" = item ] || continue
+    case "$f2" in task:*) ;; *) continue ;; esac
+    jig_valid_id "${f2#task:}" || continue
+    [ -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/${f2#task:}/state" ] || continue
+    [ "$(_jig_task_state_value "${f2#task:}" status)" = active ] || continue
+    tk=$(jig_checkout_taken "${f2#task:}")
+    [ -n "$tk" ] || continue
+    IFS=$'\t' read -r c s a _ <<EOF
+$tk
+EOF
+    taken="${taken}tk"$'\t'"$f2"$'\t'"$(_queue_taken_words "$c" "$s" "$a")"$'\n'
+  done <<EOF
+$canonical
+EOF
   awk -F '\t' '
     function show(i, indent,   j, p) {
       p = (pri[i] == "-") ? "-" : "P" pri[i]
       printf "%s%s  %s\n", indent, ref[i], p
+      if (ref[i] in tk) printf "%s    %s\n", indent, tk[ref[i]]
       for (j = 1; j <= dn; j++) if (dsub[j] == ref[i]) printf "%s    waits for %s: %s\n", indent, don[j], drea[j]
     }
     $1 == "item" { i = ++n; ref[i] = $2; lvl[i] = $3; pri[i] = $5; queued[$2] = 1 }
     $1 == "dep" { j = ++dn; dsub[j] = $2; don[j] = $3; drea[j] = $4 }
+    $1 == "tk" { tk[$2] = $3 }
     END {
       if (n == 0) { print "queue: empty"; exit }
       for (i = 1; i <= n; i++) {
@@ -700,6 +722,7 @@ _queue_list() {
     }
   ' <<EOF
 $canonical
+$taken
 EOF
 }
 
@@ -740,7 +763,9 @@ EOF
 # The facts are gathered here, in the shell, as one table of lines on stdin of
 # the one awk that decides (_queue_next_decide): the queue's items and
 # dependencies as jig_queue_items prints them, then `tf` (a queued task's state
-# facts) and `ds` (the state of every dependency's target) lines.
+# facts), `tk` (a queued task another session holds: jig_checkout_taken,
+# adr-20261030-a-task-another-session-works-on-is-not-advised) and `ds` (the
+# state of every dependency's target) lines.
 _queue_next() {
   [ $# -eq 0 ] || jig_fail usage "queue next: unexpected argument: $1"
   jig_require_init
@@ -758,11 +783,17 @@ _queue_next() {
   # not merged, so the work is still open as far as a dependency goes.
   merged=" $(hklog_ids ' remote=merged ' | tr '\n' ' ') "
   open_ids=" $(hklog_ids ' remote=(open|closed) ' | tr '\n' ' ') "
+  local tk
+  jig_checkout_taken_begin
   while IFS=$'\t' read -r kind f2 f3 f4 f5; do
     case "$kind" in
       item)
         case "$f2" in
-          task:*) facts="$facts$(_queue_next_task_fact "${f2#task:}")"$'\n' ;;
+          task:*)
+            facts="$facts$(_queue_next_task_fact "${f2#task:}")"$'\n'
+            tk=$(jig_checkout_taken "${f2#task:}")
+            [ -z "$tk" ] || facts="${facts}tk"$'\t'"$f2"$'\t'"$tk"$'\n'
+            ;;
         esac ;;
       dep)
         case "$seen" in *" $f2 "*) continue ;; esac
@@ -862,11 +893,13 @@ _queue_next_dep_state() {
 
 # _queue_next_decide — the advice, from the table on stdin. Prints:
 #   next <ref> <level> <position> <priority> <started> <rank> <count>   (none when nothing)
-#   reason <waiting|paused|empty>                                       (only without next)
+#   reason <waiting|taken|paused|empty>                                 (only without next)
 #   wait <holder> <on> <state> <reason>                                  (each unfinished dependency holding a candidate)
+#   taken <ref> <checkout> <since> <idle seconds> <command>              (each candidate another session holds)
 #
 # A candidate is a queued task whose state file says `active`, with no pause
-# and no pause request; everything else queued is silently not one. It waits
+# and no pause request; everything else queued is silently not one. One that
+# another session holds (a `tk` line) is named instead of advised. It waits
 # while any dependency of its own or of the epic it is built on is not
 # finished. Among the rest the lowest priority number goes first (`-` last),
 # then a started task before one not started, then the position of the item
@@ -906,11 +939,13 @@ _queue_next_decide() {
     $1 == "dep" { k = ++nd[n]; don[n, k] = $2; drea[n, k] = $3 }
     $1 == "tf" { st[$2] = $3; pz[$2] = $4; sd[$2] = $5; rq[$2] = $6 }
     $1 == "ds" { dst[$2] = $3 }
+    $1 == "tk" { tk[$2] = substr($0, length($1) + length($2) + 3) }
     END {
       for (i = 1; i <= n; i++) {
         r = ref[i]
         if (r !~ /^task:/ || st[r] != "active") continue
         if (pz[r] == "true" || rq[r] == 1) { paused++; continue }
+        if (r in tk) { taken++; tl[++nt] = "taken\t" r "\t" tk[r]; continue }
         unfinished = 0
         note(i)
         if (lvl[i] != "-" && (lvl[i] in idx)) note(idx[lvl[i]])
@@ -922,9 +957,11 @@ _queue_next_decide() {
         for (i = 1; i <= n; i++) if (lvl[i] == lvl[best]) { cnt++; if (pos[i] < pos[best]) rank++ }
         printf "next\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n", ref[best], lvl[best], pos[best], pri[best], (sd[ref[best]] == 1), rank + 1, cnt
       } else if (waiting) print "reason\twaiting"
+      else if (taken) print "reason\ttaken"
       else if (paused) print "reason\tpaused"
       else print "reason\tempty"
       for (i = 1; i <= nw; i++) print wl[i]
+      for (i = 1; i <= nt; i++) print tl[i]
     }
   '
 }
@@ -932,7 +969,7 @@ _queue_next_decide() {
 # _queue_next_json <result> <not queued> — the producer's data for `jig queue
 # next --json` (schemas/json.md, "jig queue next --json").
 _queue_next_json() {
-  local kind f2 f3 f4 f5 f6 f7 f8 next=null reason=null waiting=""
+  local kind f2 f3 f4 f5 f6 f7 f8 next=null reason=null waiting="" taken=""
   while IFS=$'\t' read -r kind f2 f3 f4 f5 f6 f7 f8; do
     case "$kind" in
       next)
@@ -950,11 +987,34 @@ _queue_next_json() {
         json_quote "$f3"; waiting="$waiting,\"on\":$_JSON"
         json_quote "$f4"; waiting="$waiting,\"state\":$_JSON"
         json_quote "$f5"; waiting="$waiting,\"reason\":$_JSON}" ;;
+      taken)
+        # `-` stands for a key the record does not hold (jig_checkout_taken).
+        taken="$taken${taken:+,}"
+        json_quote "$f2"; taken="$taken{\"ref\":$_JSON"
+        if [ "$f3" = "-" ]; then taken="$taken,\"checkout\":null"; else json_quote "$f3"; taken="$taken,\"checkout\":$_JSON"; fi
+        if [ "$f4" = "-" ]; then taken="$taken,\"since\":null"; else json_quote "$f4"; taken="$taken,\"since\":$_JSON"; fi
+        json_int_or_null "$f5"; taken="$taken,\"idle_seconds\":$_JSON"
+        if [ "$f6" = "-" ]; then taken="$taken,\"command\":null}"; else json_quote "$f6"; taken="$taken,\"command\":$_JSON}"; fi ;;
     esac
   done <<EOF
 $1
 EOF
-  printf '{"next":%s,"reason":%s,"waiting":[%s],"not_queued":%s}\n' "$next" "$reason" "$waiting" "$2"
+  printf '{"next":%s,"reason":%s,"waiting":[%s],"taken":[%s],"not_queued":%s}\n' "$next" "$reason" "$waiting" "$taken" "$2"
+}
+
+# _queue_taken_words <checkout> <since> <idle seconds> — who holds a task and
+# since when, for a person: `taken by another session in <checkout>, since
+# <since>, last active <n>m ago`. `-` is a key the record does not hold
+# (jig_checkout_taken), and its words are left out.
+_queue_taken_words() {
+  local words="taken by another session"
+  [ "$1" = "-" ] || words="$words in $1"
+  [ "$2" = "-" ] || words="$words, since $2"
+  case "$3" in
+    '' | *[!0-9]*) ;;
+    *) words="$words, last active $(jig_checkout_ago "$3") ago" ;;
+  esac
+  printf '%s\n' "$words"
 }
 
 # _queue_next_text <result> <not queued> — the advice for a person: the
@@ -975,6 +1035,7 @@ _queue_next_text() {
       reason)
         case "$f2" in
           waiting) printf 'next: none — every queued task waits for a dependency\n' ;;
+          taken) printf 'next: none — every queued task left is taken by another session\n' ;;
           paused) printf 'next: none — every queued task is paused\n' ;;
           *) printf 'next: none — the queue holds no task to take\n' ;;
         esac ;;
@@ -988,6 +1049,7 @@ _queue_next_text() {
             esac ;;
           *) [ -n "$advised" ] || printf '  %s waits for %s: %s\n' "$f2" "$f3" "$f4" ;;
         esac ;;
+      taken) printf '  %s is %s\n' "$f2" "$(_queue_taken_words "$f3" "$f4" "$f5")" ;;
     esac
   done <<EOF
 $1

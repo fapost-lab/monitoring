@@ -87,6 +87,11 @@ cmd_housekeeping() {
     # Under the lock and before this run's marker, so no other run writes
     # the log while it is rewritten and the run about to start is never cut.
     _hk_log_trim "$runtime/housekeeping.log"
+    # A tree a killed write left would hold its branch against a person's `git switch`
+    # (adr-20261104-a-write-goes-in-jigs-own-tree).
+    # shellcheck source=lib/owntree.sh
+    . "$JIG_LIB/owntree.sh"
+    ot_sweep
   fi
 
   _HK_DEFAULT_BASE=$(cfg git.base_branch main)

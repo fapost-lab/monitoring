@@ -161,10 +161,12 @@ open questions, untested assumptions; ask the human about each one, move it wher
 spec through `jig-idea`, or a task) or drop it, and run it again with `--leftovers-handled`. A spec on
 an epic is closed on the epic by `--finish`, not here.
 
-Then hand the change over. Stage the new files the task added (`git add <path>`); with nothing
-else staged, `task ship` stages the tracked changes itself and lists them, and it refuses while a
-new file is neither staged nor ignored. When the tree holds other work, stage only this task's
-changes, hunk by hunk: a staged index is committed as it is, and ship names what it left out. Write
+Then hand the change over. With only tracked files changed, stage nothing: `task ship` stages them
+itself and lists them. It refuses while a new file is neither staged nor ignored, and once anything
+is staged, that index is the commit and ship adds nothing to it. So a change with new files stages
+all of it: `git add <path>` for each new file, then `git add -u`. When the tree holds other work,
+stage only this task's changes, hunk by hunk: ship names what the commit left out, and at `merge`
+it refuses until you pass `--partial`, which says the rest is not this task's. Write
 the commit message with
 `jig task artifact write <id> commit-message --from <file>` (it prints the path, in the task's
 workspace and not in a shared directory), and run:
@@ -185,7 +187,8 @@ report holds the same block): only a human approves the new text, in `jig-accept
 
 Once a pull request exists, `task ship` hands every P2 and P3 still `open` to one triage task,
 `<id>-findings`, filed not started and not queued, and says so; a second ship files no second
-one. Name it in your report: it is where a person decides what the review left.
+one. Name it in your report: it is where a person decides what the review left, and it closes as
+§6 says for a triage task.
 
 The status stays `ready`: the task is still current, and fixes from review of the commit
 or PR continue in it — stage the fix and run `task ship` again. If review changes the implementation, update the same documents; do
@@ -217,7 +220,10 @@ or the human says the work is finished.
 .ai/scripts/jig task set <id> status consolidated
 ```
 
-The script refuses this while the knowledge decision is unrecorded. Once the task's branch
+The script refuses this while the knowledge decision is unrecorded. A triage task
+(`<id>-findings`, which `task ship` filed) is the exception: once the person has decided every
+finding, this one command closes it as done — it has no class and no route, and the close records
+the knowledge decision itself. Never `jig task abandon` a decided triage. Once the task's branch
 is confirmed merged, housekeeping moves the workspace to trash; a task whose landing
 cannot be observed keeps its workspace, closed and unflagged, because housekeeping never
 destroys on `unknown`. A problem found after the close is a new task.

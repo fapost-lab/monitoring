@@ -61,7 +61,10 @@ stage for inspection.
 ### External review
 
 Start a **new process** with no implementation history. Give it the task id, base,
-requirements, design, actual diff, applicable knowledge and the review skill. Codex uses
+requirements, design, actual diff, applicable knowledge, the rule files `jig-review` §1 names —
+those git does not track copied in from the main checkout, which the process cannot reach — the
+review skill and its axis. The `review` stage starts one process per axis, Behaviour and
+Standards; they may run side by side, since only the coordinator writes the ledger. Codex uses
 `codex -a never exec --cd <worktree> --sandbox read-only --ephemeral
 --ignore-user-config --disable multi_agent`. Claude uses `claude -p --restricted
 --strict-mcp-config --permission-mode plan --permission-prompts none
@@ -73,9 +76,11 @@ verdict in the prompt: on `narrow`, the interdiff, any knowledge diff and the `f
 place of the actual diff; on `full`, the actual diff as for a first review.
 
 The coordinator checks the process exit and denials, compares its reviewed diff with the
-current diff, enters every finding through `jig task finding`, and records the receipt
+current diff, enters the findings through `jig task finding`, and records the receipt
 through `jig task receipt <id> --stage <review|architecture-review>` only after reviewing the
-report and files. Check `jig task findings` and receipt freshness before continuing.
+report and files. A finding against a `*.local.md` rule is left out of the ledger and goes in
+the coordinator's own report (`jig-review` §1); a finding both axes' reports name is entered
+once. Check `jig task findings` and receipt freshness before continuing.
 If implementation changed after the review, start a new reviewer process and replace the
 receipt. An empty or malformed report is failure, not a clean review. The receipt pins
 content, not the reviewer's identity.
@@ -83,6 +88,8 @@ content, not the reviewer's identity.
 ## With a matching line
 
 Start a new subagent for the entire stage, with the value exactly as printed as its model.
+For the `review` stage that is two subagents, one per axis and one after the other, as
+`jig-review` §1 says; both take the printed model.
 Give it the task id, worktree path, base, stage skill, and approved design or plan. It runs
 the skill itself, reads the relevant knowledge, records findings and the review receipt, and
 returns a report. The coordinator checks `jig task findings <id>` and the receipt before
@@ -113,9 +120,10 @@ model remains the person's decision.
 ## Without a matching line
 
 The current session implements as before. Every review stage still goes to a new subagent on
-the session's model, briefed without the implementation conversation. Only here, with no review
-line at all, may the session review when no subagent can start, and it says so in the pull
-request. No setting is required for a normal Jig route.
+the session's model, briefed without the implementation conversation; the `review` stage goes to
+two, one per axis and one after the other, as with a matching line. Only here,
+with no review line at all, may the session review when no subagent can start, and it says so in
+the pull request. No setting is required for a normal Jig route.
 
 ## T4: another model when there is one
 

@@ -18,7 +18,9 @@ documents for the first time.
 .ai/scripts/jig knowledge proposed
 ```
 
-Nothing proposed is a normal answer. Say so and stop.
+Nothing proposed is a normal answer. Say so and stop. A decision somebody already made from a page
+waits on its own branch (`jig writes`, and `waiting` in `jig knowledge proposed --json`) and still
+reads as proposed here: name it, and do not ask again.
 
 ## 2. Show the documents, then your reading
 

@@ -1728,8 +1728,11 @@ _upgrade_land_prs() {
         --jq '.[] | "\(.headRefName)\t\(.state)\t\(.headRefOid)\t\(.url)"' 2>/dev/null) || return 1
       ;;
     gitlab)
-      rows=$(glab mr list --all --target-branch "$base" --output json 2>/dev/null \
-        | jig_glab_fields source_branch state sha web_url@/merge_requests/) || return 1
+      # glab's own answer first, then the reading of it: a failing glab is a
+      # forge that did not answer, never an empty list, and that should not
+      # rest on `pipefail` judging a pipeline whose last stage is awk's.
+      rows=$(glab mr list --all --target-branch "$base" --output json 2>/dev/null) || return 1
+      rows=$(printf '%s\n' "$rows" | jig_glab_fields source_branch state sha web_url@/merge_requests/) || return 1
       ;;
     *) return 1 ;;
   esac
@@ -1841,6 +1844,12 @@ PICK
   fi
   if [ "$cur" != "$base" ] && [ "$cur" != "$head" ]; then
     reasons="${reasons}this checkout is on ${cur:-a detached HEAD}, not on $base or $head; switch to $base (\`git checkout $base\`), then run \`jig upgrade --land\` again
+"
+  elif [ "$cur" != "$base" ] && [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
+    # A linked worktree is never switched to the base, as jig_ship_leave
+    # never switches one: housekeeping finds a worktree by the branch git
+    # lists in it, and one moved to the base would be found by nothing.
+    reasons="${reasons}this is a linked worktree on $head, and Jig never switches one to $base; run \`jig upgrade --land\` in the main checkout ($(jig_config_clone_root))
 "
   elif [ "$cur" != "$base" ] && jig_branch_checked_out "$base"; then
     reasons="${reasons}$base is checked out in another worktree; run \`jig upgrade --land\` there

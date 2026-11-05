@@ -1,6 +1,6 @@
 # Framework software version (semver). Independent of the spec document version.
 # shellcheck shell=bash
-JIG_VERSION="0.39.0"
+JIG_VERSION="0.40.0"
 export JIG_VERSION
 
 # jig_version_lt <a> <b> — true when dotted-integer version <a> is older than

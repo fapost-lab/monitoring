@@ -132,6 +132,34 @@ _jig_config_clone_root_find() {
   printf '%s\n' "$JIG_PROJECT"
 }
 
+# jig_config_odd_common — the clone's git common directory when it is not named `.git`
+# (`--separate-git-dir`, a submodule, a bare repository with linked worktrees), and
+# non-zero in the ordinary layout, where a linked worktree's clone root is the main
+# checkout. In these layouts the clone root stays each checkout's own, so what must be
+# one per clone — the revision, and the lock and records of a write in Jig's own tree
+# (adr-20261104-a-write-goes-in-jigs-own-tree) — is kept under this directory, which
+# every checkout and that tree find alike. Reads git's own files, like
+# _jig_config_clone_root_find, because the revision asks on every read.
+jig_config_odd_common() {
+  local line="" gitdir
+  [ -f "$JIG_PROJECT/.git" ] || return 1
+  IFS= read -r line < "$JIG_PROJECT/.git" || [ -n "$line" ] || return 1
+  gitdir=${line#gitdir: }
+  [ -n "$gitdir" ] && [ "$gitdir" != "$line" ] || return 1
+  (
+    common="" here=""
+    cd "$JIG_PROJECT" 2>/dev/null || exit 1
+    cd "$gitdir" 2>/dev/null || exit 1
+    if [ -f commondir ]; then
+      IFS= read -r common < commondir || [ -n "$common" ] || exit 1
+      cd "$common" 2>/dev/null || exit 1
+    fi
+    here=$(pwd -P)
+    [ "${here##*/}" != .git ] || exit 1
+    printf '%s\n' "$here"
+  )
+}
+
 # Path of the local config file for the current clone.
 jig_config_local_file() {
   local file
@@ -185,50 +213,67 @@ jig_config_local_only_key() {
 # somebody fixes, and not in the report, where it would be a lie told to a
 # user.
 jig_config_keys() {
+  jig_config_key_rows | awk -F'|' '{ if ($2 != "") print $1 " " $2; else print $1 }'
+}
+
+# jig_config_key_rows — the registry itself, one row per key, the fields
+# separated by `|`: `<key>|<default>|<kind>|<allowed>|<description>`. The
+# default is the one jig_config_keys prints; the other three are what
+# `jig config keys --json` tells a program about the key, kept on the same row
+# so that a key cannot be added without them (tests/config.t.sh refuses a row
+# that lacks one, and checks every `allowed` list against the validator).
+# - kind: `boolean`, `choice` (a fixed set), `duration` (`<n>[dhms]`),
+#   `number`, `text` (anything the file can hold) or `list` (an inline list,
+#   `[a, b]`);
+# - allowed: the comma-separated values of a boolean or a choice, empty
+#   otherwise;
+# - description: one line, no `|`.
+# Whether the key is a secret is not stored here: _cfg_secret_key answers it.
+jig_config_key_rows() {
   cat <<'EOF'
-profiles [generic]
-adapters [claude, codex]
-git.base_branch main
-git.branch_per_task true
-git.branch_template task/{id}
-git.worktree_root ../<project>.worktrees
-git.delete_merged_branches true
-worktree.carry []
-worktree.share []
-worktree.setup
-worktree.setup_timeout 10m
-forge auto
-task.issue_pattern
-housekeeping.cadence 1d
-housekeeping.fetch true
-housekeeping.trash_ttl 7d
-housekeeping.abandoned_ttl 14d
-housekeeping.stale_after 60d
-checkout.busy_ttl 12h
-agent.git none
-autopilot.git
-agent.ci_timeout 30
-autopilot.unattended false
-autopilot.parallel 2
-route.depth full
-release.merge agent
-knowledge.require_frontmatter true
-verify.full_run local
-verify.busy_ttl 30m
-run.exec auto
-run.path auto
-claude.implement_model
-claude.review_model
-codex.implement_model
-codex.review_model
-executor.implement_runtime
-executor.review_runtime
-executor.implement_model
-executor.review_model
-notify.telegram.token
-notify.telegram.chat_id
-notify.autopilot true
-notify.interactive false
+profiles|[generic]|list||Which profiles are active; generic is always included.
+adapters|[claude, codex]|list||Which runtimes get Jig's skills installed.
+git.base_branch|main|text||The branch tasks merge into.
+git.branch_per_task|true|boolean|true,false|Whether starting a task creates and checks out a branch.
+git.branch_template|task/{id}|text||The name of a task's branch; {id} is the task id.
+git.worktree_root|../<project>.worktrees|text||Where task worktrees are made.
+git.delete_merged_branches|true|boolean|true,false|Whether a branch Jig made is deleted once its work has landed.
+worktree.carry|[]|list||Extra paths copied into a new task worktree.
+worktree.share|[]|list||Directories a new task worktree shares with this checkout.
+worktree.setup||text||A command run in a new task worktree after it is made.
+worktree.setup_timeout|10m|duration||How long worktree.setup may run; 0 waits for ever.
+forge|auto|choice|auto,github,gitlab,none|Which code forge pull requests and CI are read from.
+task.issue_pattern||text||A regular expression for the tracker issue at the start of a task id.
+housekeeping.cadence|1d|duration||How often the session hook runs housekeeping, in whole days.
+housekeeping.fetch|true|boolean|true,false|Whether housekeeping may run git fetch.
+housekeeping.trash_ttl|7d|duration||How long trashed workspaces and specs are kept.
+housekeeping.abandoned_ttl|14d|duration||How long an abandoned task stays before it is archived.
+housekeeping.stale_after|60d|duration||How long an untouched active task stays before it is archived or flagged.
+checkout.busy_ttl|12h|duration||How long a checkout's record of work in progress counts as a live session.
+agent.git|none|choice|none,commit,push,pr,merge|How far your agent takes a finished task with git.
+autopilot.git||choice|none,commit,push,pr,merge|The git level of an autopilot run; when unset, agent.git answers.
+agent.ci_timeout|30|number||Minutes a merge waits for the pull request's checks; 0 looks once.
+autopilot.unattended|false|boolean|true,false|Whether an autopilot run asks nothing and decides each stop itself.
+autopilot.parallel|2|number||How many tasks of a roadmap phase are built at once, 1 to 16.
+route.depth|full|choice|full,lean|How much of its route a task runs.
+release.merge|agent|choice|agent,human|Who merges a release in an unattended run.
+knowledge.require_frontmatter|true|boolean|true,false|Whether jig knowledge check fails on a document without frontmatter.
+verify.full_run|local|choice|local,ci|Whether a plain jig verify runs everything or only what changed.
+verify.busy_ttl|30m|duration||How long a verify run counts as live; 0 never waits.
+run.exec|auto|text||Where this machine runs the project's checks: auto, host or a command prefix.
+run.path|auto|text||A directory put first on PATH for the checks, or auto.
+claude.implement_model||text||The model Claude Code hands the implement stage to as a subagent.
+claude.review_model||text||The model Claude Code hands each review stage to as a subagent.
+codex.implement_model||text||The model a Codex subagent uses for implementation.
+codex.review_model||text||The model a Codex subagent uses for review.
+executor.implement_runtime||choice|claude,codex|The runtime that owns the implement stage; empty keeps the current session.
+executor.review_runtime||choice|claude,codex|The runtime that owns each review stage; empty keeps the current session.
+executor.implement_model||text||The model for an external implementation process.
+executor.review_model||text||The model for an external review process.
+notify.telegram.token||text||The Telegram bot token messages are sent with; never shown.
+notify.telegram.chat_id||text||The Telegram chat messages go to: digits or @name.
+notify.autopilot|true|boolean|true,false|Whether autopilot runs send Telegram messages.
+notify.interactive|false|boolean|true,false|Whether a session waiting for you sends a Telegram message too.
 EOF
 }
 
@@ -432,13 +477,36 @@ cfg() {
   printf '%s\n' "$value"
 }
 
+# _cfg_layered_v <var> <layer var> <key> — the value the layers give <key>
+# into <var> and the layer that gave it into <layer var>: `local`, `project`
+# or empty when no file answers and the caller's default does. The one place
+# the layering is written down: cfg_v asks it for the value and `jig config
+# keys --json` for the layer as well, so what is reported as the source is
+# what was read. An empty value falls through; a key outside
+# JIG_CFG_LOCAL_KEYS never reads the local file, and one in
+# JIG_CFG_LOCAL_ONLY_KEYS never reads the project's.
+_cfg_layered_v() {
+  local __cl_file __cl_value=""
+  printf -v "$2" '%s' ""
+  if jig_config_local_key "$3"; then
+    jig_config_local_file_v __cl_file
+    _cfg_read_v __cl_value "$__cl_file" "$3" || true
+    [ -z "$__cl_value" ] || printf -v "$2" '%s' local
+  fi
+  if [ -z "$__cl_value" ] && ! jig_config_local_only_key "$3"; then
+    _cfg_read_v __cl_value "$JIG_PROJECT/$JIG_AI_DIR/config.yaml" "$3" || true
+    [ -z "$__cl_value" ] || printf -v "$2" '%s' project
+  fi
+  printf -v "$1" '%s' "$__cl_value"
+}
+
 # cfg_v <var> <key> [default] — cfg's value into <var>, in the caller's shell.
 #
 # Inside a read snapshot the layered value of each key is kept too
 # (`_CFG_MEMO`, "<key><TAB><value>" lines): a listing asks the same few keys
 # for every task, and each answer is otherwise a walk over both files.
 cfg_v() {
-  local __cv_key="$2" __cv_default="${3:-}" __cv_value="" __cv_file __cv_nl=$'\n' __cv_t=$'\t'
+  local __cv_key="$2" __cv_default="${3:-}" __cv_value="" __cv_layer="" __cv_nl=$'\n' __cv_t=$'\t'
   if [ "$_JIG_TS_ON" = 1 ]; then
     case "$_CFG_MEMO" in
       *"$__cv_nl$__cv_key$__cv_t"*)
@@ -448,13 +516,7 @@ cfg_v() {
         return 0 ;;
     esac
   fi
-  if jig_config_local_key "$__cv_key"; then
-    jig_config_local_file_v __cv_file
-    _cfg_read_v __cv_value "$__cv_file" "$__cv_key" || true
-  fi
-  if [ -z "$__cv_value" ] && ! jig_config_local_only_key "$__cv_key"; then
-    _cfg_read_v __cv_value "$JIG_PROJECT/$JIG_AI_DIR/config.yaml" "$__cv_key" || true
-  fi
+  _cfg_layered_v __cv_value __cv_layer "$__cv_key"
   [ "$_JIG_TS_ON" != 1 ] || _CFG_MEMO="$_CFG_MEMO$__cv_key$__cv_t$__cv_value$__cv_nl"
   printf -v "$1" '%s' "${__cv_value:-$__cv_default}"
 }
@@ -811,22 +873,63 @@ jig_config_value_problem() {
 # leave the only way to remove it a hand edit of a file the tooling owns
 # (ADR-0001).
 
+# `set`, `unset` and `keys` also answer `--json` (schemas/json.md, "jig config
+# keys --json" and "jig config writes"): `keys` lists every key with its value,
+# source and metadata, and a write answers with the same objects for the keys
+# it touched. A secret's value is in none of them (_config_entry_json).
+
 # Referenced from the EXIT trap, so global (convention-shell).
 _CONFIG_TMP=""
 
+# Set by cmd_config when `--json` is among the arguments; the producer runs in
+# json_run's subshell and inherits it.
+_CONFIG_AS_JSON=""
+
 cmd_config() {
-  local sub="${1:-}"
+  local sub="${1:-}" arg
   [ $# -gt 0 ] && shift
+  case "$sub" in
+    set | unset | keys)
+      # `--json` anywhere runs the whole command as the producer of json_run
+      # (conventions/json-output.md), so every refusal is an envelope too.
+      for arg in "$@"; do
+        if [ "$arg" = --json ]; then
+          _CONFIG_AS_JSON=1
+          # shellcheck source=lib/json.sh
+          . "$JIG_LIB/json.sh"
+          json_run _config_json_main "$sub" "$@"
+          return
+        fi
+      done
+      ;;
+  esac
+  _config_main "$sub" "$@"
+}
+
+# _config_json_main <sub> <args...> — the producer: the command without its
+# `--json`.
+_config_json_main() {
+  local sub="$1" arg args=()
+  shift
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  _config_main "$sub" ${args[@]+"${args[@]}"}
+}
+
+_config_main() {
+  local sub="$1"
+  shift
   case "$sub" in
     set) _config_set "$@" ;;
     unset) _config_unset "$@" ;;
     show) _config_show "$@" ;;
     keys) _config_keys "$@" ;;
     help | -h | --help)
-      printf 'usage: jig config set <key> <value> [<key> <value>...] --local [--dry-run]\n'
-      printf '       jig config unset <key> [<key>...] --local [--dry-run]\n'
+      printf 'usage: jig config set <key> <value> [<key> <value>...] --local [--dry-run | --revision <n>] [--json]\n'
+      printf '       jig config unset <key> [<key>...] --local [--dry-run | --revision <n>] [--json]\n'
       printf '       jig config show --local\n'
-      printf '       jig config keys\n'
+      printf '       jig config keys [--json]\n'
       printf 'local keys: %s\n' "$JIG_CFG_LOCAL_KEYS"
       ;;
     '') jig_die "config: missing subcommand (usage: jig config set|unset|show|keys ...)" ;;
@@ -843,7 +946,7 @@ _config_display_path() {
 }
 
 _config_refuse_project() {
-  jig_die "config $1: only --local is supported: .ai/config.yaml is the team's file, edited by hand and reviewed like code; your own settings go in .ai/config.local.yaml (jig config $1 ... --local)"
+  jig_fail usage "config $1: only --local is supported: .ai/config.yaml is the team's file, edited by hand and reviewed like code; your own settings go in .ai/config.local.yaml (jig config $1 ... --local)"
 }
 
 # _config_warn_ignored <shown path> — the warning `jig status` prints.
@@ -917,11 +1020,15 @@ _config_print_masked() {
 # No `--local` here, and no refusal without it: the other subcommands guard a
 # write to a file the team owns, and this one writes nothing.
 _config_keys() {
-  [ $# -eq 0 ] || jig_die "config keys: unknown argument: $1 (usage: jig config keys)"
+  [ $# -eq 0 ] || jig_fail usage "config keys: unknown argument: $1 (usage: jig config keys [--json])"
   # jig_require_init, not jig_require_repo: the last column is what this
   # project's .ai/config.yaml mentions, and without that file every key would
   # be reported as unmentioned, which is true of nothing.
   jig_require_init
+  if [ -n "$_CONFIG_AS_JSON" ]; then
+    _config_keys_json
+    return 0
+  fi
   local file key default note
   file=$(jig_config_file)
   printf '%-31s%-25s%s\n' "key" "default" "answered by"
@@ -950,6 +1057,119 @@ _config_keys() {
   printf 'nothing but a person edits %s/config.yaml (ADR-0024)\n' "$JIG_AI_DIR"
 }
 
+# --- `--json` ------------------------------------------------------------------
+
+# _config_entry_json <key> <default> <kind> <allowed> <description> — _CONFIG_ENTRY
+# <- the key's object, as `keys` lists it and a write answers with it:
+# {"key", "value", "set", "source", "scope", "kind", "allowed", "default",
+# "description", "secret"}. `value` is what a reader gets (`cfg`, which asks
+# _cfg_layered_v the same question this asks for the source) as a string, or
+# null when there is none; `set` says that a file answers for the key, `source`
+# which one (`local`, `project`) or `default`; `scope` is the word `jig config
+# keys` prints. `allowed` is the fixed set of a boolean or a choice, else null.
+#
+# A secret's `value` is null whatever the file holds, and `set` is all a
+# program learns of it. The value is never put into a variable the object is
+# built from, so no branch below can print it by mistake.
+_CONFIG_ENTRY=""
+_config_entry_json() {
+  local key="$1" default="$2" kind="$3" allowed="$4" desc="$5"
+  local value layer set=false secret=false out item sep=""
+  _cfg_layered_v value layer "$key"
+  if [ -z "$layer" ]; then
+    layer=default
+  else
+    set=true
+  fi
+  if _cfg_secret_key "$key"; then
+    secret=true
+    value=""
+  elif [ "$layer" = default ]; then
+    value=$default
+  fi
+  json_quote "$key"; out="{\"key\":$_JSON"
+  json_str_or_null "$value"; out="$out,\"value\":$_JSON"
+  out="$out,\"set\":$set"
+  json_quote "$layer"; out="$out,\"source\":$_JSON"
+  json_quote "$(jig_config_key_scope "$key")"; out="$out,\"scope\":$_JSON"
+  json_quote "$kind"; out="$out,\"kind\":$_JSON"
+  if [ -z "$allowed" ]; then
+    out="$out,\"allowed\":null"
+  else
+    out="$out,\"allowed\":["
+    for item in ${allowed//,/ }; do
+      json_quote "$item"; out="$out$sep$_JSON"
+      sep=,
+    done
+    out="$out]"
+  fi
+  json_str_or_null "$default"; out="$out,\"default\":$_JSON"
+  json_quote "$desc"; out="$out,\"description\":$_JSON"
+  _CONFIG_ENTRY="$out,\"secret\":$secret}"
+}
+
+# _config_entries_json <key>... — _CONFIG_ENTRIES <- the objects of the keys
+# the registry has, in the order given, comma-separated; a key it lacks (one
+# `unset` took out of the file that no reader answers from) has none.
+_CONFIG_ENTRIES=""
+_config_entries_json() {
+  local key row default kind allowed desc sep=""
+  _CONFIG_ENTRIES=""
+  for key in "$@"; do
+    row=$(jig_config_key_rows | JIG_CFG_KEY="$key" awk -F'|' '$1 == ENVIRON["JIG_CFG_KEY"] { print; exit }')
+    [ -n "$row" ] || continue
+    IFS='|' read -r key default kind allowed desc <<EOF
+$row
+EOF
+    _config_entry_json "$key" "$default" "$kind" "$allowed" "$desc"
+    _CONFIG_ENTRIES="$_CONFIG_ENTRIES$sep$_CONFIG_ENTRY"
+    sep=,
+  done
+}
+
+# _config_keys_json — the producer's data for `jig config keys --json`:
+# {"keys": [<every key, in the registry's order>]}.
+_config_keys_json() {
+  local key default kind allowed desc out="" sep=""
+  while IFS='|' read -r key default kind allowed desc; do
+    [ -n "$key" ] || continue
+    _config_entry_json "$key" "$default" "$kind" "$allowed" "$desc"
+    out="$out$sep$_CONFIG_ENTRY"
+    sep=,
+  done < <(jig_config_key_rows)
+  printf '{"keys":[%s]}\n' "$out"
+}
+
+# _config_land <tmp> <file> <expected> — move the new local file into place.
+# With <expected>, a write checked against the revision its caller read: claim
+# the revision right above it first (jig_revision_claim), nothing written when
+# the clone changed since, and raise it again after the move, as the claim
+# raised it before the file landed (adr-20261019-the-queue-is-one-file-written-
+# against-a-revision).
+_config_land() {
+  local rc=0
+  if [ -n "$3" ]; then
+    jig_revision_claim "$3" || rc=$?
+    case "$rc" in
+      0) ;;
+      1)
+        rm -f "$1"
+        jig_fail stale-revision "config: the clone changed since revision $3; read the settings again and retry"
+        ;;
+      *) jig_die "config: cannot claim the clone revision in $(jig_revision_dir)" ;;
+    esac
+  fi
+  mv "$1" "$2"
+  jig_record_changed
+}
+
+# _config_check_revision <command> <given> <value> — validate a `--revision`,
+# as `jig queue` does.
+_config_check_revision() {
+  [ -z "$2" ] || [ -n "$3" ] || jig_fail usage "config $1: --revision is empty"
+  [ -z "$3" ] || jig_revision_valid "$3" || jig_fail usage "config $1: --revision is not a revision: $3"
+}
+
 # _config_apply <in> <out> <key> <value> — <in> with <key> set to <value>: the
 # first `<key>:` line replaced, the one `cfg` reads, else a line appended.
 # The value reaches awk through the environment, where a backslash in a path
@@ -964,7 +1184,7 @@ _config_apply() {
 }
 
 _config_set() {
-  local local_flag=0 dry=0 n=0 key value problem file dir shown i
+  local local_flag=0 dry=0 n=0 key value problem file dir shown i rev="" rev_given="" expected="" code
   # The pairs, in order: an array, because a value is checked for line breaks
   # below and must reach that check intact.
   local args=()
@@ -972,13 +1192,20 @@ _config_set() {
     case "$1" in
       --local) local_flag=1; shift ;;
       --dry-run) dry=1; shift ;;
-      --*) jig_die "config set: unknown flag: $1 (usage: jig config set <key> <value> [<key> <value>...] --local [--dry-run])" ;;
+      --revision)
+        [ $# -ge 2 ] || jig_fail usage "config set: --revision needs a value"
+        rev=$2; rev_given=1; shift 2 ;;
+      --*) jig_fail usage "config set: unknown flag: $1 (usage: jig config set <key> <value> [<key> <value>...] --local [--dry-run | --revision <n>] [--json])" ;;
       *) args[n]="$1"; n=$((n + 1)); shift ;;
     esac
   done
   [ "$local_flag" = 1 ] || _config_refuse_project set
   if [ "$n" -eq 0 ] || [ $((n % 2)) -ne 0 ]; then
-    jig_die "config set: expected <key> <value> pairs (usage: jig config set <key> <value> [<key> <value>...] --local [--dry-run])"
+    jig_fail usage "config set: expected <key> <value> pairs (usage: jig config set <key> <value> [<key> <value>...] --local [--dry-run | --revision <n>] [--json])"
+  fi
+  _config_check_revision set "$rev_given" "$rev"
+  if [ -n "$_CONFIG_AS_JSON" ] && [ "$dry" = 1 ]; then
+    jig_fail usage "config set: --dry-run cannot be combined with --json: a dry run writes nothing, and the answer is the state after a write"
   fi
 
   # Every pair is checked before anything is written: one bad value leaves
@@ -987,18 +1214,30 @@ _config_set() {
   while [ "$i" -lt "$n" ]; do
     key=${args[i]}; value=${args[i + 1]}
     if ! jig_config_local_key "$key"; then
-      jig_die "config set: $key is not a local key; the local file answers only for: $JIG_CFG_LOCAL_KEYS (anything else belongs to the team's .ai/config.yaml, edited by hand)"
+      # One message, two codes: a key Jig reads that the team owns, and a name
+      # it does not read at all.
+      code=unknown-key
+      if jig_config_key_known "$key"; then code=not-local; fi
+      jig_fail "$code" "config set: $key is not a local key; the local file answers only for: $JIG_CFG_LOCAL_KEYS (anything else belongs to the team's .ai/config.yaml, edited by hand)"
     fi
     if ! problem=$(jig_config_value_problem "$key" "$value"); then
       if _cfg_secret_key "$key"; then
-        jig_die "config set: $key: refused: $problem"
+        jig_fail secret-key "config set: $key: refused: $problem"
       fi
-      jig_die "config set: $key: invalid value '$value': $problem"
+      jig_fail invalid-value "config set: $key: invalid value '$value': $problem"
     fi
     i=$((i + 2))
   done
 
   jig_require_repo
+  # The revision this write is checked against: the caller's, or — in a JSON
+  # write only — the one read here before the file is. A text write without
+  # `--revision` is unchecked, as it always was.
+  if [ -n "$rev" ]; then
+    expected=$rev
+  elif [ -n "$_CONFIG_AS_JSON" ]; then
+    expected=$(jig_revision_read)
+  fi
   file=$(jig_config_local_file)
   dir=${file%/*}
   shown=$(_config_display_path "$file")
@@ -1028,11 +1267,22 @@ _config_set() {
     _config_warn_ignored "$shown"
     return 0
   fi
-  mv "$_CONFIG_TMP" "$file"
   # A setting can change what a read reports (the git level and unattended
   # mode decide what a person may do next), so a written one raises the
   # clone's revision.
-  jig_record_changed
+  _config_land "$_CONFIG_TMP" "$file" "$expected"
+  if [ -n "$_CONFIG_AS_JSON" ]; then
+    _config_warn_ignored "$shown"
+    local names=()
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      names+=("${args[i]}")
+      i=$((i + 2))
+    done
+    _config_entries_json "${names[@]}"
+    printf '{"keys":[%s]}\n' "$_CONFIG_ENTRIES"
+    return 0
+  fi
   i=0
   while [ "$i" -lt "$n" ]; do
     printf 'config: %s: %s (%s)\n' "${args[i]}" "${args[i + 1]}" "$shown"
@@ -1064,6 +1314,23 @@ _config_remove() {
   ' "$1" > "$2"
 }
 
+# _config_unset_json <removed key>... -- <asked key>... — the producer's data
+# for `jig config unset --json`: {"keys": [<the objects of the registry's keys
+# asked for, as they stand now>], "removed": [<the keys taken out of the
+# file>]}. A key no reader answers from has no object, and is in `removed` only
+# when it was in the file.
+_config_unset_json() {
+  local out="" sep=""
+  while [ "$1" != -- ]; do
+    json_quote "$1"; out="$out$sep$_JSON"
+    sep=,
+    shift
+  done
+  shift
+  _config_entries_json "$@"
+  printf '{"keys":[%s],"removed":[%s]}\n' "$_CONFIG_ENTRIES" "$out"
+}
+
 # _config_unset — `jig config unset <key> [<key>...] --local [--dry-run]`.
 #
 # Any key the file holds, local or not (see the section header). A key the file
@@ -1071,19 +1338,26 @@ _config_remove() {
 # what `jig status` and `jig config show` call `ignored`, and a refusal there
 # would send them back to editing the file by hand.
 _config_unset() {
-  local local_flag=0 dry=0 n=0 key file shown i removed=0
-  local args=()
+  local local_flag=0 dry=0 n=0 key file shown i removed=0 rev="" rev_given="" expected=""
+  local args=() removed_keys=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --local) local_flag=1; shift ;;
       --dry-run) dry=1; shift ;;
-      --*) jig_die "config unset: unknown flag: $1 (usage: jig config unset <key> [<key>...] --local [--dry-run])" ;;
+      --revision)
+        [ $# -ge 2 ] || jig_fail usage "config unset: --revision needs a value"
+        rev=$2; rev_given=1; shift 2 ;;
+      --*) jig_fail usage "config unset: unknown flag: $1 (usage: jig config unset <key> [<key>...] --local [--dry-run | --revision <n>] [--json])" ;;
       *) args[n]="$1"; n=$((n + 1)); shift ;;
     esac
   done
   [ "$local_flag" = 1 ] || _config_refuse_project unset
   [ "$n" -gt 0 ] \
-    || jig_die "config unset: missing key (usage: jig config unset <key> [<key>...] --local [--dry-run])"
+    || jig_fail usage "config unset: missing key (usage: jig config unset <key> [<key>...] --local [--dry-run | --revision <n>] [--json])"
+  _config_check_revision unset "$rev_given" "$rev"
+  if [ -n "$_CONFIG_AS_JSON" ] && [ "$dry" = 1 ]; then
+    jig_fail usage "config unset: --dry-run cannot be combined with --json: a dry run writes nothing, and the answer is the state after a write"
+  fi
 
   # A key is a name the file's own grammar allows (jig_config_local_entries
   # reads exactly this set); anything else could never be in the file, so
@@ -1092,16 +1366,25 @@ _config_unset() {
   while [ "$i" -lt "$n" ]; do
     case "${args[i]}" in
       '' | *[!A-Za-z0-9_.-]*)
-        jig_die "config unset: not a key name: '${args[i]}' (letters, digits, '.', '_' and '-')" ;;
+        jig_fail usage "config unset: not a key name: '${args[i]}' (letters, digits, '.', '_' and '-')" ;;
     esac
     i=$((i + 1))
   done
 
   jig_require_repo
+  if [ -n "$rev" ]; then
+    expected=$rev
+  elif [ -n "$_CONFIG_AS_JSON" ]; then
+    expected=$(jig_revision_read)
+  fi
   file=$(jig_config_local_file)
   shown=$(_config_display_path "$file")
   if [ ! -f "$file" ]; then
-    printf 'no local settings: %s does not exist\n' "$shown"
+    if [ -n "$_CONFIG_AS_JSON" ]; then
+      _config_unset_json -- ${args[@]+"${args[@]}"}
+    else
+      printf 'no local settings: %s does not exist\n' "$shown"
+    fi
     return 0
   fi
 
@@ -1119,6 +1402,7 @@ _config_unset() {
       _config_remove "$_CONFIG_TMP" "$_CONFIG_TMP.next" "$key"
       mv "$_CONFIG_TMP.next" "$_CONFIG_TMP"
       removed=$((removed + 1))
+      removed_keys+=("$key")
       report="$report$(printf 'config: unset %s (%s)' "$key" "$shown")
 "
     else
@@ -1143,10 +1427,13 @@ _config_unset() {
   # An untouched file is left untouched, mtime included: nothing was asked of
   # it that it did not already satisfy.
   if [ "$removed" -gt 0 ]; then
-    mv "$_CONFIG_TMP" "$file"
-    jig_record_changed
+    _config_land "$_CONFIG_TMP" "$file" "$expected"
   else
     rm -f "$_CONFIG_TMP"
+  fi
+  if [ -n "$_CONFIG_AS_JSON" ]; then
+    _config_unset_json ${removed_keys[@]+"${removed_keys[@]}"} -- ${args[@]+"${args[@]}"}
+    return 0
   fi
   printf '%s' "$report"
 }

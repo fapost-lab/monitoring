@@ -88,18 +88,29 @@ Usage: jig <command> [args]
   knowledge paths [...]          report or maintain documents' paths coverage
   knowledge summary <id> <text>  set the one-line catalog summary
   knowledge stages add|remove <id> <stage>  maintain additive stage relevance
-  knowledge proposed             list documents awaiting accept or reject
-  knowledge accept <id>...       promote proposed document(s) to active
-  knowledge reject <id>...       mark proposed document(s) as rejected
+  knowledge proposed [--json]    list documents awaiting accept or reject; --json as data
+  knowledge accept <id>... [--revision <n>] [--json]
+                                 promote proposed document(s) to active; with either
+                                 flag, committed in Jig's own tree, not the working tree
+  knowledge reject <id>... [--revision <n>] [--json]
+                                 mark proposed document(s) as rejected, likewise
   knowledge inventory [...]      deterministic facts about the repository's shape
   knowledge changed --base <ref>  knowledge documents created/modified since <ref>
   knowledge stale [--strict]     documents that drifted away from the code
-  knowledge reviewed <id>        stamp a document as reconciled with the code
+  knowledge reviewed <id>... [--revision <n>] [--json]
+                                 stamp document(s) as reconciled with the code, likewise
+  knowledge sources [--diff <id>] [--json]
+                                 linked sources and what changed since approval; --json as data
   spec new <id>                  create .ai/specs/<id>/ from the specification templates
   spec list                      specifications under .ai/specs/ and their roadmap progress
   spec done <task-id>            check the roadmap items that name a spec-linked task
   spec drop <task-id>            close the roadmap items of an abandoned or moved task, with why
   spec link <spec-id> <task-id>  link a filed, not-started task to the spec phase naming it
+  spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom]
+  spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom]
+  spec item file <id> <item> --task <task-id>
+                                 change a roadmap on a branch of its own, in Jig's own
+                                 tree; each takes [--revision <n>] [--json]
   spec stop <id> --phase <n> --reason <text>
                                  record a phase run's stop: the reason goes to your Telegram
   spec close <id> [--leftovers-handled]
@@ -116,17 +127,23 @@ Usage: jig <command> [args]
   queue request|cancel <ref> pause [--reason <text>] [--revision <n>] [--json]
                                  ask a task to pause at its next stage boundary,
                                  or take the request back
+  writes [list] [--json]         edits Jig committed in its own tree that have not landed
+  writes ship <target> [--json]  carry one as far as agent.git allows; at merge, merge it
+                                 once CI passed (<target> is spec:<id> or knowledge)
   housekeeping [--dry-run] [--verbose]  reconcile workspaces with remote state
-  config set <key> <value> [...] --local [--dry-run]
+  config set <key> <value> [...] --local [--dry-run | --revision <n>] [--json]
                                  write your own settings to .ai/config.local.yaml;
-                                 local keys only, values checked, never .ai/config.yaml
-  config unset <key> [...] --local [--dry-run]
+                                 local keys only, values checked, never .ai/config.yaml;
+                                 --json answers with each key's new state
+  config unset <key> [...] --local [--dry-run | --revision <n>] [--json]
                                  remove keys from .ai/config.local.yaml, including
                                  ones no reader answers from
   config show --local            print .ai/config.local.yaml and the keys in it
                                  that no reader answers from
-  config keys                    every key jig reads, its default, which file
-                                 answers for it, and what .ai/config.yaml omits
+  config keys [--json]           every key jig reads, its default, which file
+                                 answers for it, and what .ai/config.yaml omits;
+                                 --json adds each key's value, source, kind and
+                                 description, and never a secret's value
   notify setup                   in your own terminal: ask for the Telegram bot token
                                  (hidden) and chat id, write them, send a test message
   notify test                    send one Telegram test message now, as autopilot would
@@ -143,7 +160,7 @@ main() {
   case "$cmd" in
     help|-h|--help) jig_usage ;;
     version|--version) printf 'jig %s\n' "$JIG_VERSION" ;;
-    init|upgrade|status|task|context|verify|knowledge|spec|queue|housekeeping|measure|doctor|config|notify)
+    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|housekeeping|measure|doctor|config|notify)
       if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
         jig_die "command '$cmd' is not available in jig $JIG_VERSION"
       fi

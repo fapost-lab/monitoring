@@ -19,7 +19,7 @@ column is the way; the right-hand one is what it replaces.
 |---|---|---|
 | Take on work someone described | the `jig-task` skill | starting to edit code straight away |
 | Decide how much process the work needs | the risk test in the `jig-task` skill | reading a class off one word in the route table |
-| File the work as a unit | `jig task new <id>` | the runtime's own background tasks (`spawn_task` in Claude Code): they open another session, not a task with a route, a workspace and consolidation |
+| File the work as a unit | `jig task new <id>`, then `jig queue set <id> --priority <0-5>` | the runtime's own background tasks (`spawn_task` in Claude Code): they open another session, not a task with a route, a workspace and consolidation |
 | Get a branch for the task, or a tree of its own | `jig task start <id>`, or `jig task start <id> --worktree` | `git checkout -b`, `git worktree add` |
 | Find what to read for the files you touch | `jig context --files <files>` | grepping `.ai/knowledge/`, or reading all of it |
 | Write one of the task's documents | `jig task artifact write <id> <kind> --from <file>` | your editing tools on a path under `.ai/workspace/` |
@@ -76,6 +76,11 @@ writes the answers to their gitignored `.ai/config.local.yaml` through
 `jig-upgrade` brings a project's copy of Jig up to the version on the machine: `jig self-update`
 when a newer release is out, `jig upgrade`, and the steps the release asks for by hand; what would
 stop the upgrade is named to the person, never worked around.
+
+The queue (`jig queue`) holds each task's priority, order and dependencies, and `jig queue next`
+advises from it. A task gets its priority when it is filed; to set priorities or order the tasks,
+start with the `jig-task` skill, which holds the `0`–`5` scale. The answer goes in the queue, not
+in a list in the chat.
 
 **Three questions decide the class**, asked about this change being wrong after it shipped:
 what takes it back; how far the mistake reaches — this repository, or users, money, somebody
