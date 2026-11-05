@@ -39,8 +39,9 @@ entered. End the session there — say the task is paused at their request and h
 (`jig task resume <id>`, then a new session); this is not a stop, so record none.
 
 - **Review in a fresh context.** Review and architecture review go to a reader who has not seen
-  the implementation, briefed as [jig-review](../jig-review/SKILL.md) §1 says. It records findings
-  and signs the receipt; you fix, set `fixed`, and a new reviewer does the re-review.
+  the implementation, briefed as [jig-review](../jig-review/SKILL.md) §1 says. A code review is two
+  readers at either depth, Behaviour then Standards, never side by side; only a `narrow` re-review
+  is one. They record findings and sign the receipt; you fix, set `fixed`, and a new reviewer does the re-review.
 - **A `delegate:` line for this session's runtime hands a stage to a helper** on the model it names — implement, review or
   both ([delegation](../jig-task/references/delegation.md)). Without one, you implement, and the
   review subagent runs on the session's model.
@@ -173,3 +174,23 @@ mechanics — the loop, the prompt each task agent gets, what to do when one fai
 It needs the run's level (`autopilot.git:` in `jig status`) at `pr` or better and a spec
 built on an epic. Without either, refuse the
 phase run, say which is missing, and offer to run the phase's tasks one at a time instead.
+
+## 7. Several tasks
+
+"Take these tasks on autopilot" is a run over a **set**: each task its own run, started as a slot
+frees (`autopilot.parallel`). The set is not the queue. Before each next start — the first one too —
+ask:
+
+```
+.ai/scripts/jig queue next
+```
+
+- **It names a task of the set**, or one outside it with no higher priority than the set's next:
+  start the set's next.
+- **It names a task outside the set with a higher priority** (a lower number; a task without one
+  comes last): start neither silently. Name it to the person and ask whether to take it or keep to
+  the set — §3's "a decision nobody made". Unattended: `jig task autopilot <id> decide --reason`
+  on a run of the set still on, finish the set's tasks in flight, start nothing new, and say so
+  when you hand back. Never take someone else's T3/T4 task to approve its gate as the agent.
+- **A task it names as taken by another session** is not free, in the set or out of it: never
+  start it; skip it and name it when you hand back.

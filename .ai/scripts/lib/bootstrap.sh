@@ -143,7 +143,7 @@ _bootstrap_dest_ok() {
 # gitignore jig installs lists it without a trailing slash, so a directory and
 # a link both match). That matters more than tidiness: anything a carry leaves
 # in the worktree that git does *not* ignore reads as untracked, and
-# `git worktree remove` without --force — the only removal jig ever performs —
+# `git worktree remove` without --force — the only way jig removes a task's worktree —
 # refuses such a worktree for the rest of its life. Staging beside the
 # destination was tried first and did exactly that: a project ignores
 # `vendor/`, and `vendor.jig-partial.60347` is not `vendor/`.
@@ -197,7 +197,7 @@ _bootstrap_discard() {
 #
 # This is the question that matters, asked of the only thing that can answer
 # it. Everything a carry puts in a worktree must be invisible to git, because
-# `git worktree remove` without `--force` — the only removal jig performs —
+# `git worktree remove` without `--force` — the only way jig removes a task's worktree —
 # refuses a worktree with anything untracked in it, and then housekeeping can
 # never clean that tree up (ADR-0029).
 #

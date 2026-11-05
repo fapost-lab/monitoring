@@ -35,7 +35,7 @@ run, recorded as below. No open wave with
 items of this phase means the phase is waiting on an earlier wave, or is done.
 
 **2. File the wave, in one commit.** For every `item … file` of the open wave, follow
-`jig-idea` §10: classify it, `jig task new … --from -` with the exact `Spec:` line, and rewrite
+`jig-idea` §10: classify it, `jig task new … --from -` with the exact `Spec:` line, its priority, and rewrite
 the roadmap item to start with `` `<task-id>` ``. Then commit the roadmap — the new tags plus
 any checkmarks you owe from earlier waves — **on the local epic, and do not push it**:
 
@@ -67,6 +67,12 @@ running agent. `inherit` removes an override before start.
 .ai/scripts/jig task start <id> --worktree          # prints the path
 .ai/scripts/jig task autopilot <id> start --phase <spec>/<n>
 ```
+
+Before each start, ask `jig queue next` as `jig-autopilot` §7 says: a higher-priority task
+outside the phase holds the start, so a release's notes task gets its number first (`jig-release`
+§5) — attended, a question for the message of step 4; unattended,
+the wave in flight finishes and nothing new starts — and either way it is a stop recorded with
+`jig spec stop`. A task the queue names as taken by another session is never started.
 
 Then start a background subagent with the prompt below — a subagent of your runtime, never a
 separate session of the app (`jig-autopilot` §2 says why). A slot is held by an agent still

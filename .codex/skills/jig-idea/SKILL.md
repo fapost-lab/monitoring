@@ -209,6 +209,9 @@ Check the result:
    ```
 
    Write the `Spec:` line exactly so: `jig spec done` and `jig spec remove` read it.
+   Then give it a priority: `.ai/scripts/jig queue set <task-id> --priority <0-5>`, as
+   [task priority](../jig-task/references/priority.md) says.
+
 3. Rewrite the item in `roadmap.md` to start with the id: ``- [ ] `<task-id>` — <goal>``. One task
    may cover several items; each of them then names it. Show the changed phase verbatim.
 

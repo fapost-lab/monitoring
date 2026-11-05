@@ -65,6 +65,7 @@ _task_usage() {
     set)
       printf 'usage: jig task set <id> <key> <value>\n'
       printf '       jig task set <id> class <Tn> --reason <text>   (a lower class than the current one)\n'
+      printf '       jig task set <id> status consolidated [--revision <n>] [--json]\n'
       ;;
     abandon) printf 'usage: jig task abandon <id> [--reason <text>] [--moved-to <repo>#<task-id>|<repo>#spec/<spec-id>]\n' ;;
     archive) printf 'usage: jig task archive <id>\n' ;;
@@ -93,7 +94,7 @@ _task_usage() {
       printf '       jig task receipt <id> --check\n'
       printf '       jig task receipt <id> --since-review [--format report|paths]\n'
       ;;
-    ship) printf 'usage: jig task ship <id> --message-file <file> [--title <t>] [--body-file <file>] [--draft]\n' ;;
+    ship) printf 'usage: jig task ship <id> --message-file <file> [--title <t>] [--body-file <file>] [--draft] [--partial]\n' ;;
     autopilot)
       printf 'usage: jig task autopilot <id> start [--phase <spec-id>/<n>]\n'
       printf '       jig task autopilot <id> stage <name>\n'
@@ -490,7 +491,7 @@ _task_borrowed_tasks_root() {
 #
 # The fallback to ADR-0029's single-task link is not a nicety. A path git does
 # not ignore reads as untracked, and `git worktree remove` without --force --
-# the only removal jig performs -- then refuses that worktree for the rest of
+# the only way jig removes a task's worktree -- then refuses that worktree for the rest of
 # its life. A rule ending in `/` matches only a directory, so a project that
 # ignores `.ai/workspace/tasks/` would earn exactly that. Being blind is the
 # lesser harm, so git is asked first and the old shape taken when it says no.
@@ -685,11 +686,26 @@ _task_md_put_goal() {
 # would be written as an actual newline and split the state file into a
 # second, bogus key (task_finding_set below uses the same ENVIRON pattern).
 _task_rewrite_state() {
-  local dir="$1" key="$2" value="$3" file tmp today
+  local dir="$1" key="$2" value="$3" file tmp
   _task_guard_dir "$dir"
   file="$dir/state"
   tmp="$dir/state.tmp.$$"
-  jig_cleanup_add "$tmp"
+  _task_state_set_into "$file" "$tmp" "$key" "$value"
+  mv "$tmp" "$file"
+  jig_task_state_forget
+  jig_record_changed
+}
+
+# _task_state_set_into <src> <dst> <key> <value> — the state file <src> with
+# <key> set to <value> and `updated_at` refreshed, into <dst>; <src> is not
+# touched. What _task_rewrite_state builds before it moves the file into
+# place, apart so that a write checked against a revision (`task set <id>
+# status consolidated --revision`) can build the whole file, claim the
+# revision and only then move it. <dst> may be <src>'s successor in a chain
+# of keys, never <src> itself.
+_task_state_set_into() {
+  local src="$1" dst="$2" key="$3" value="$4" today
+  jig_cleanup_add "$dst"
   today=$(jig_today)
   JIG_S_KEY="$key" JIG_S_VALUE="$value" JIG_S_TODAY="$today" \
     awk '
@@ -712,10 +728,7 @@ _task_rewrite_state() {
     END {
       if (!done) print key ": " value
     }
-  ' "$file" > "$tmp"
-  mv "$tmp" "$file"
-  jig_task_state_forget
-  jig_record_changed
+  ' "$src" > "$dst"
 }
 
 # Rewrite <dir>/state with the <key> line removed (companion to
@@ -1151,6 +1164,7 @@ _task_new_body() {
     return 0
   fi
   jig_relpath "$dir" "$JIG_PROJECT"
+  jig_info "not queued: $id — jig queue set $id --priority <0-5>; the scale is in the jig-task skill"
 }
 
 # task_start <id> — begin work on a filed task: cut its branch, check it out
@@ -1664,19 +1678,76 @@ _task_undo_worktree_start() {
   fi
 }
 
+# `jig task set <id> status consolidated` — the close — takes `--revision <n>`
+# and `--json` as `task resume` does (fapost-lab/jig#365): the write is checked
+# against the revision the caller read, and the answer is the closed task as
+# `task list --json` lists it, or an error.code. They are the close's alone:
+# on any other key they are refused as `usage`, never ignored, since a program
+# that sent a revision with a write that does not check it would believe it
+# had been protected. `--json` anywhere runs the whole command as the producer
+# of json_run (conventions/json-output.md).
 task_set() {
-  [ $# -eq 3 ] || [ $# -eq 5 ] || jig_die "$(_task_usage set)"
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _task_set_body 1 "$@"
+      return
+    fi
+  done
+  _task_set_body 0 "$@"
+}
+
+# _task_set_body <as_json> <id> <key> <value> [--reason <text>] [--revision <n>]
+# [--json] — the body of `task set`; with <as_json> 1 it runs inside json_run
+# and prints the closed task as data.
+_task_set_body() {
+  local as_json="$1" arg args=()
+  shift
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  set -- ${args[@]+"${args[@]}"}
+  [ $# -ge 3 ] || jig_fail usage "$(_task_usage set)"
   jig_require_init
-  local id="$1" key="$2" value="$3" dir reason="" has_reason=0
-  if [ $# -eq 5 ]; then
-    [ "$4" = --reason ] || jig_die "task set: unknown argument: $4"
-    [ "$key" = class ] || jig_die "task set: --reason is only for lowering a class"
-    reason="$5"
-    has_reason=1
-    [ -n "$reason" ] || jig_die "task set: --reason must not be empty"
-    _task_finding_valid_field "$reason" || jig_die "task set: --reason must be a single line with no tab"
+  local id="$1" key="$2" value="$3" dir reason="" has_reason=0 rev="" rev_given=0
+  shift 3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason)
+        [ $# -ge 2 ] || jig_fail usage "$(_task_usage set)"
+        reason="$2"; has_reason=1; shift 2 ;;
+      --revision)
+        [ $# -ge 2 ] || jig_fail usage "task set: --revision requires a value"
+        rev="$2"; rev_given=1; shift 2 ;;
+      *) jig_fail usage "task set: unknown argument: $1" ;;
+    esac
+  done
+  if [ "$has_reason" -eq 1 ]; then
+    [ "$key" = class ] || jig_fail usage "task set: --reason is only for lowering a class"
+    [ -n "$reason" ] || jig_fail usage "task set: --reason must not be empty"
+    _task_finding_valid_field "$reason" || jig_fail usage "task set: --reason must be a single line with no tab"
+  fi
+  local claim=0
+  if [ "$rev_given" -eq 1 ] || [ "$as_json" -eq 1 ]; then
+    [ "$key:$value" = status:consolidated ] \
+      || jig_fail usage "task set: --revision and --json are only for closing a task: jig task set $id status consolidated"
+    [ "$rev_given" -eq 0 ] || [ -n "$rev" ] || jig_fail usage "task set: --revision is empty"
+    [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "task set: --revision is not a revision: $rev"
+    claim=1
+  fi
+  _task_valid_id "$id" || jig_fail usage "invalid task id: $id"
+  # The revision this write is checked against: the caller's, or the one read
+  # here before the task is, so the state read below is never newer than it.
+  local expected=""
+  if [ "$claim" -eq 1 ]; then
+    if [ -n "$rev" ]; then expected=$rev; else expected=$(jig_revision_read); fi
   fi
   dir=$(task_dir "$id")
+  if [ "$claim" -eq 1 ] && [ ! -f "$dir/state" ]; then
+    jig_fail not-found "task set: unknown task: $id"
+  fi
   _task_guard_write "$id" "task set"
 
   case "$key" in
@@ -1737,7 +1808,7 @@ task_set() {
   if [ "$key" = status ] && [ "$value" = consolidated ]; then
     local refusal
     refusal=$(_task_close_refusal "$id" forge) || exit 1
-    [ -z "$refusal" ] || jig_die "$refusal"
+    [ -z "$refusal" ] || jig_fail not-closable "$refusal"
   fi
   if [ "$key" = knowledge_consolidated ] && [ "$value" = false ] && [ "$(task_state_get "$id" status)" = consolidated ]; then
     jig_die "task set: knowledge_consolidated cannot be false on a consolidated task: $id"
@@ -1750,6 +1821,12 @@ task_set() {
   case "$key:$value" in
     status:ready) gate=1 ;;
     knowledge_consolidated:true) gate=1 ;;
+    # A bare triage task's close records its knowledge decision (below), so
+    # it passes the same gates as recording it would.
+    status:consolidated)
+      if _task_is_bare_triage "$id" && [ "$(task_state_get "$id" knowledge_consolidated)" != true ]; then
+        gate=1
+      fi ;;
   esac
   if [ "$gate" -eq 1 ]; then
     local blocking
@@ -1778,8 +1855,24 @@ task_set() {
   fi
   [ "$has_reason" -eq 0 ] || jig_die "task set: --reason is only for lowering a class"
 
+  if [ "$claim" -eq 1 ]; then
+    _task_close_write "$id" "$dir" "$expected"
+    if [ "$as_json" -eq 1 ]; then
+      printf '{"task":%s}\n' "$(_task_json_one "$id")"
+    fi
+    return 0
+  fi
+
   local was=""
   [ "$key" != status ] || was=$(task_state_get "$id" status)
+  # A bare triage task closes in one command: it carries no change whose
+  # intent could be lost, so its knowledge decision is recorded with the close
+  # and `consolidated` still implies `knowledge_consolidated: true` (ADR-0030)
+  # for every reader (adr-20261029-a-ship-hands-open-findings-to-one-triage-task).
+  if [ "$key:$value" = status:consolidated ] && _task_is_bare_triage "$id" \
+     && [ "$(task_state_get "$id" knowledge_consolidated)" != true ]; then
+    _task_rewrite_state "$dir" knowledge_consolidated true
+  fi
   if [ "$value" = inherit ]; then
     _task_rewrite_state_remove "$dir" "$key"
   else
@@ -1788,6 +1881,35 @@ task_set() {
   if [ "$was" = abandoned ] && [ "$value" != abandoned ]; then
     _task_abandon_keys_clear "$id" "$dir"
   fi
+}
+
+# _task_close_write <id> <dir> <expected> — the close of a write checked
+# against a revision: the new state built whole (the knowledge decision of a
+# bare triage task with it, as the unchecked close records it), the revision
+# claimed, and only then the file moved into place — one write under one
+# claim, as `task resume` lands its own. A claim that does not stand writes
+# nothing and refuses with `stale-revision`.
+_task_close_write() {
+  local id="$1" dir="$2" expected="$3" rc=0 tmp tmp2
+  tmp="$dir/state.tmp.$$"
+  tmp2="$dir/state.tmp2.$$"
+  _task_guard_dir "$dir"
+  if _task_is_bare_triage "$id" && [ "$(task_state_get "$id" knowledge_consolidated)" != true ]; then
+    _task_state_set_into "$dir/state" "$tmp2" knowledge_consolidated true
+    _task_state_set_into "$tmp2" "$tmp" status consolidated
+    rm -f "$tmp2"
+  else
+    _task_state_set_into "$dir/state" "$tmp" status consolidated
+  fi
+  jig_revision_claim "$expected" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) rm -f "$tmp"; jig_fail stale-revision "task set: the clone changed since revision $expected; read again and retry" ;;
+    *) rm -f "$tmp"; jig_die "task set: cannot claim the clone revision in $(jig_revision_dir)" ;;
+  esac
+  mv "$tmp" "$dir/state"
+  jig_task_state_forget
+  jig_record_changed
 }
 
 # _task_close_refusal <id> <pr-state> — why `jig task set <id> status
@@ -1818,7 +1940,8 @@ task_set() {
 _task_close_refusal() {
   local id="$1" pr_state="$2" pr kc
   task_state_var kc "$id" knowledge_consolidated
-  if [ "$kc" != "true" ]; then
+  # A bare triage task's close records its knowledge decision too (task_set).
+  if [ "$kc" != "true" ] && ! _task_is_bare_triage "$id"; then
     printf 'task set: status consolidated requires knowledge_consolidated true; record the knowledge decision first: jig task set %s knowledge_consolidated true\n' "$id"
     return 0
   fi
@@ -4065,6 +4188,11 @@ _task_receipt_covers() {
 _task_route_evidence_missing() {
   local id="$1" point="$2" dir class stages stage
   dir=$(task_dir "$id")
+  # A triage task as `task ship` filed it has no route, so nothing of one is
+  # missing (adr-20261029-a-ship-hands-open-findings-to-one-triage-task).
+  if _task_is_bare_triage "$id"; then
+    return 0
+  fi
   class=$(task_state_get "$id" class)
   if ! _task_valid_class "$class"; then
     printf 'class (not classified, so there is no route: jig task set %s class Tn)\n' "$id"
@@ -4099,6 +4227,24 @@ _task_route_evidence_missing() {
         esac ;;
     esac
   done < <(printf '%s\n' "$stages" | tr ',' '\n' | sed 's/^ *//')
+}
+
+# _task_is_bare_triage <id> — exit 0 when <id> is a triage task as `task ship`
+# filed it: `triage_of` set (script-owned, so an ordinary task cannot claim
+# it), no class and never started. It holds decisions, not a change, so it has
+# no route to prove and no change whose intent consolidation could lose; it
+# closes with `jig task set <id> status consolidated`, which records the
+# knowledge decision with it. Classified or started, it is an ordinary task
+# again and its route is asked for as for any other
+# (adr-20261029-a-ship-hands-open-findings-to-one-triage-task).
+_task_is_bare_triage() {
+  local of class branch
+  task_state_var of "$1" triage_of
+  [ -n "$of" ] || return 1
+  task_state_var class "$1" class
+  ! _task_valid_class "$class" || return 1
+  task_state_var branch "$1" branch
+  [ -z "$branch" ]
 }
 
 # _task_route_evidence_list <id> <point> — what _task_route_evidence_missing
@@ -6049,7 +6195,9 @@ _task_triage_md() {
   local id="$1" url="$2" open="$3"
   printf '# Triage the open findings of %s\n\n' "$id"
   printf '## Goal\n\n'
-  printf 'Decide each open finding of %s with a person: file a task for it, or dismiss it with a reason.\n\n' "$id"
+  printf 'Decide each open finding of %s with a person: file a task for it, or dismiss it with a reason.\n' "$id"
+  # shellcheck disable=SC2016 # the backticks quote a command for the reader
+  printf 'Once each is decided, close this task as done: `jig task set %s status consolidated`.\n\n' "$(_task_triage_id "$id")"
   printf '## Source\n\n'
   printf -- '- Task: %s\n' "$id"
   printf -- '- Pull request: %s\n' "$url"
@@ -6071,11 +6219,14 @@ task_ship() {
   [ $# -ge 1 ] || jig_die "$(_task_usage ship)"
   local id="$1"
   shift
-  local message_file="" title="" body_file="" has_message=0 draft=0
+  local message_file="" title="" body_file="" has_message=0 draft=0 partial=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --draft)
         draft=1
+        shift ;;
+      --partial)
+        partial=1
         shift ;;
       --message-file)
         [ $# -ge 2 ] || jig_die "task ship: --message-file requires a value"
@@ -6186,6 +6337,17 @@ EOF
 
   jig_ship_stage_tracked "task ship" "$inputs_msg" "$inputs_body"
   jig_ship_check_staged "task ship"
+  # At `merge` nobody reads the pull request before it lands, so an index that
+  # leaves part of the change behind has to be declared, not only warned about
+  # (adr-20261029-task-ship-stages-tracked-changes-and-refuses-new-files). A
+  # draft is never merged, and below `merge` a person takes the next step.
+  if [ "$level" = merge ] && [ "$draft" -eq 0 ] && [ "$partial" -eq 0 ]; then
+    local left_out
+    left_out=$(jig_ship_left_out "$message_file" "$inputs_msg" "$inputs_body")
+    [ -z "$left_out" ] || jig_die "task ship: this commit would merge without these changes:
+$left_out
+Nothing was committed. Stage what belongs to the task (git add -u, git add <path>) and run again; if the rest is not this task's, run again with --partial."
+  fi
   jig_ship_commit "task ship" "$message_file" "$inputs_msg" "$inputs_body"
 
   # Before the first step that leaves this machine (common.sh, "what a ship

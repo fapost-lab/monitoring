@@ -9,6 +9,8 @@
 # its task.md. `new` creates a spec, `done` checks a linked task's roadmap
 # items, `drop` closes the items of an abandoned or moved one, `link` writes a filed task's `Spec:` line, `remove` unlinks a spec's open tasks and moves the spec to trash,
 # `stop` records a phase run's stop by sending it to the person's Telegram,
+# `item` adds, moves and files a roadmap item in Jig's own tree, never in a checkout
+# (adr-20261104-a-write-goes-in-jigs-own-tree),
 # `close` removes a spec whose roadmap is complete, `epic` declares, cuts,
 # finishes and reopens a spec's epic branch (ADR-0035, ADR-0040 as amended),
 # and `ship` carries a declaration, an epic or an epic's final pull request as
@@ -16,7 +18,7 @@
 # `list` only reads.
 # shellcheck shell=bash
 
-SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
+SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item file <id> <item> --task <task-id> (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
 
 cmd_spec() {
   local sub="${1:-}"
@@ -32,6 +34,7 @@ cmd_spec() {
     done) spec_done "$@"; jig_status_page_touch ;;
     drop) spec_drop "$@"; jig_status_page_touch ;;
     link) spec_link "$@" ;;
+    item) spec_item "$@"; jig_status_page_touch ;;
     remove) spec_remove "$@"; jig_status_page_touch ;;
     close) spec_close "$@"; jig_status_page_touch ;;
     epic) spec_epic "$@"; jig_status_page_touch ;;
@@ -299,14 +302,16 @@ spec_progress() {
 # none), and listed only when there are some: every item is counted exactly
 # once, which is what keeps spec_progress's sum equal to the old total.
 #
-# With `items` as the second argument (spec_phase_items) each counted item is
-# also printed, before the line of its section, as
-# `item\t<checked 0|1>\t<done 0|1>\t=<task-id>\t<fog 0|1>\t<text>`, `=` alone for
-# no task id — a mark no id can be, since `-` is one the pattern takes: <done> is
-# what the item counted as, the task id and the
-# fog mark by the same patterns the counts use, read from checked items too,
-# and the text as written after the checkbox, its indented continuation lines
-# joined with a space. Without it the output is the counts alone.
+# With `items` as the second argument each counted item is also printed, before
+# the line of its section, as
+# `item\t<checked 0|1>\t<done 0|1>\t=<task-id>\t<fog 0|1>\t<first>\t<last>\t<text>`,
+# `=` alone for no task id — a mark no id can be, since `-` is one the pattern
+# takes: <done> is what the item counted as, the task id and the fog mark by the
+# same patterns the counts use, read from checked items too, <first> and <last>
+# the lines it occupies, and the text as written after the checkbox, its indented
+# continuation lines joined with a space. Right before a section's own line comes
+# `section\t<heading line, 0 when none>\t<last line>`. Without it the output is
+# the counts alone.
 spec_phase_counts() {
   local items=0 merged
   [ "${2:-}" != items ] || items=1
@@ -315,20 +320,23 @@ spec_phase_counts() {
   # expanded.
   JIG_SP_MERGED="$merged" awk -v items="$items" '
     function reset() { done = 0; total = 0; filed = 0; fog = 0 }
-    function flush() {
-      if (phase != "-" || total > 0)
+    function flush(last) {
+      if (phase != "-" || total > 0) {
+        if (items == 1) printf "section\t%d\t%d\n", head, last
         printf "%s\t%s\t%d\t%d\t%d\t%d\n", phase, (title == "" ? "-" : title), done, total, filed, fog
+      }
     }
     function emit() {
       if (!pending) return
       gsub(/\t/, " ", itext)
       sub(/[[:space:]]+$/, "", itext)
-      printf "item\t%d\t%d\t=%s\t%d\t%s\n", ichecked, idone, itid, ifog, itext
+      printf "item\t%d\t%d\t=%s\t%d\t%d\t%d\t%s\n", ichecked, idone, itid, ifog, ifirst, ilast, itext
       pending = 0
     }
-    BEGIN { phase = "-"; title = ""; reset(); pending = 0; merged = ENVIRON["JIG_SP_MERGED"] }
+    BEGIN { phase = "-"; title = ""; head = 0; reset(); pending = 0; merged = ENVIRON["JIG_SP_MERGED"] }
     /^##[[:space:]]/ {
-      emit(); flush(); reset()
+      emit(); flush(NR - 1); reset()
+      head = NR
       h = $0
       sub(/^##[[:space:]]+/, "", h)
       gsub(/\t/, " ", h)
@@ -361,7 +369,7 @@ spec_phase_counts() {
       if (isdone) done++
       else if (tid != "") filed++
       else if (isfog) fog++
-      if (items == 1) { pending = 1; ichecked = checked; idone = isdone; itid = tid; ifog = isfog; itext = text }
+      if (items == 1) { pending = 1; ichecked = checked; idone = isdone; itid = tid; ifog = isfog; itext = text; ifirst = NR; ilast = NR }
       next
     }
     pending && /^[[:space:]]+[^[:space:]]/ {
@@ -369,18 +377,75 @@ spec_phase_counts() {
       sub(/^[[:space:]]+/, "", t)
       sub(/[[:space:]]+$/, "", itext)
       itext = itext " " t
+      ilast = NR
       next
     }
     { emit() }
-    END { emit(); flush() }
+    END { emit(); flush(NR) }
   ' "$1"
 }
 
 # spec_phase_items <roadmap.md|-> — spec_phase_counts with every item printed
 # before its section's line: the items and their counts from one pass, so the
-# two cannot disagree.
+# two cannot disagree. Each item carries its handle after the fog mark
+# (_spec_item_ids).
 spec_phase_items() {
-  spec_phase_counts "$1" items
+  spec_phase_counts "$1" items | _spec_item_ids
+}
+
+# _spec_item_ids — the rows of `spec_phase_counts <file> items` on stdin, on stdout
+# with the item's handle added as the field before <first>: `i-<12 hex>`, a digest of
+# its text, and `-2`, `-3`, … for a repeat of the same text, in roadmap order.
+#
+# The roadmap's format stays as it is: an id written in the file would reach the wave
+# grammar, `spec link`, `spec done` and every person reading it. The digest is of the
+# text without its filing — the leading task id or `fog:` — so that a move, a check and
+# a filing keep the handle; rewording the item changes it, and a write naming the old
+# one then finds nothing and refuses, which is what makes it safe
+# (adr-20261104-a-write-goes-in-jigs-own-tree).
+#
+# Bytes through `od`, numbers through awk: every awk agrees on those, where one reads
+# a Cyrillic letter as a character and another as two bytes; and each factor keeps the
+# arithmetic exact in a double. One od and three awks per roadmap, none per item: a
+# read lists every item of every spec.
+_spec_item_ids() {
+  local rows ids
+  rows=$(mktemp "${TMPDIR:-/tmp}/jig-spec-items.XXXXXX")
+  ids="$rows.ids"
+  jig_cleanup_add "$rows"
+  jig_cleanup_add "$ids"
+  cat > "$rows"
+  awk -F '\t' '$1 == "item" {
+      t = $8
+      if (t ~ /^`[A-Za-z0-9._-]+`[[:space:]]+(—|-|--)[[:space:]]/) sub(/^`[A-Za-z0-9._-]+`[[:space:]]+(—|--|-)[[:space:]]+/, "", t)
+      else sub(/^fog:[[:space:]]*/, "", t)
+      gsub(/[[:space:]]+/, " ", t)
+      sub(/^ /, "", t)
+      sub(/ $/, "", t)
+      print t
+    }' "$rows" | od -An -v -tu1 | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        c = $i + 0
+        if (c == 10) {
+          k = sprintf("%06x%06x", a + 0, b + 0)
+          n = ++seen[k]
+          print "i-" k (n > 1 ? "-" n : "")
+          a = 0; b = 0
+        } else {
+          a = (a * 257 + c + 1) % 16777213
+          b = (b * 263 + c + 1) % 16777183
+        }
+      }
+    }' > "$ids"
+  JIG_SI_IDS="$ids" awk -F '\t' 'BEGIN { OFS = "\t"; f = ENVIRON["JIG_SI_IDS"] }
+    $1 == "item" {
+      getline id < f
+      print $1, $2, $3, $4, $5, id, $6, $7, $8
+      next
+    }
+    { print }' "$rows"
+  rm -f "$rows" "$ids"
 }
 
 # spec_phase_rows — every spec's progress by phase for the status page, one
@@ -483,12 +548,14 @@ spec_list() {
 # spec_release_check. Local refs only: no fetch, no forge.
 _spec_list_json() {
   local arg root id dir title missing line branch state here checked_out
-  local loc rc ref src content release epic phases progress
+  local loc rc ref src content release epic phases progress waiting
   local _SPEC_MERGED_MEMO _SPEC_MERGED
   for arg in "$@"; do
     [ "$arg" = --json ] || jig_fail usage "spec list: unexpected argument: $arg"
   done
   jig_require_repo
+  # shellcheck source=lib/owntree.sh
+  . "$JIG_LIB/owntree.sh"
   root=$(spec_dir)
   _spec_merged_memo
   here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
@@ -545,10 +612,32 @@ _spec_list_json() {
     printf ',"title":%s,"missing_files":[%s]' "$_JSON" "$missing"
     json_str_or_null "$release"
     printf ',"release":%s,"epic":%s' "$_JSON" "$epic"
-    printf ',"progress":%s,"phases":%s}' "$progress" "$phases"
+    _spec_json_waiting "$id"
+    waiting=$_SPEC_JSON_WAITING
+    printf ',"progress":%s,"phases":%s,"waiting":%s}' "$progress" "$phases" "$waiting"
     sep=","
   done < <(spec_ids)
   printf ']}\n'
+}
+
+# _spec_json_waiting <id> — _SPEC_JSON_WAITING <- the edit of this spec that has not
+# landed (ot_waiting_json, lib/owntree.sh) with the roadmap as it is on its branch, or
+# null. A page shows the old roadmap right after a write that succeeded otherwise, and
+# the next edit names the handles this one made.
+_SPEC_JSON_WAITING=null
+_spec_json_waiting() {
+  local rec content
+  _SPEC_JSON_WAITING=null
+  ot_waiting_json "spec:$1"
+  [ -n "$_JSON" ] || return 0
+  rec=$_JSON
+  content=$(jig_git_show_path "$OT_W_TIP" "$JIG_AI_DIR/specs/$1/roadmap.md" 2>/dev/null) || content=""
+  if [ -n "$content" ]; then
+    _spec_json_phases < <(spec_phase_items - <<<"$content")
+    _SPEC_JSON_WAITING="$rec,\"progress\":$_SPEC_JSON_PROGRESS,\"phases\":$_SPEC_JSON_PHASES}"
+  else
+    _SPEC_JSON_WAITING="$rec,\"progress\":null,\"phases\":[]}"
+  fi
 }
 
 # _spec_json_phases — spec_phase_items rows on stdin, as JSON in two globals:
@@ -559,14 +648,15 @@ _spec_list_json() {
 _SPEC_JSON_PHASES="[]"
 _SPEC_JSON_PROGRESS=null
 _spec_json_phases() {
-  local f1 f2 f3 f4 f5 f6 items="" isep="" out="" psep="" num
+  local f1 f2 f3 f4 f5 f6 f7 f8 f9 items="" isep="" out="" psep="" num
   local sd=0 st=0 sf=0 sg=0
-  while IFS=$'\t' read -r f1 f2 f3 f4 f5 f6; do
+  while IFS=$'\t' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9; do
+    [ "$f1" != section ] || continue
     if [ "$f1" = item ]; then
-      # f2 checked, f3 done, f4 `=` and the task id, f5 fog, f6 the text (no
-      # tab in it).
-      json_quote "$f6"
-      items="$items$isep{\"text\":$_JSON"
+      # f2 checked, f3 done, f4 `=` and the task id, f5 fog, f6 the handle, f7 and
+      # f8 its lines, f9 the text (no tab in it).
+      json_quote "$f9"
+      items="$items$isep{\"id\":\"$f6\",\"text\":$_JSON"
       if [ "$f2" = 1 ]; then items="$items,\"checked\":true"; else items="$items,\"checked\":false"; fi
       if [ "$f3" = 1 ]; then items="$items,\"done\":true"; else items="$items,\"done\":false"; fi
       if [ "$f4" = = ]; then _JSON=null; else json_quote "${f4#=}"; fi
@@ -2779,44 +2869,19 @@ spec_remove() {
 spec_link() {
   [ $# -ge 2 ] || jig_die "spec link: missing argument (usage: jig spec link <spec-id> <task-id>)"
   [ $# -eq 2 ] || jig_die "spec link: unexpected argument: $3"
-  local sid="$1" tid="$2" roadmap tdir tasks_root st branch link rc=0 phases count phase line real phys
+  local sid="$1" tid="$2" roadmap tdir phases count phase line
   spec_valid_id "$sid" || jig_die "spec link: invalid spec id: $sid"
   jig_valid_id "$tid" || jig_die "spec link: invalid task id: $tid"
   jig_require_init
   roadmap="$(spec_dir)/$sid/roadmap.md"
   [ -d "$(spec_dir)/$sid" ] || jig_die "spec link: no such spec in this checkout: $JIG_AI_DIR/specs/$sid"
   [ -f "$roadmap" ] || jig_die "spec link: $JIG_AI_DIR/specs/$sid has no roadmap.md"
-  tasks_root="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
-  [ ! -L "$tasks_root" ] \
-    || jig_die "spec link: this checkout borrows its task workspaces; run it in the checkout that owns them"
-  tdir=$(spec_task_dir "$tid") || jig_die "spec link: invalid task id: $tid"
-  [ ! -L "$tdir" ] || jig_die "spec link: the workspace of $tid is a link; run it in the checkout that owns it"
-  [ -f "$tdir/task.md" ] || jig_die "spec link: unknown task: $tid (no $JIG_AI_DIR/workspace/tasks/$tid/task.md)"
-  # A link anywhere above the workspace (`.ai/workspace` too) would carry the
-  # write out of this checkout: the workspace must physically be the one this
-  # checkout keeps. spec.sh sources no other command library, so the check is
-  # the plain comparison, and a borrowing checkout is refused as above.
-  real=$(cd -P "$JIG_PROJECT" 2>/dev/null && pwd -P) || real=""
-  phys=""
-  [ -z "$real" ] || phys=$(cd -P "$tdir" 2>/dev/null && pwd -P) || phys=""
-  if [ -z "$real" ] || [ "$phys" != "$real/$JIG_AI_DIR/workspace/tasks/$tid" ]; then
-    jig_die "spec link: the workspace of $tid is not inside this checkout; run it in the checkout that owns it"
-  fi
-
-  st=$(spec_task_state "$tdir" status)
-  case "$st" in
-    consolidated | abandoned | archived) jig_die "spec link: $tid is $st; only a live task is linked" ;;
-  esac
-  link=$(jig_spec_link "$tdir/task.md") || rc=$?
-  [ "$rc" = 0 ] || jig_die "spec link: $tid links to more than one spec in its task.md"
-  if [ "$link" = "$sid" ]; then
+  _spec_link_check "$sid" "$tid"
+  tdir=$_SPEC_LINK_TDIR
+  if [ "$_SPEC_LINK_CURRENT" = "$sid" ]; then
     printf 'spec link: %s already linked to %s\n' "$tid" "$sid"
     return 0
   fi
-  [ -z "$link" ] || jig_die "spec link: $tid is linked to spec $link; unlink it there first"
-  branch=$(spec_task_state "$tdir" branch)
-  [ -z "$branch" ] \
-    || jig_die "spec link: $tid is started on $branch; a started task is not moved — ship it where it was cut from, and an epic gets it when the default branch is merged into it"
 
   # Every phase whose items name the task, once each; `-` for an item above
   # the first `## Phase` heading.
@@ -2856,6 +2921,46 @@ spec_link() {
   fi
   spec_link_task "$tdir/task.md" "$line" || jig_die "spec link: could not write $JIG_AI_DIR/workspace/tasks/$tid/task.md"
   printf 'spec link: %s linked: %s\n' "$tid" "$line"
+}
+
+# _spec_link_check <spec-id> <task-id> — may this task be linked to this spec: the
+# refusals of `spec link` and `spec item file`, which must not disagree. Leaves
+# _SPEC_LINK_TDIR, its workspace, and _SPEC_LINK_CURRENT, the spec it is linked to now;
+# already linked to this one is not a refusal.
+_SPEC_LINK_TDIR=""
+_SPEC_LINK_CURRENT=""
+_spec_link_check() {
+  local sid="$1" tid="$2" tdir tasks_root st branch link rc=0 real phys
+  tasks_root="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
+  [ ! -L "$tasks_root" ] \
+    || jig_fail not-linkable "spec link: this checkout borrows its task workspaces; run it in the checkout that owns them"
+  tdir=$(spec_task_dir "$tid") || jig_fail usage "spec link: invalid task id: $tid"
+  [ ! -L "$tdir" ] || jig_fail not-linkable "spec link: the workspace of $tid is a link; run it in the checkout that owns it"
+  [ -f "$tdir/task.md" ] || jig_fail not-found "spec link: unknown task: $tid (no $JIG_AI_DIR/workspace/tasks/$tid/task.md)"
+  # A link anywhere above the workspace (`.ai/workspace` too) would carry the
+  # write out of this checkout: the workspace must physically be the one this
+  # checkout keeps. spec.sh sources no other command library, so the check is
+  # the plain comparison, and a borrowing checkout is refused as above.
+  real=$(cd -P "$JIG_PROJECT" 2>/dev/null && pwd -P) || real=""
+  phys=""
+  [ -z "$real" ] || phys=$(cd -P "$tdir" 2>/dev/null && pwd -P) || phys=""
+  if [ -z "$real" ] || [ "$phys" != "$real/$JIG_AI_DIR/workspace/tasks/$tid" ]; then
+    jig_fail not-linkable "spec link: the workspace of $tid is not inside this checkout; run it in the checkout that owns it"
+  fi
+
+  st=$(spec_task_state "$tdir" status)
+  case "$st" in
+    consolidated | abandoned | archived) jig_fail not-linkable "spec link: $tid is $st; only a live task is linked" ;;
+  esac
+  link=$(jig_spec_link "$tdir/task.md") || rc=$?
+  [ "$rc" = 0 ] || jig_fail not-linkable "spec link: $tid links to more than one spec in its task.md"
+  _SPEC_LINK_TDIR=$tdir
+  _SPEC_LINK_CURRENT=$link
+  [ "$link" != "$sid" ] || return 0
+  [ -z "$link" ] || jig_fail not-linkable "spec link: $tid is linked to spec $link; unlink it there first"
+  branch=$(spec_task_state "$tdir" branch)
+  [ -z "$branch" ] \
+    || jig_fail not-linkable "spec link: $tid is started on $branch; a started task is not moved — ship it where it was cut from, and an epic gets it when the default branch is merged into it"
 }
 
 # spec_link_task <task.md> <line> — put <line> under the first `# ` heading,
@@ -2916,4 +3021,387 @@ spec_unlink_task() {
   fi
   mv "$tmp" "$file"
   jig_record_changed
+}
+
+# --- roadmap items, in Jig's own tree ---------------------------------------------
+#
+# `spec item add|move|file` change a roadmap on `spec/<id>`, reaching the base (the
+# default branch, or an open epic) through a pull request, in a tree of Jig's own, and
+# never in anybody's checkout (lib/owntree.sh, adr-20261104-a-write-goes-in-jigs-own-tree).
+
+_SPEC_ITEM_JSON=""
+
+# spec_item — `--json` anywhere runs the whole command as the producer of json_run.
+spec_item() {
+  local arg
+  # shellcheck source=lib/owntree.sh
+  . "$JIG_LIB/owntree.sh"
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      _SPEC_ITEM_JSON=1
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _spec_item_main "$@"
+      return
+    fi
+  done
+  _spec_item_main "$@"
+}
+
+# The roadmap as arrays, for the line arithmetic of a write. Items and sections
+# in roadmap order; M_SEC is an item's index into the S_ arrays.
+M_ID=() M_FIRST=() M_LAST=() M_SEC=() M_CHECKED=() M_TID=() M_FOG=() M_TEXT=()
+S_PHASE=() S_HEAD=() S_LAST=()
+
+# _spec_map_load <roadmap> — fill them, from the one reader of the roadmap's grammar.
+_spec_map_load() {
+  local f1 f2 f3 f4 f5 f6 f7 f8 f9 n=0 sec=0
+  M_ID=() M_FIRST=() M_LAST=() M_SEC=() M_CHECKED=() M_TID=() M_FOG=() M_TEXT=()
+  S_PHASE=() S_HEAD=() S_LAST=()
+  while IFS=$'\t' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9; do
+    case "$f1" in
+      item)
+        M_CHECKED[n]=$f2; M_TID[n]=${f4#=}; M_FOG[n]=$f5; M_ID[n]=$f6
+        M_FIRST[n]=$f7; M_LAST[n]=$f8; M_TEXT[n]=$f9; M_SEC[n]=$sec
+        n=$((n + 1)) ;;
+      section) S_HEAD[sec]=$f2; S_LAST[sec]=$f3 ;;
+      *) S_PHASE[sec]=$f1; sec=$((sec + 1)) ;;
+    esac
+  done < <(spec_phase_items "$1")
+}
+
+# _spec_map_find <handle> — _SPEC_I <- its index, or refused.
+_SPEC_I=0
+_spec_map_find() {
+  local i=0
+  while [ "$i" -lt "${#M_ID[@]}" ]; do
+    if [ "${M_ID[$i]}" = "$1" ]; then
+      _SPEC_I=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  jig_fail not-found "spec item: no item $1 in the roadmap of $_SPEC_ITEM_SPEC on $OT_BRANCH; read it again"
+}
+
+# _spec_map_phase <phase> — _SPEC_S <- the index of that phase's section, or refused.
+_SPEC_S=0
+_spec_map_phase() {
+  local i=0
+  while [ "$i" -lt "${#S_PHASE[@]}" ]; do
+    if [ "${S_PHASE[$i]}" = "$1" ]; then
+      _SPEC_S=$i
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  jig_fail not-found "spec item: the roadmap of $_SPEC_ITEM_SPEC has no phase $1"
+}
+
+# _spec_map_place <section> <top|bottom> <skip-index> <file> — where a block goes:
+# _SPEC_AT, the line it goes after; _SPEC_PRE and _SPEC_POST, whether it needs a blank
+# line before and after, which only a section with no other item does: it goes after
+# the section's last line that is not blank.
+_SPEC_AT=0 _SPEC_PRE=0 _SPEC_POST=0
+_spec_map_place() {
+  local sec="$1" how="$2" skip="$3" file="$4" i=0 first="" last=""
+  _SPEC_PRE=0 _SPEC_POST=0
+  while [ "$i" -lt "${#M_ID[@]}" ]; do
+    if [ "${M_SEC[$i]}" = "$sec" ] && [ "$i" != "$skip" ]; then
+      [ -n "$first" ] || first=$i
+      last=$i
+    fi
+    i=$((i + 1))
+  done
+  if [ -n "$first" ]; then
+    if [ "$how" = top ]; then _SPEC_AT=$((M_FIRST[first] - 1)); else _SPEC_AT=${M_LAST[$last]}; fi
+    return 0
+  fi
+  _SPEC_AT=$(awk -v from="${S_HEAD[$sec]}" -v to="${S_LAST[$sec]}" '
+    NR >= from && NR <= to && /[^[:space:]]/ { at = NR }
+    END { print at + 0 }' "$file")
+  _SPEC_PRE=1
+  if [ -n "$(sed -n "$((_SPEC_AT + 1))p" "$file" | tr -d '[:space:]')" ]; then _SPEC_POST=1; fi
+}
+
+# _spec_map_splice <file> <at> <pre> <post> <first> <last> <block> — <file> with lines
+# <first>..<last> taken out (0 0 for none) and <block> put after line <at>, by the old
+# numbering. The block comes through the environment (conventions/shell.md).
+_spec_map_splice() {
+  JIG_SI_BLOCK="$7" awk -v at="$2" -v pre="$3" -v post="$4" -v first="$5" -v last="$6" '
+    function put() {
+      if (pre) print ""
+      print ENVIRON["JIG_SI_BLOCK"]
+      if (post) print ""
+    }
+    BEGIN { if (at == 0) put() }
+    {
+      if (first == 0 || NR < first || NR > last) print
+      if (NR == at) put()
+    }' "$1"
+}
+
+# _spec_text_id <text> — the handle <text> would have, as the first of its text.
+_spec_text_id() {
+  printf 'item\t0\t0\t=\t0\t0\t0\t%s\n' "$1" | _spec_item_ids | cut -f6
+}
+
+# _spec_item_base <id> — _SPEC_ITEM_BASE <- where the edit is going: the epic when the
+# roadmap on the default branch, as jig_base_ref reads it, declares an open one, which reaches it through
+# a pull request and never a push (ADR-0040 as amended), and otherwise the default
+# branch. A roadmap that is on neither yet has only its own `spec/<id>` to be read on.
+_SPEC_ITEM_BASE=""
+_spec_item_base() {
+  local id="$1" rel default start line rc=0 branch
+  rel="$JIG_AI_DIR/specs/$id/roadmap.md"
+  default=$(cfg git.base_branch main)
+  ot_fetch "$default"
+  start=$(jig_base_ref "$default")
+  _SPEC_ITEM_BASE=$default
+  line=$(jig_git_show_path "$start" "$rel" 2>/dev/null | jig_spec_epic -) || rc=$?
+  [ "$rc" -ne 2 ] || jig_die "spec item: $rel declares more than one epic; keep one Epic: line"
+  [ -n "$line" ] || return 0
+  [ "${line##* }" = open ] || return 0
+  branch=${line% *}
+  git check-ref-format --branch "$branch" >/dev/null 2>&1 \
+    || jig_die "spec item: git rejects the epic's name: $branch"
+  ot_fetch "$branch"
+  [ -n "$(jig_base_ref "$branch")" ] \
+    || jig_fail epic-missing "spec item: $id is built on $branch, which is neither here nor on origin; cut it with \`jig spec epic $id\`, or fetch it"
+  _SPEC_ITEM_BASE=$branch
+}
+
+_spec_item_need() {
+  [ "$2" -ge 2 ] || jig_fail usage "spec item: $1 requires a value"
+}
+
+_SPEC_ITEM_SPEC=""
+
+# _spec_item_main <add|move|file> <spec> [<item>] … — the three writes.
+_spec_item_main() {
+  local args=() arg sub id item="" phase="" text="" after="" place="" task="" rev="" rev_given=""
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  [ "${#args[@]}" -ge 2 ] || jig_fail usage "spec item: missing arguments; $SPEC_USAGE"
+  sub=${args[0]}
+  id=${args[1]}
+  args=("${args[@]:2}")
+  case "$sub" in
+    add) ;;
+    move | file)
+      [ "${#args[@]}" -ge 1 ] || jig_fail usage "spec item $sub: missing the item"
+      item=${args[0]}
+      args=("${args[@]:1}")
+      case "$item" in -*) jig_fail usage "spec item $sub: missing the item before $item" ;; esac
+      ;;
+    *) jig_fail usage "spec item: unknown subcommand: $sub; $SPEC_USAGE" ;;
+  esac
+  spec_valid_id "$id" || jig_fail usage "spec item: invalid spec id: $id"
+  _SPEC_ITEM_SPEC=$id
+  set -- ${args[@]+"${args[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --revision) _spec_item_need "$1" $#; rev=$2; rev_given=1; shift 2 ;;
+      --phase)
+        [ "$sub" != file ] || jig_fail usage "spec item file: unexpected argument: $1"
+        _spec_item_need "$1" $#; phase=$2; shift 2 ;;
+      --text)
+        [ "$sub" = add ] || jig_fail usage "spec item $sub: unexpected argument: $1"
+        _spec_item_need "$1" $#; text=$2; shift 2 ;;
+      --after)
+        [ "$sub" != file ] || jig_fail usage "spec item file: unexpected argument: $1"
+        [ -z "$place" ] || jig_fail usage "spec item $sub: give one of --after, --top, --bottom"
+        _spec_item_need "$1" $#; place=after; after=$2; shift 2 ;;
+      --top | --bottom)
+        [ "$sub" != file ] || jig_fail usage "spec item file: unexpected argument: $1"
+        [ -z "$place" ] || jig_fail usage "spec item $sub: give one of --after, --top, --bottom"
+        place=${1#--}; shift ;;
+      --task)
+        [ "$sub" = file ] || jig_fail usage "spec item $sub: unexpected argument: $1"
+        _spec_item_need "$1" $#; task=$2; shift 2 ;;
+      *) jig_fail usage "spec item $sub: unexpected argument: $1" ;;
+    esac
+  done
+  [ -z "$rev_given" ] || [ -n "$rev" ] || jig_fail usage "spec item: --revision is empty"
+  [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "spec item: --revision is not a revision: $rev"
+  case "$phase" in
+    '' | *[!0-9]*) [ -z "$phase" ] || jig_fail usage "spec item $sub: --phase is a number: $phase" ;;
+  esac
+  case "$sub" in
+    add)
+      [ -n "$phase" ] || jig_fail usage "spec item add: --phase is required"
+      # One line in the roadmap: tabs and line breaks become spaces.
+      text=$(printf '%s' "$text" | tr '\t\r\n' '   ')
+      text=$(printf '%s' "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      [ -n "$text" ] || jig_fail usage "spec item add: --text is required and not blank"
+      ;;
+    move)
+      if [ -z "$phase" ] && [ -z "$place" ]; then
+        jig_fail usage "spec item move: say where: --phase, --after, --top or --bottom"
+      fi
+      if [ "$place" = after ] && [ -n "$phase" ]; then
+        jig_fail usage "spec item move: --after names the place; --phase goes with --top or --bottom"
+      fi
+      ;;
+    file)
+      [ -n "$task" ] || jig_fail usage "spec item file: --task is required"
+      jig_valid_id "$task" || jig_fail usage "spec item file: invalid task id: $task"
+      ;;
+  esac
+  jig_require_init
+
+  ot_begin "spec item $sub" "spec:$id" "$rev"
+  _spec_item_base "$id"
+  ot_open "spec/$id" "$_SPEC_ITEM_BASE"
+
+  local rel roadmap crlf=0 first_line norm new msg tmpd
+  rel="$JIG_AI_DIR/specs/$id/roadmap.md"
+  roadmap="$OT_TREE/$rel"
+  [ -f "$roadmap" ] || jig_fail not-found "spec item: no spec $id on $OT_BRANCH or $OT_BASE; a spec only in a working tree is not reachable until it is committed, and one only on an unpushed $OT_BASE until it is pushed"
+  # The ending is read by the shell, awk works on LF, and the ending goes back once on
+  # the whole stream (conventions/shell.md).
+  IFS= read -r first_line < "$roadmap" || true
+  case "$first_line" in *$'\r') crlf=1 ;; esac
+  tmpd=$(mktemp "${TMPDIR:-/tmp}/jig-spec-item.XXXXXX")
+  norm="$tmpd.norm"
+  new="$tmpd.new"
+  msg="$tmpd.msg"
+  jig_cleanup_add "$tmpd"
+  jig_cleanup_add "$norm"
+  jig_cleanup_add "$new"
+  jig_cleanup_add "$msg"
+  tr -d '\r' < "$roadmap" > "$norm"
+  _spec_map_load "$norm"
+
+  local handle=""
+  case "$sub" in
+    add) _spec_item_build_add "$id" "$phase" "$text" "$place" "$after" "$norm" "$new" "$msg"; handle=$_SPEC_ITEM_HANDLE ;;
+    move) _spec_item_build_move "$id" "$item" "$phase" "$place" "$after" "$norm" "$new" "$msg"; handle=$item ;;
+    file) _spec_item_build_file "$id" "$item" "$task" "$norm" "$new" "$msg"; handle=$item ;;
+  esac
+
+  ot_claim
+  if [ "$crlf" -eq 1 ]; then
+    awk '{ printf "%s\r\n", $0 }' "$new" > "$norm"
+    mv "$norm" "$roadmap"
+  else
+    mv "$new" "$roadmap"
+  fi
+  jig_record_changed
+  ot_commit "$msg" "$rel"
+  ot_ship "Roadmap edits: $id" "Edits to the roadmap of \`$id\`, made through Jig on a branch of its own: nobody's checkout moved. Each commit is one edit, and further edits land here."
+  # After the record: the commit stands, so a link that fails is an answer, not a refusal.
+  [ "$sub" != file ] || _spec_item_link "$id" "$task" "$_SPEC_ITEM_PHASE"
+
+  # The item as the roadmap now has it. Its handle holds, but for one of a repeated text,
+  # which a move may renumber: the text then still finds it.
+  tr -d '\r' < "$roadmap" > "$norm"
+  _spec_map_load "$norm"
+  _spec_map_find "$handle"
+  local i=$_SPEC_I sec
+  sec=${S_PHASE[${M_SEC[$i]}]}
+  if [ -n "$_SPEC_ITEM_JSON" ]; then
+    local rec w
+    ot_answer_json
+    w=$_JSON
+    json_quote "$id"; rec="{\"spec\":$_JSON,\"item\":{\"id\":\"${M_ID[$i]}\""
+    json_quote "${M_TEXT[$i]}"; rec="$rec,\"text\":$_JSON"
+    if [ "${M_CHECKED[$i]}" = 1 ]; then rec="$rec,\"checked\":true"; else rec="$rec,\"checked\":false"; fi
+    json_str_or_null "${M_TID[$i]}"; rec="$rec,\"task\":$_JSON"
+    if [ "${M_FOG[$i]}" = 1 ]; then rec="$rec,\"fog\":true"; else rec="$rec,\"fog\":false"; fi
+    json_int_or_null "$sec"; rec="$rec,\"phase\":$_JSON}"
+    printf '%s,"write":%s}\n' "$rec" "$w"
+  else
+    printf 'spec item: %s %s in %s\n' "$sub" "${M_ID[$i]}" "$id"
+    ot_answer_text
+  fi
+}
+
+_SPEC_ITEM_HANDLE=""
+_SPEC_ITEM_PHASE=""
+
+# _spec_item_where <place> <after> <section> <skip-index> <file> — the place a block
+# goes, for add and move: _SPEC_AT and its blank lines.
+_spec_item_where() {
+  local place="$1" after="$2" sec="$3" skip="$4" file="$5"
+  if [ "$place" = after ]; then
+    _spec_map_find "$after"
+    [ "$_SPEC_I" != "$skip" ] || jig_fail usage "spec item: an item cannot go after itself"
+    _SPEC_AT=${M_LAST[$_SPEC_I]}
+    _SPEC_PRE=0 _SPEC_POST=0
+    return 0
+  fi
+  _spec_map_place "$sec" "${place:-bottom}" "$skip" "$file"
+}
+
+_spec_item_build_add() {
+  local id="$1" phase="$2" text="$3" place="$4" after="$5" norm="$6" new="$7" msg="$8" i=0
+  _spec_map_phase "$phase"
+  local sec=$_SPEC_S
+  _SPEC_ITEM_HANDLE=$(_spec_text_id "$text")
+  while [ "$i" -lt "${#M_ID[@]}" ]; do
+    [ "${M_ID[$i]}" != "$_SPEC_ITEM_HANDLE" ] \
+      || jig_fail already-exists "spec item add: the roadmap of $id already has this item: $_SPEC_ITEM_HANDLE"
+    i=$((i + 1))
+  done
+  if [ "$place" = after ]; then
+    _spec_map_find "$after"
+    [ "${M_SEC[$_SPEC_I]}" = "$sec" ] \
+      || jig_fail usage "spec item add: $after is not in phase $phase"
+  fi
+  _spec_item_where "$place" "$after" "$sec" -1 "$norm"
+  _spec_map_splice "$norm" "$_SPEC_AT" "$_SPEC_PRE" "$_SPEC_POST" 0 0 "- [ ] $text" > "$new"
+  printf 'Add a roadmap item to %s\n\n%s\n' "$id" "$text" > "$msg"
+}
+
+_spec_item_build_move() {
+  local id="$1" item="$2" phase="$3" place="$4" after="$5" norm="$6" new="$7" msg="$8" self sec block
+  _spec_map_find "$item"
+  self=$_SPEC_I
+  sec=${M_SEC[$self]}
+  if [ -n "$phase" ]; then
+    _spec_map_phase "$phase"
+    sec=$_SPEC_S
+  fi
+  _spec_item_where "$place" "$after" "$sec" "$self" "$norm"
+  block=$(sed -n "${M_FIRST[$self]},${M_LAST[$self]}p" "$norm")
+  _spec_map_splice "$norm" "$_SPEC_AT" "$_SPEC_PRE" "$_SPEC_POST" "${M_FIRST[$self]}" "${M_LAST[$self]}" "$block" > "$new"
+  printf 'Move a roadmap item in %s\n\n%s\n' "$id" "${M_TEXT[$self]}" > "$msg"
+}
+
+# _spec_item_build_file — the item gets the task in front (`fog:` goes: it is filed
+# now), and every refusal of `spec link` comes before anything is written.
+_spec_item_build_file() {
+  local id="$1" item="$2" task="$3" norm="$4" new="$5" msg="$6" i
+  _spec_map_find "$item"
+  i=$_SPEC_I
+  [ -z "${M_TID[$i]}" ] || jig_fail already-exists "spec item file: $item already names task ${M_TID[$i]}"
+  [ "${M_CHECKED[$i]}" != 1 ] || jig_fail not-linkable "spec item file: $item is checked; a done item files no task"
+  _spec_link_check "$id" "$task"
+  _SPEC_ITEM_PHASE=${S_PHASE[${M_SEC[$i]}]}
+  JIG_SI_TASK="$task" awk -v at="${M_FIRST[$i]}" '
+    NR == at && match($0, /^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]*/) {
+      head = substr($0, 1, RLENGTH)
+      rest = substr($0, RLENGTH + 1)
+      sub(/^fog:[[:space:]]*/, "", rest)
+      print head "`" ENVIRON["JIG_SI_TASK"] "` — " rest
+      next
+    }
+    { print }' "$norm" > "$new"
+  printf 'File %s from the roadmap of %s\n\n%s\n' "$task" "$id" "${M_TEXT[$i]}" > "$msg"
+}
+
+# _spec_item_link <spec> <task> <phase> — its `Spec:` line, as `spec link` writes it.
+_spec_item_link() {
+  local line
+  [ "$_SPEC_LINK_CURRENT" != "$1" ] || return 0
+  if [ "$3" = - ]; then
+    line="Spec: .ai/specs/$1/"
+  else
+    line="Spec: .ai/specs/$1/ — Phase $3"
+  fi
+  if ! spec_link_task "$_SPEC_LINK_TDIR/task.md" "$line"; then
+    OT_NOTE="${OT_NOTE:+$OT_NOTE; }could not write the Spec: line of $2; run \`jig spec link $1 $2\` once the item has landed"
+  fi
 }

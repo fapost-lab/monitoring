@@ -1,6 +1,6 @@
 ---
 name: jig-task
-description: Start or resume a task with Jig — classify it by risk, create its workspace and choose the workflow. Use when the user describes work to do ("add …", "fix …", "refactor …"), asks to start or continue a task, asks what to take next ("what next", "take the next one"), or says "jig task", "classify this", "what process does this need".
+description: Start or resume a task with Jig — classify it by risk, create its workspace and choose the workflow. Use when the user describes work to do ("add …", "fix …", "refactor …"), asks to start or continue a task, asks what to take next ("what next", "take the next one"), asks to set priorities or order the tasks ("prioritise", "order the backlog"), or says "jig task", "classify this", "what process does this need".
 ---
 
 # jig-task — classify and route
@@ -64,6 +64,9 @@ When the person asks what to take next ("what next", "take the next one"), run
 through this skill (§3). On `next: none`, report its reason and the lines under it and stop:
 do not pick a task yourself.
 
+When the person asks to set priorities or to order the tasks, follow
+[task priority](references/priority.md): the answer is written to the queue, not listed in the chat.
+
 ## 2. Classify
 
 Read `references/classification.md`, answer its risk test — what a mistake would cost and
@@ -84,6 +87,9 @@ T0 and T1 that fit in one session need no workspace. Otherwise:
 
 The id is short and kebab-case, derived from the work (`fix-trigger-idempotency`), not a
 ticket number unless the project uses one. Fill in `task.md`: goal, scope, notes.
+
+**Give it a priority when you file it**, from what is confirmed, not the worst that could happen,
+`.ai/scripts/jig queue set <id> --priority <0-5>`: a task not in the queue is never advised. [Task priority](references/priority.md) holds the scale and how to pick the number.
 
 **The goal comes before the start.** `task start` warns when `## Goal` is empty or holds only the
 template's comment, and refuses a T3 or T4 task until it is written. Write it from what you were

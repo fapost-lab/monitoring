@@ -1188,13 +1188,22 @@ jig_ship_stage_tracked() {
   if [ -n "$untracked" ]; then
     jig_die "$who: nothing is staged, and these files are not tracked by git:
 $untracked
-A new file is never staged for you: stage the ones that belong to the change (git add <path>), ignore or remove the rest, and run again."
+A new file is never staged for you: stage the ones that belong to the change (git add <path>), ignore or remove the rest. Once anything is staged, that index is the commit, so stage the changes to tracked files too (git add -u), and run again."
   fi
   git -C "$JIG_PROJECT" add -u -- . \
     ":(exclude)$JIG_AI_DIR/workspace" ":(exclude)$JIG_AI_DIR/runtime" \
     || jig_die "$who: git add -u failed"
   staged=$(jig_ship_staged)
   [ -z "$staged" ] || printf '%s: nothing was staged; staged the tracked changes:\n%s\n' "$who" "$staged"
+}
+
+# jig_ship_left_out [<file>...] — what the index would leave in the working
+# tree, one path per line: changes to tracked files and new files, but never
+# .ai/workspace/, .ai/runtime/ or the <file>s, which are the ship's inputs.
+jig_ship_left_out() {
+  { git -C "$JIG_PROJECT" diff --name-only -- . \
+      ":(exclude)$JIG_AI_DIR/workspace" ":(exclude)$JIG_AI_DIR/runtime" 2>/dev/null
+    jig_ship_untracked "$@"; } | sed '/^$/d'
 }
 
 # jig_ship_commit <who> <message-file> [<file>...] — commit the index as it
@@ -1224,8 +1233,7 @@ jig_ship_commit() {
     git -C "$JIG_PROJECT" commit -F "$message_file" >/dev/null \
       || jig_die "$who: git commit failed"
     printf 'committed %s\n' "$(git -C "$JIG_PROJECT" rev-parse --short HEAD)"
-    unstaged=$( { git -C "$JIG_PROJECT" diff --name-only 2>/dev/null
-                  jig_ship_untracked "$message_file" "$@"; } | sed '/^$/d')
+    unstaged=$(jig_ship_left_out "$message_file" "$@")
     [ -z "$unstaged" ] || jig_warn "$who: these changes are not part of this commit; stage them and ship again if they belong to it:
 $unstaged"
     return 0
@@ -2546,7 +2554,8 @@ jig_status_page_flush() {
 #
 # The value is the highest numeric **name** in `.ai/runtime/revision/` of the
 # clone's main checkout (jig_config_clone_root: every worktree raises and reads
-# the same one, ADR-0008 as amended 2026-09-25). Raising it claims the next
+# the same one, ADR-0008 as amended 2026-09-25; see jig_revision_dir for a clone with
+# no main checkout to find). Raising it claims the next
 # name, a file created exclusively (jig_claim_file, O_EXCL on POSIX and
 # CREATE_NEW on NTFS under Git Bash), so of two writers that both saw <n> exactly
 # one creates <n+1> and the other gets EEXIST, reads again and claims <n+2>; a
@@ -2558,10 +2567,15 @@ jig_status_page_flush() {
 # A file edited by hand, or changed by a git command a person ran, raises
 # nothing: the accepted risk of the contract-extensions spec.
 
-# jig_revision_dir — where the counter lives; fails outside a project.
+# jig_revision_dir — where the counter lives; fails outside a project. Where a clone has
+# no main checkout to find, under its git common directory (jig_config_odd_common).
 jig_revision_dir() {
-  local root
+  local root common
   [ -n "${JIG_PROJECT:-}" ] || return 1
+  if common=$(jig_config_odd_common); then
+    printf '%s/jig/revision\n' "$common"
+    return 0
+  fi
   root=$(jig_config_clone_root) || return 1
   [ -n "$root" ] || return 1
   printf '%s/%s/runtime/revision\n' "$root" "$JIG_AI_DIR"

@@ -322,6 +322,16 @@ $rel"
   else
     printf 'specs: none\n'
   fi
+  # Only when something waits: the edits Jig committed in its own tree that have not
+  # landed. Counted, not listed, as specs are: `jig writes` lists.
+  # shellcheck source=lib/owntree.sh
+  . "$JIG_LIB/owntree.sh"
+  local waiting_target waiting=0
+  while IFS= read -r waiting_target; do
+    [ -n "$waiting_target" ] || continue
+    if ot_waiting "$waiting_target"; then waiting=$((waiting + 1)); fi
+  done < <(ot_targets)
+  [ "$waiting" -eq 0 ] || printf 'writes: %s waiting (jig writes)\n' "$waiting"
 
   local found=0 rec line default_base blocking bcount autopilot_note qlines qon qreason qago
   [ -n "$_STATUS_LIVE_READY" ] || _status_live_collect
@@ -1989,14 +1999,26 @@ _status_attention() {
   #
   # 0c. An upgrade waits on its pull request, or was merged and not brought
   # here yet (task upgrade-land): one item per upgrade branch the forge cache
-  # knows. While one stands, 0b is not said: what is left of that upgrade is
-  # a merge and `jig upgrade --land`, and `jig upgrade` again would only cut a
-  # second branch for the same version.
-  local up_from up_to upr ub ust uat uurl uto uhave ubase
+  # knows. While one stands for this machine's version or a newer one, 0b is
+  # not said: what is left of that upgrade is a merge and `jig upgrade
+  # --land`, and `jig upgrade` again would only cut a second branch for the
+  # same version. One for an older version — an abandoned pull request left
+  # open — does not hide the newer upgrade (task upgrade-land-followups); a
+  # branch whose name holds no version is taken as covering it, as before.
+  local up_from up_to upr ub ust uat uurl uto uhave ubase up_covered=0
   upr=$(_status_upgrade_prs)
+  if up_from=$(_status_project_behind); then
+    up_to=${up_from#* }
+    up_from=${up_from%% *}
+  else
+    up_from=""
+  fi
   if [ -n "$upr" ]; then
     while IFS="$(printf '\t')" read -r ust ub ubase uto uhave uat uurl; do
       [ -n "$ub" ] || continue
+      if [ -n "$up_from" ] && { [ "$uto" = "-" ] || ! jig_version_newer "$up_to" "$uto"; }; then
+        up_covered=1
+      fi
       [ "$uurl" != "-" ] || uurl=""
       if [ "$ust" = open ]; then
         _status_attn upgrade-pull-request-waiting project "" "" \
@@ -2014,9 +2036,8 @@ _status_attention() {
     done <<UPR
 $upr
 UPR
-  elif up_from=$(_status_project_behind); then
-    up_to=${up_from#* }
-    up_from=${up_from%% *}
+  fi
+  if [ -n "$up_from" ] && [ "$up_covered" = 0 ]; then
     _status_attn upgrade-available project "" "" "Jig in this project is older than on this machine" \
       "this project runs $up_from; this machine has $up_to" "jig upgrade"
   fi

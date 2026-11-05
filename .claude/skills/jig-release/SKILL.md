@@ -56,10 +56,13 @@ pull request, so its merge is where a person agrees.
 1. `jig spec new release-<YYYY-MM-DD>` — the planning day, so the id never lies when the level
    changes. `spec.md`: the approved document. `roadmap.md`: one phase, an item per task
    (``- [ ] `<task-id>` — <goal>``), the notes task last; waves: the tasks, then the notes.
-2. File the notes task (`jig task new`, the `Spec:` line as `jig-idea` §10 writes it).
+2. File the notes task (`jig task new`, the `Spec:` line as `jig-idea` §10 writes it). It stays out
+   of the queue for now, which would advise it before the tasks it reads: §5 queues it.
 3. `jig spec epic <id> --release <level>`.
 4. For each task that was already filed: `jig spec link <id> <task-id>`. It reads the phase from
    the roadmap and refuses a started or closed task — a refusal is a task that stays out (§2).
+   Then set its number, `.ai/scripts/jig queue set <task-id> --priority <p>`, again if it has one:
+   a task already in the queue stays on the top level until a write touches it.
 5. Ship the declaration and cut the epic as `jig-idea` §8 says: `jig spec ship`, a person merges
    it, `jig spec epic <id>`, `jig spec ship <id>` again to push the epic.
 
@@ -68,7 +71,8 @@ pull request, so its merge is where a person agrees.
 A phase run (`jig-autopilot` §6) when the run's level (`autopilot.git:` in `jig status`) is `pr`
 or more; otherwise each task through
 `jig-task`, cut from the epic by `jig task start`. The notes task starts after every other item
-is merged into the epic and the latest default branch was merged in: it writes the notes as
+is merged into the epic and the latest default branch was merged in, and gets its number then, the
+most urgent of the release's (its lowest), so that a task outside the release does not hold it: it writes the notes as
 [release notes](references/release-notes.md) says. It never edits the spec: when the diffs
 disagree with the planned level, it says so in its pull request.
 
