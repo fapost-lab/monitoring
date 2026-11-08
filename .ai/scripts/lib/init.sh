@@ -270,7 +270,7 @@ $old_rel"
 
 cmd_init() {
   local from="" link=0 link_given=0 adapters_csv="" profiles_csv="" quiet=0
-  local adapters_given=0 profiles_given=0 session_hook=0
+  local adapters_given=0 profiles_given=0 session_hook=0 unreleased=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -280,6 +280,7 @@ cmd_init() {
       --profiles) [ $# -ge 2 ] || jig_die "init: --profiles requires a value"; profiles_csv="$2"; profiles_given=1; shift 2 ;;
       --quiet) quiet=1; shift ;;
       --session-hook) session_hook=1; shift ;;
+      --unreleased) unreleased=1; shift ;;
       *) jig_die "init: unknown argument: $1" ;;
     esac
   done
@@ -307,6 +308,11 @@ cmd_init() {
   if [ "$link_given" = 0 ] && manifest_exists; then
     if [ "$(manifest_header_get jig.mode)" = "link" ]; then link=1; else link=0; fi
   fi
+
+  # A copy-mode project takes released code only; link mode runs the source
+  # checkout itself, so whatever it is on is what the person develops
+  # (adr-20261106-copy-mode-projects-take-released-code-only).
+  [ "$link" = 1 ] || jig_require_released_source init "$source" "$unreleased"
 
   # Link mode is a tree of relative symlinks. A junction cannot stand in for
   # them: it has no relative target and git does not store it. Where `ln -s`
@@ -680,6 +686,12 @@ cmd_init() {
       paste -d' ' "$hash_file" "$need_file" >> "$entries"
     fi
 
+    # A copy records the version it is: `X.Y.Z+<sha>` when --unreleased took
+    # code from past a release, `+<sha>.dirty` from a checkout with local
+    # changes, so the project says what it carries.
+    version=$(jig_source_taken_version "$source" 2>/dev/null) || true
+    [ -n "$version" ] || version=$(_init_source_version "$source")
+    [ -n "$version" ] || version="$JIG_VERSION"
     manifest_write_entries "$version" "$source" "$adapters_manifest" "copy" \
       "$section_record" < "$entries"
     rm -rf "$_INIT_HASH_TMP"

@@ -56,7 +56,7 @@ jig_notify_token_ok() {
 jig_notify_autopilot() {
   local id="$1" event="$2" text="$3" token chat
   case "$event" in
-    stop | end | approve | decide) ;;
+    stop | end | approve | decide | handover) ;;
     *) return 0 ;;
   esac
   case "$(cfg notify.autopilot true)" in
@@ -157,6 +157,7 @@ _notify_message() {
       if [ "$(_task_autopilot_mode "$id")" = unattended ]; then mark='⛔'; else mark='⏸'; fi
       ;;
     end) mark='✅' ;;
+    handover) mark='👤' ;;
     *) mark='🤖' ;;
   esac
   if [ -z "$text" ] && [ "$event" = end ]; then text="Run ended"; fi

@@ -102,8 +102,12 @@ Every end of the loop that waits for the person is such a stop: questions, a `pr
 forge unreachable, and — unattended — a draft ending the run.
 After an answer, resume an attended task with `jig task autopilot <id> resume --answer "<the person's answer>"`.
 For an already stopped unattended task with repairs still available, quote the actual answer and add
-`--by human`; a repair-limit stop remains a draft and cannot resume. Then tell an agent — the same
-one, or a new one — to continue task X from stage Y.
+`--by human`; a repair-limit stop remains a draft and cannot resume. When the person takes a stopped
+task on instead, at the repair limit too, quote their words with
+`jig task autopilot <id> handover --by human --answer "<their words>"`: its run ends, and the agent goes
+on without `stage`, `repair` or `end`, with the person's gate approval when the design changed. You
+still ship it, and the agent you start on it takes a slot of `autopilot.parallel` until it ships:
+`spec plan` no longer counts a run that ended, so count it yourself. Then tell an agent (the same one, or a new one) to continue task X from stage Y.
 
 **5. Ship, one at a time.** Tasks with `knowledge_consolidated: true` queue in the order they
 became ready. For the head of the queue, from its worktree:
@@ -120,7 +124,8 @@ Pass `--body-file` when the task agent wrote a `pr-body.md`; without it the body
   the table below.
 
 After each merge: `jig task set <id> status consolidated`, `jig spec done <id>` **in the epic
-checkout**, `jig task autopilot <id> end --reason merged`, and fast-forward the epic. A task of the
+checkout**, `jig task autopilot <id> end --reason merged` (not for a task that was handed over: its
+run already ended), and fast-forward the epic. A task of the
 wave that was abandoned instead (`spec plan` shows its item `abandoned`) gets `jig spec drop <id>`
 in the epic checkout in place of `spec done`: its branch could not close the item, and the edit is
 committed on the epic like a checkmark. Asking for a phase run is

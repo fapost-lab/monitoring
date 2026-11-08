@@ -47,10 +47,12 @@ jig $JIG_VERSION — deterministic mechanics for agent-driven SDLC
 
 Usage: jig <command> [args]
 
-  init [--from <dir>] [--link] [--session-hook]
-                                 bootstrap .ai/ in the current repository
-  upgrade [--from <dir>] [--dry-run] [--json]
-                                 update framework-owned files (manifest-aware); --json
+  init [--from <dir>] [--link] [--session-hook] [--unreleased]
+                                 bootstrap .ai/ in the current repository; a copy
+                                 takes a released source only, unless --unreleased
+  upgrade [--from <dir>] [--dry-run] [--unreleased] [--json]
+                                 update framework-owned files (manifest-aware); a copy
+                                 takes a released source only, unless --unreleased; --json
                                  reports what it did as data (schemas/json.md)
   upgrade --land [--json]        once an upgrade's pull request is merged: back on the
                                  base branch, fast-forwarded, the upgrade branch let go
@@ -81,7 +83,7 @@ Usage: jig <command> [args]
   context [...]                  relevant knowledge for a task
   context resolve [...]          required documents; --stage, --no-task, --catalog
   context pending|guard [...]    knowledge required but not yet acknowledged
-  context acknowledge [...]      record documents as read
+  context acknowledge [...]      record documents as read, or --revoke
   verify                         run active profiles' checks (or preview with --explain)
   knowledge check                validate .ai/knowledge
   knowledge new <type> <slug>    create a knowledge document (jig knowledge for types)
@@ -101,6 +103,7 @@ Usage: jig <command> [args]
                                  stamp document(s) as reconciled with the code, likewise
   knowledge sources [--diff <id>] [--json]
                                  linked sources and what changed since approval; --json as data
+  knowledge read <id> --json     one document's text, and a stub's linked file as it is now
   spec new <id>                  create .ai/specs/<id>/ from the specification templates
   spec list                      specifications under .ai/specs/ and their roadmap progress
   spec done <task-id>            check the roadmap items that name a spec-linked task
@@ -108,7 +111,7 @@ Usage: jig <command> [args]
   spec link <spec-id> <task-id>  link a filed, not-started task to the spec phase naming it
   spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom]
   spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom]
-  spec item file <id> <item> --task <task-id>
+  spec item file <id> <item> --task <task-id> | --new <task-id> [--goal <text>]
                                  change a roadmap on a branch of its own, in Jig's own
                                  tree; each takes [--revision <n>] [--json]
   spec stop <id> --phase <n> --reason <text>
@@ -159,7 +162,19 @@ main() {
   [ $# -gt 0 ] && shift
   case "$cmd" in
     help|-h|--help) jig_usage ;;
-    version|--version) printf 'jig %s\n' "$JIG_VERSION" ;;
+    version|--version)
+      # Run from a framework checkout (the global jig, link mode), the version
+      # names unreleased code as `X.Y.Z+<sha>`; at a release tag, and from a
+      # project's installed copy, it is the plain number, as the installer and
+      # self-update require (adr-20261106-copy-mode-projects-take-released-code-only).
+      # Physically: through a link-mode project's .ai/scripts link the logical
+      # parent is the project's .ai/, not the checkout.
+      local root v=""
+      root=$(cd -P "$JIG_LIB/../.." 2>/dev/null && pwd) || root=""
+      if [ -n "$root" ] && jig_is_source_root "$root"; then
+        v=$(jig_source_version "$root" 2>/dev/null) || v=""
+      fi
+      printf 'jig %s\n' "${v:-$JIG_VERSION}" ;;
     init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|housekeeping|measure|doctor|config|notify)
       if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
         jig_die "command '$cmd' is not available in jig $JIG_VERSION"
@@ -194,4 +209,4 @@ main() {
   esac
 }
 
-main "$@"
+jig_supervise main "$@"

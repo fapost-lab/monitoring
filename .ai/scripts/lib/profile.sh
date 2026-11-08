@@ -87,6 +87,39 @@ jp_begin() {
 # jp_scoped — exit 0 when this run is narrowed to changed files.
 jp_scoped() { [ "$JP_SCOPED" = 1 ]; }
 
+# jp_covered <check> <label> — exit 0 when another profile in this run took
+# over this profile's check named <check> (a role such as `tests`, never a
+# tool), after printing the check's skip line — or its PLAN line under
+# `--explain` — under <label>, the name the check's other lines use. Exit 1
+# otherwise, and the caller runs the check as before.
+#
+# The profile names its own check and nothing else: which profile covers it
+# is `jig verify`'s decision, made from the covering profile's
+# `covers: [<profile>:<check>]` and this profile's `checks: [<check>]`, and
+# handed down as JIG_VERIFY_COVERED (`<check>=<profile>` words). Without it
+# nothing is covered, so a check never stands down on a guess. The reason
+# starts `scope:`: the check's tools are fine and the work is another
+# profile's, so a run where everything else narrowed away is not read as a
+# gap in coverage (adr-20261107-a-profile-covers-a-check-of-another).
+jp_covered() {
+  local check="$1" label="$2" word by="" reason IFS=$' \t\n'
+  set -f
+  for word in ${JIG_VERIFY_COVERED:-}; do
+    case "$word" in
+      "$check="?*) by=${word#*=}; break ;;
+    esac
+  done
+  set +f
+  [ -n "$by" ] || return 1
+  reason="scope: covered by $by, $JP_PROFILE:$check"
+  if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
+    jp_plan "$label" skip "$reason"
+  else
+    jp_skip "$label" "$reason"
+  fi
+  return 0
+}
+
 # jp_has_line <line> <text> — exit 0 when <line> is a whole line of <text>,
 # compared as a string: common.sh's jig_has_line for profiles, which source
 # this file alone. A `case`, never `printf | grep -q`: bash writes a pipe line

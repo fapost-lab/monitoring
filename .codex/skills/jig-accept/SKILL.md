@@ -56,7 +56,9 @@ guesses with uniform confidence has hidden the only thing the human is there to 
 For each `changed` or `unrecorded` line of `jig knowledge sources`, show
 `jig knowledge sources --diff <id>` (or the source whole when no approved text is stored) and ask:
 keep it, which is `jig knowledge reviewed <id>`, or drop the link, which is
-`jig knowledge reject <id>`. A `missing` source is fixed by moving the link, not reviewed.
+`jig knowledge reject <id>`: the stub becomes `rejected` and no agent is handed the file again. A
+`missing` source is fixed by moving the link when the file moved, or dropped with `reject` when
+it is gone for good; it is never reviewed.
 
 ## 3. Ask, and wait
 
@@ -77,8 +79,9 @@ the state doing its job, not a failure to complete the task.
 .ai/scripts/jig knowledge check
 ```
 
-Both commands take several ids and refuse the whole batch if any id is not a proposal, so
-apply each decision as one call rather than one call per document.
+Both commands take several ids and refuse the whole batch if any id is not a proposal (or,
+for `reject`, a changed link), so apply each decision as one call rather than one call per
+document.
 
 **Rejecting is not deleting.** The document stays at its path with `status: rejected`: it
 no longer resolves, and the next map that proposes the same domain can see the argument

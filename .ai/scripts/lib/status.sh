@@ -411,7 +411,9 @@ EOF
     esac
     # Same predicate `jig task autopilot report` prints (_task_autopilot_note,
     # task.sh): a run mid-flight (`on`) or waiting on a human (`stopped`).
-    # `done`, and a task that never ran one, add nothing (design.md, autopilot).
+    # A run a person took over adds `autopilot=handed-over`, a fact and not a
+    # wait; any other `done`, and a task that never ran one, add nothing
+    # (design.md, autopilot; adr-20261108-a-person-takes-over-a-stopped-run).
     # Asked only of a task whose state has a run at all; for any other the
     # answer is empty.
     if [ -n "$_ST_AUTOPILOT" ]; then
@@ -1041,6 +1043,7 @@ _status_terminal_tasks() {
           uncommitted=*) note+=("${wd#uncommitted=} uncommitted") ;;
           base=*) note+=("base ${wd#base=}") ;;
           autopilot=on) note+=("autopilot on") ;;
+          autopilot=handed-over) note+=("autopilot handed over") ;;
           queue=*) note+=("queue ${wd#queue=}") ;;
           priority=*) note+=("priority ${wd#priority=}") ;;
           *) note+=("$wd") ;;
@@ -1974,7 +1977,7 @@ _status_attn() {
 # twice.
 _status_attention() {
   local stopped="" gates="" git_steps="" rec id stop_reason stop_at ago level queue url live hk_note pr_ids=""
-  local nc wrong kept closed open settled phase phase_stops=""
+  local nc wrong kept closed open settled phase phase_stops="" todo
   hk_note=""
   [ -z "$_STATUS_HK_AT" ] || hk_note="housekeeping at $_STATUS_HK_WHEN"
   level=$(jig_agent_git 2>/dev/null) || level=none
@@ -2086,9 +2089,15 @@ UPR
 "
         continue
       fi
+      # An unattended run at its repair limit is resumed by nothing: what is
+      # left is its draft, or a person taking the task over
+      # (adr-20261108-a-person-takes-over-a-stopped-run).
+      todo="Answer the agent in this task's session; it resumes the run."
+      if _task_autopilot_at_limit "$_ST_ID"; then
+        todo="Nothing resumes this run: it ships a draft. To finish the task yourself, tell the agent in this task's session; it hands the run over to you."
+      fi
       stopped="$stopped$(_status_attn autopilot-stopped task "$_ST_ID" "$_ST_ID" \
-        "Autopilot stopped and is waiting for you" "$stop_reason" \
-        "Answer the agent in this task's session; it resumes the run.")
+        "Autopilot stopped and is waiting for you" "$stop_reason" "$todo")
 "
       continue
     fi
@@ -2695,7 +2704,7 @@ _status_html_task_row() {
 # stage (ADR-0020), so none is claimed — except the gate a T3/T4 design waits
 # at (_task_gate_state).
 _status_html_stage() {
-  local repairs stage stage_at ago
+  local repairs stage stage_at ago handover
   if [ "$_ST_AUTOPILOT" = on ]; then
     repairs=$(printf '%s\n' "$_ST_APFACTS" | cut -f 2)
     stage=$(printf '%s\n' "$_ST_APFACTS" | cut -f 3)
@@ -2717,6 +2726,17 @@ _status_html_stage() {
   if [ -z "$_ST_BRANCH" ]; then
     printf '<span class="muted">filed, not started</span>'
     return 0
+  fi
+  # A run a person took over: no stage is tracked from here on, and the
+  # gate, when there is one, follows.
+  if [ "$_ST_AUTOPILOT" = "done" ]; then
+    # The handover time is the facts line's last field: read without a
+    # process, as every per-row reader here must (conventions/shell.md).
+    handover=${_ST_APFACTS##*$'\t'}
+    case "$handover" in
+      '' | -) ;;
+      *) printf '<span class="badge">taken over by a person</span> ' ;;
+    esac
   fi
   case "$_ST_GATE" in
     waiting) printf '<span class="badge warn">design at the gate</span>' ;;
@@ -2835,20 +2855,39 @@ _status_upgrade_prs() {
     to=$(_status_upgrade_version "$b")
     case "$st" in
       open)
-        if [ -n "$to" ] && [ -n "$have" ] && ! jig_version_newer "$to" "$have"; then
+        if [ -n "$to" ] && [ -n "$have" ] && ! jig_version_newer "$to" "$have" \
+           && ! _status_upgrade_rebuilds "$b" "$have"; then
           continue
         fi
         printf '%s\t%s\t%s\t%s\t-\t%s\t%s\n' open "$b" "$base" "${to:--}" "$at" "$url"
         ;;
       merged)
         [ -n "$to" ] && [ -n "$have" ] || continue
-        jig_version_newer "$to" "$have" || continue
+        jig_version_newer "$to" "$have" || _status_upgrade_rebuilds "$b" "$have" || continue
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' merged "$b" "$base" "$to" "$have" "$at" "$url"
         ;;
     esac
   done <<CACHE
 $(forgecache_upgrades "$cache" "$base")
 CACHE
+}
+
+# _status_upgrade_rebuilds <branch> <have> — true when upgrade branch <branch>
+# records a version of the same release number as the base's <have> but
+# another build: a return to a release (`X.Y.Z+<sha>` -> `X.Y.Z`) or an
+# `--unreleased` upgrade within one release. The branch name holds the number
+# alone, so only the label it records tells it from an upgrade already here.
+# Read from the branch here or origin's copy of it, as `jig upgrade --land`
+# reads it (upgrade.sh); false when neither is here.
+_status_upgrade_rebuilds() {
+  local ref label
+  for ref in "refs/heads/$1" "refs/remotes/origin/$1"; do
+    label=$(_upgrade_land_version "$ref")
+    [ -n "$label" ] || continue
+    _upgrade_rebuilds "$label" "$2"
+    return
+  done
+  return 1
 }
 
 # _status_upgrade_version <branch> — the version `jig/upgrade-<to>[-<n>]` is
@@ -2899,17 +2938,33 @@ UPR
 # runs from — a normal "current", not a missing global (common.sh,
 # jig_global_executable).
 _status_framework_versions() {
-  local project="$1" global_exe global
+  local project="$1" global_exe global global_src
+  # The global version as a person should read it: `X.Y.Z+<sha>` off a release
+  # tag. Read from its git, never by running it
+  # (adr-20261106-copy-mode-projects-take-released-code-only).
   if ! global_exe=$(jig_global_executable) \
-     || ! global=$(jig_declared_version "${global_exe%/scripts/jig}"); then
+     || ! global=$(jig_source_version "${global_exe%/scripts/jig}"); then
     printf '%s\n' "framework versions: project=$project global=unavailable"
     return 0
   fi
+  global_src=${global_exe%/scripts/jig}
   if [ "$project" = "$global" ]; then
     printf '%s\n' "framework versions: project=$project global=$global current"
     return 0
   fi
   printf '%s\n' "framework versions: project=$project global=$global mismatch"
+  # Unreleased code on either side is named before any direction: the number
+  # it shares with a release says nothing about which is newer.
+  case "$global" in
+    *+*)
+      printf '%s\n' "hint: the global jig is on the development channel ($(jig_source_where "$global_src")); copy-mode projects take releases only — return it to a release, or develop Jig in a clone of its own"
+      return 0 ;;
+  esac
+  case "$project" in
+    *+*)
+      printf '%s\n' "hint: this project carries unreleased Jig ($project); \`jig upgrade\` from a released Jig returns it to the release"
+      return 0 ;;
+  esac
   if jig_release_version "v$global" >/dev/null 2>&1 && jig_release_version "v$project" >/dev/null 2>&1; then
     if jig_version_newer "$global" "$project"; then
       printf '%s\n' "hint: the global framework is newer; run \`jig upgrade --dry-run\`"
@@ -2934,9 +2989,12 @@ _status_project_behind() {
   local project global_exe global
   manifest_exists || return 1
   project=$(manifest_header_get jig.version) || return 1
+  project=$(jig_version_core "$project")
   global_exe=$(jig_global_executable) || return 1
   global=$(jig_declared_version "${global_exe%/scripts/jig}") || return 1
   jig_release_version "v$global" >/dev/null 2>&1 || return 1
+  # Unreleased global code is nothing a project can upgrade to without asking.
+  jig_source_release "${global_exe%/scripts/jig}" || return 1
   jig_release_version "v$project" >/dev/null 2>&1 || return 1
   jig_version_newer "$global" "$project" || return 1
   printf '%s %s\n' "$project" "$global"

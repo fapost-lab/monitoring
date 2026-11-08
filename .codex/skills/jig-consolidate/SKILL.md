@@ -137,7 +137,8 @@ or when the change moved after its review; resolve the finding or re-review firs
 are the coordinator's. Stage the change, write the commit message and the pull request body with
 `jig task artifact write <id> commit-message --from <file>` and `… pr-body --from <file>`, and report
 back. The coordinator ships one task at a time so that two of them cannot merge past each
-other, runs `jig task ship` and `jig task autopilot <id> end` itself, and checks the roadmap
+other, runs `jig task ship` and `jig task autopilot <id> end` itself (none for a task handed over to a
+person, whose run already ended), and checks the roadmap
 item after the merge — `spec done` below refuses in this branch, by design.
 
 Every other run checks the roadmap here, before the commit:

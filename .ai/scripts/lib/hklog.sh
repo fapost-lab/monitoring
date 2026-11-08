@@ -120,7 +120,14 @@ _hklog_recheck() {
         # asks for (ADR-0030).
         case "$(task_state_get "$id" status)" in
           consolidated | abandoned) continue ;;
-          # An archived task whose work merged still needs closing: it stays.
+          # An archived task whose work merged still needs closing, unless it
+          # was set aside as abandoned or absorbed — the run no longer flags
+          # those (housekeeping_decide), and an older line must not keep one.
+          archived)
+            case "$(task_state_get "$id" archived_from):$(task_state_get "$id" archived_reason)" in
+              abandoned:* | *:absorbed) continue ;;
+            esac
+            ;;
         esac
         ;;
       'abandoned?')

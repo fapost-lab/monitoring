@@ -22,10 +22,9 @@ _self_update_validate_source() {
   [ "$toplevel_phys" = "$source_phys" ] \
     || jig_die "self-update: $source is nested inside another git worktree ($toplevel_phys); refusing"
 
-  # --untracked-files=all pins what counts as a change: with
-  # status.showUntrackedFiles=no in someone's git config, plain --porcelain
-  # hides untracked files and a dirty checkout would read as clean.
-  status=$(git -C "$source" status --porcelain --untracked-files=all 2>/dev/null) \
+  # The same question copy-mode init and upgrade ask of a released source
+  # (jig_source_changes, common.sh).
+  status=$(jig_source_changes "$source") \
     || jig_die "self-update: cannot read git status: $source"
   [ -z "$status" ] \
     || jig_die "self-update: framework checkout has uncommitted changes; commit or stash before self-update: $source"
@@ -70,12 +69,20 @@ _self_update_branch() {
 
   if [ "$new_short" = "$old_short" ]; then
     printf 'self-update: already current at %s (%s)\n' "$old_version" "$old_short"
-  elif [ "$new_version" = "$old_version" ]; then
+  elif [ "$(jig_version_core "$new_version")" = "$(jig_version_core "$old_version")" ]; then
+    # Off a tag the version carries its commit (`X.Y.Z+<sha>`); the number
+    # is what did not change.
     printf 'self-update: source updated, version unchanged at %s (%s -> %s)\n' \
-      "$old_version" "$old_short" "$new_short"
+      "$(jig_version_core "$old_version")" "$old_short" "$new_short"
   else
-    printf 'self-update: updated %s -> %s (%s)\n' "$old_version" "$new_version" "$new_short"
+    printf 'self-update: updated %s -> %s (%s)\n' "$(jig_version_core "$old_version")" \
+      "$(jig_version_core "$new_version")" "$new_short"
   fi
+  # A branch is the development channel; a pull there is not a release, and
+  # copy-mode projects say so when asked to take it
+  # (adr-20261106-copy-mode-projects-take-released-code-only).
+  jig_source_release "$source" \
+    || jig_warn "self-update: the global jig is on the development channel ($(jig_source_where "$source")), not a release; copy-mode projects will not take files from it without --unreleased"
 }
 
 # _self_update_detached <source> <global> — the checkout is detached. The

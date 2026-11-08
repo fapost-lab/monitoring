@@ -82,7 +82,7 @@ In an unattended run there are no stops: §5. Otherwise, on a stop, record it, t
 | Stop | What you ask |
 |---|---|
 | The human gate of a T3/T4 task | Approve, change or reject the design — shown as [show the document](../jig-task/references/show-the-document.md) says |
-| `repair` exited 3 | How to proceed: another approach, dismissing the finding (a P0/P1 only with them), or dropping the task |
+| `repair` exited 3 | How to proceed: another approach, dismissing the finding (a P0/P1 only with them), dropping the task, or taking it over (§5, "A person takes the task over") |
 | Re-classification to T3 or T4 | The gate for the new design. Up to T2, continue and say so in the report |
 | A decision nobody made | The decision: a product choice not settled in `task.md`, the spec or knowledge. Never guess one |
 | A destructive operation | Permission, or another way |
@@ -136,7 +136,7 @@ and on their phone as it happens, when they set up Telegram messages: one short 
 | The gate of a T3/T4 task, or a re-classification into one | Write the design as usual, then `jig task gate <id> approved --by agent`, `jig task autopilot <id> approve --reason "<what was approved>"`, and in `task.md` (`jig task artifact append <id> task --from -`): "Human gate — approved by the agent (unattended)". Put `design.md` verbatim in the pull request under `## Design — approved by the agent, not a human` |
 | A decision nobody made | The most cautious option that is easiest to undo. `jig task autopilot <id> decide --reason "<what you chose, and why>"` |
 | A destructive operation | Never. Find another way or leave that part out, and say so with `decide --reason` |
-| `repair` exited 3 | The run ends unfinished: stage what there is and run `jig task ship <id> --message-file <file> --draft`. The body starts with `Not finished: <why>`. A draft is never merged; the run stays `stopped`, and the status page shows it waiting. `resume` is refused after the repair limit, including with `--by human` |
+| `repair` exited 3 | The run ends unfinished: stage what there is and run `jig task ship <id> --message-file <file> --draft`. The body starts with `Not finished: <why>`. A draft is never merged; the run stays `stopped`, and the status page shows it waiting. `resume` is refused after the repair limit, including with `--by human`; a person who takes the task on is the one other ending (below) |
 | The class turns out lower | Lower it with `jig task set <id> class <Tn> --reason "<why>"`, except out of T3/T4 below T3: the script refuses that unattended, so keep the route. `end` comes after the knowledge decision, never to start a fresh run |
 
 If a person independently answers a run that is already `stopped` in an unattended clone,
@@ -146,6 +146,22 @@ repair-limit stop still ends in a draft. Never invent the answer to resume yours
 stays unattended: if the design changed, approve the current T3/T4 gate with `--by agent` and
 show the design and the quoted answer in the pull request. A person's answer to one decision
 is not their approval of the whole design.
+
+**A person takes the task over.** When a person says they will finish the task, or tells you or
+the coordinator to go on with it without autopilot, at the repair limit or at any other stop, quote
+their words:
+
+```
+.ai/scripts/jig task autopilot <id> handover --by human --answer "<their words>"
+```
+
+The run ends there and the task goes on as attended work: no `stage`, `repair`, `end` or new `start`.
+If the design changed, show it as [show the document](../jig-task/references/show-the-document.md)
+says: whole when the approval it had was the agent's (`gate_by: agent`), the changed sections only
+when the person approved it before; then record their approval with `jig task gate <id> approved`.
+Then re-review, `jig verify`, consolidate and ship as for any task, at their `agent.git`. The
+report's **Taken over by a person** block goes in the pull request. Never hand over on your own, or
+without their words: a run nobody takes over ends in its draft.
 
 What never changes: a P0/P1 is never dismissed, the gates are never worked around, and nothing
 is merged but by `task ship`. Before shipping, put `jig task autopilot <id> report`'s
