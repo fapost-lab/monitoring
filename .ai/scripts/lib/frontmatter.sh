@@ -4,27 +4,102 @@
 # bash 3.2 compatible: no associative arrays, no ${var,,}, no mapfile.
 # shellcheck shell=bash
 
+# _fm_scan_v <var> <file> — the raw lines strictly between the opening and the
+# first closing `---` delimiter into <var>, the lines up to the end of the file
+# when nothing closes it. Exit 0 when the file starts with a `---` line and has
+# a closing one, 1 otherwise. Without a process: `jig context` reads every
+# document of a project (convention-shell, `<name>_v`).
+_fm_scan_v() {
+  local __fms_line __fms_block="" __fms_first=1 __fms_closed=1 __fms_nl=$'\n' __fms_cr=$'\r' __fms_n=0 __fms_blanks=0
+  local -a __fms_lines
+  printf -v "$1" '%s' ''
+  while IFS= read -r __fms_line || [ -n "$__fms_line" ]; do
+    # A checkout may end its lines in CRLF (core.autocrlf, a Windows default;
+    # templates/gitattributes pins no line ending for .ai/knowledge/).
+    # Asked first: on a line with no CR the expansion alone tries every position.
+    case "$__fms_line" in
+      *"$__fms_cr") __fms_line=${__fms_line%"$__fms_cr"} ;;
+    esac
+    if [ "$__fms_first" -eq 1 ]; then
+      [ "$__fms_line" = "---" ] || return 1
+      __fms_first=0
+      continue
+    fi
+    if [ "$__fms_line" = "---" ]; then
+      __fms_closed=0
+      break
+    fi
+    # Lines kept apart and joined once: appending to a string copies it, and a
+    # large document that never closes its frontmatter took a minute that way.
+    # A blank line waits for a line after it, so trailing ones never get in:
+    # `$(...)` would have dropped them, and stripping them afterwards is
+    # quadratic too.
+    if [ -z "$__fms_line" ]; then
+      __fms_blanks=$((__fms_blanks + 1))
+      continue
+    fi
+    while [ "$__fms_blanks" -gt 0 ]; do
+      __fms_lines[__fms_n]=""
+      __fms_n=$((__fms_n + 1))
+      __fms_blanks=$((__fms_blanks - 1))
+    done
+    __fms_lines[__fms_n]=$__fms_line
+    __fms_n=$((__fms_n + 1))
+  done < "$2"
+  if [ "$__fms_n" -gt 0 ]; then
+    local IFS=$__fms_nl
+    __fms_block="${__fms_lines[*]}"
+  fi
+  printf -v "$1" '%s' "$__fms_block"
+  return "$__fms_closed"
+}
+
 # fm_has <file> — exit 0 when the file starts with a `---` line and has a
 # closing `---` line further down.
 fm_has() {
-  local file="$1"
-  [ -f "$file" ] || return 1
-  awk '
-    NR == 1 { if ($0 != "---") exit; next }
-    $0 == "---" { found = 1; exit }
-    END { exit !found }
-  ' "$file"
+  local __fmh_block
+  [ -f "$1" ] || return 1
+  _fm_scan_v __fmh_block "$1"
 }
 
 # fm_block <file> — print the raw lines strictly between the opening and the
 # first closing `---` delimiter. Prints nothing when there is no frontmatter.
 fm_block() {
-  local file="$1"
-  awk '
-    NR == 1 { if ($0 != "---") exit; in_block = 1; next }
-    in_block && $0 == "---" { exit }
-    in_block { print }
-  ' "$file"
+  local __fmb_block
+  _fm_scan_v __fmb_block "$1" || [ -n "$__fmb_block" ] || return 0
+  [ -z "$__fmb_block" ] || printf '%s\n' "$__fmb_block"
+}
+
+# fm_read_v <var> <file> — the frontmatter into <var>; exit 1, with <var> empty,
+# when fm_has would say the file has none. fm_has and fm_block in one reading.
+fm_read_v() {
+  printf -v "$1" '%s' ''
+  [ -f "$2" ] || return 1
+  _fm_scan_v "$1" "$2" || {
+    printf -v "$1" '%s' ''
+    return 1
+  }
+}
+
+# _fm_trim_v <var> <text> — <text> without leading and trailing whitespace.
+_fm_trim_v() {
+  local __fmt_text="$2"
+  __fmt_text=${__fmt_text#"${__fmt_text%%[![:space:]]*}"}
+  __fmt_text=${__fmt_text%"${__fmt_text##*[![:space:]]}"}
+  printf -v "$1" '%s' "$__fmt_text"
+}
+
+# _fm_unquote_v <var> <text> — <text> without one pair of surrounding double
+# quotes, when it has both.
+_fm_unquote_v() {
+  local __fmu_text="$2"
+  case "$__fmu_text" in
+    \"*\")
+      __fmu_text=${__fmu_text#\"}
+      __fmu_text=${__fmu_text%\"}
+      ;;
+  esac
+  printf -v "$1" '%s' "$__fmu_text"
 }
 
 # A caller reading one document rarely wants one field: `paths`, `domains`,
@@ -49,15 +124,30 @@ fm_block() {
 
 # fm_get_block <block> <key> — fm_get, given the block already read.
 fm_get_block() {
-  local block="$1" key="$2" raw val
-  [ -n "$block" ] || return 0
-  raw=$(printf '%s\n' "$block" | sed -n "s/^${key}:[[:space:]]*//p" | head -n 1)
-  val=$(printf '%s' "$raw" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//')
-  case "$val" in
+  local __fmgb_val
+  fm_get_block_v __fmgb_val "$1" "$2"
+  [ -z "$__fmgb_val" ] || printf '%s\n' "$__fmgb_val"
+}
+
+# fm_get_block_v <var> <block> <key> — fm_get_block into <var>, without a process.
+fm_get_block_v() {
+  local __fmg_nl=$'\n' __fmg_rest __fmg_val
+  printf -v "$1" '%s' ''
+  case "$__fmg_nl$2" in
+    *"$__fmg_nl$3:"*) ;;
+    *) return 0 ;;
+  esac
+  __fmg_rest="$__fmg_nl$2"
+  __fmg_rest=${__fmg_rest#*"$__fmg_nl$3:"}
+  __fmg_val=${__fmg_rest%%"$__fmg_nl"*}
+  # Cut at the first `#`, then trim: a `#` closes the value with or without a
+  # space before it.
+  __fmg_val=${__fmg_val%%#*}
+  _fm_trim_v __fmg_val "$__fmg_val"
+  case "$__fmg_val" in
     '' | \[*) return 0 ;;
   esac
-  val=$(printf '%s' "$val" | sed 's/^"\(.*\)"$/\1/')
-  printf '%s\n' "$val"
+  _fm_unquote_v "$1" "$__fmg_val"
 }
 
 # fm_get <file> <key> — print the trimmed scalar value of <key> (trailing
@@ -70,37 +160,84 @@ fm_get() {
 # fm_list_block <block> <key> — fm_list, given the block already read.
 # Supports inline `key: [a, b]` and block `key:\n  - a\n  - b` forms.
 fm_list_block() {
-  local block="$1" key="$2" inline_content
-  [ -n "$block" ] || return 0
+  local __fmlb_items
+  fm_list_block_v __fmlb_items "$1" "$2"
+  [ -z "$__fmlb_items" ] || printf '%s\n' "$__fmlb_items"
+}
 
-  # `grep -c` rather than `grep -q`: counting every match means reading to the
-  # end of the input, so the printf behind it never writes into a closed pipe
-  # (conventions/shell.md). The `head -n 1` below is the other shape the rule
-  # allows: what writes into it is sed, with one short line left to write.
-  if printf '%s\n' "$block" | grep -c -E "^${key}:[[:space:]]*\[" >/dev/null; then
-    inline_content=$(printf '%s\n' "$block" \
-      | sed -n "s/^${key}:[[:space:]]*\[\(.*\)\].*/\1/p" | head -n 1)
-    printf '%s\n' "$inline_content" | tr ',' '\n' \
-      | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"\(.*\)"$/\1/' \
-      | sed '/^$/d'
-    return 0
+# fm_list_block_v <var> <block> <key> — the items into <var>, one per line,
+# without a process. An inline list anywhere under the key wins over a block
+# list; of several, the first that closes its `]` is read. An inline item keeps
+# a `#` and an empty one is dropped; a block item ends at its `#`.
+fm_list_block_v() {
+  local __fml_block="$2" __fml_key="$3" __fml_line __fml_rest __fml_item __fml_nl=$'\n'
+  local __fml_inline=0 __fml_content="" __fml_closed=0 __fml_capture=0 __fml_items="" __fml_sep=""
+  printf -v "$1" '%s' ''
+  [ -n "$__fml_block" ] || return 0
+  while IFS= read -r __fml_line; do
+    case "$__fml_line" in
+      "$__fml_key:"*)
+        _fm_trim_v __fml_rest "${__fml_line#"$__fml_key:"}"
+        case "$__fml_rest" in
+          \[*)
+            __fml_inline=1
+            if [ "$__fml_closed" -eq 0 ]; then
+              case "$__fml_rest" in
+                *\]*)
+                  __fml_closed=1
+                  __fml_content=${__fml_rest#\[}
+                  __fml_content=${__fml_content%\]*}
+                  ;;
+              esac
+            fi
+            ;;
+        esac
+        ;;
+    esac
+    case "$__fml_capture" in
+      0)
+        case "$__fml_line" in
+          "$__fml_key:"*)
+            case "$__fml_rest" in
+              '' | \#*) __fml_capture=1 ;;
+            esac
+            ;;
+        esac
+        ;;
+      1)
+        case "$__fml_line" in
+          "  - "*)
+            __fml_item=${__fml_line#"  - "}
+            __fml_item=${__fml_item%%#*}
+            _fm_trim_v __fml_item "$__fml_item"
+            _fm_unquote_v __fml_item "$__fml_item"
+            __fml_items="$__fml_items$__fml_sep$__fml_item"
+            __fml_sep=$__fml_nl
+            ;;
+          *) __fml_capture=2 ;;
+        esac
+        ;;
+    esac
+  done <<EOF
+$__fml_block
+EOF
+  if [ "$__fml_inline" -eq 1 ]; then
+    __fml_items=""
+    __fml_sep=""
+    while [ -n "$__fml_content" ]; do
+      __fml_item=${__fml_content%%,*}
+      case "$__fml_content" in
+        *,*) __fml_content=${__fml_content#*,} ;;
+        *) __fml_content="" ;;
+      esac
+      _fm_trim_v __fml_item "$__fml_item"
+      _fm_unquote_v __fml_item "$__fml_item"
+      [ -n "$__fml_item" ] || continue
+      __fml_items="$__fml_items$__fml_sep$__fml_item"
+      __fml_sep=$__fml_nl
+    done
   fi
-
-  printf '%s\n' "$block" | awk -v key="$key" '
-    capture == 0 {
-      if ($0 ~ ("^" key ":[[:space:]]*(#.*)?$")) { capture = 1 }
-      next
-    }
-    capture == 1 {
-      if ($0 ~ /^  - /) {
-        line = $0
-        sub(/^  - /, "", line)
-        print line
-      } else {
-        capture = 2
-      }
-    }
-  ' | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^[[:space:]]*//; s/^"\(.*\)"$/\1/'
+  printf -v "$1" '%s' "$__fml_items"
 }
 
 # fm_list <file> <key> — print list items one per line, quotes stripped.

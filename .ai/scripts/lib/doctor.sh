@@ -312,6 +312,15 @@ _doctor_check_framework_version() {
 _doctor_check_upgrade() {
   local pending rc=0 n src=""
   pending=$(upgrade_pending) || rc=$?
+  if [ "$rc" = 4 ]; then
+    # Not a fault here: the only source on offer is unreleased code, which a
+    # copy-mode install is not measured against
+    # (adr-20261106-copy-mode-projects-take-released-code-only).
+    # shellcheck disable=SC2016
+    _doctor_warn "upgrade check" "not measured: the framework source is not a release" \
+      'run `jig upgrade --dry-run` to see where it stands'
+    return 0
+  fi
   if [ "$rc" != 0 ]; then
     # shellcheck disable=SC2016
     _doctor_fail "upgrade check" "cannot determine pending state" \

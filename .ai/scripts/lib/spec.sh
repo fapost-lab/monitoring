@@ -18,7 +18,7 @@
 # `list` only reads.
 # shellcheck shell=bash
 
-SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item file <id> <item> --task <task-id> (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
+SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item file <id> <item> --task <task-id> | --new <task-id> [--goal <text>] (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
 
 cmd_spec() {
   local sub="${1:-}"
@@ -3101,7 +3101,9 @@ _spec_map_phase() {
 # _spec_map_place <section> <top|bottom> <skip-index> <file> — where a block goes:
 # _SPEC_AT, the line it goes after; _SPEC_PRE and _SPEC_POST, whether it needs a blank
 # line before and after, which only a section with no other item does: it goes after
-# the section's last line that is not blank.
+# the section's last line that is not blank. The one item of its own section is already
+# at its top and its bottom: it stays where it stands, so a move that changes nothing
+# writes nothing.
 _SPEC_AT=0 _SPEC_PRE=0 _SPEC_POST=0
 _spec_map_place() {
   local sec="$1" how="$2" skip="$3" file="$4" i=0 first="" last=""
@@ -3115,6 +3117,10 @@ _spec_map_place() {
   done
   if [ -n "$first" ]; then
     if [ "$how" = top ]; then _SPEC_AT=$((M_FIRST[first] - 1)); else _SPEC_AT=${M_LAST[$last]}; fi
+    return 0
+  fi
+  if [ "$skip" -ge 0 ] && [ "${M_SEC[$skip]}" = "$sec" ]; then
+    _SPEC_AT=$((M_FIRST[skip] - 1))
     return 0
   fi
   _SPEC_AT=$(awk -v from="${S_HEAD[$sec]}" -v to="${S_LAST[$sec]}" '
@@ -3179,7 +3185,7 @@ _SPEC_ITEM_SPEC=""
 
 # _spec_item_main <add|move|file> <spec> [<item>] … — the three writes.
 _spec_item_main() {
-  local args=() arg sub id item="" phase="" text="" after="" place="" task="" rev="" rev_given=""
+  local args=() arg sub id item="" phase="" text="" after="" place="" task="" task_given="" rev="" rev_given="" newtask="" goal="" goal_given=""
   for arg in "$@"; do
     [ "$arg" = --json ] || args+=("$arg")
   done
@@ -3219,7 +3225,13 @@ _spec_item_main() {
         place=${1#--}; shift ;;
       --task)
         [ "$sub" = file ] || jig_fail usage "spec item $sub: unexpected argument: $1"
-        _spec_item_need "$1" $#; task=$2; shift 2 ;;
+        _spec_item_need "$1" $#; task=$2; task_given=1; shift 2 ;;
+      --new)
+        [ "$sub" = file ] || jig_fail usage "spec item $sub: unexpected argument: $1"
+        _spec_item_need "$1" $#; newtask=$2; shift 2 ;;
+      --goal)
+        [ "$sub" = file ] || jig_fail usage "spec item $sub: unexpected argument: $1"
+        _spec_item_need "$1" $#; goal=$2; goal_given=1; shift 2 ;;
       *) jig_fail usage "spec item $sub: unexpected argument: $1" ;;
     esac
   done
@@ -3245,8 +3257,21 @@ _spec_item_main() {
       fi
       ;;
     file)
-      [ -n "$task" ] || jig_fail usage "spec item file: --task is required"
-      jig_valid_id "$task" || jig_fail usage "spec item file: invalid task id: $task"
+      [ -z "$task_given" ] || [ -n "$task" ] || jig_fail usage "spec item file: --task is empty"
+      [ -z "$task" ] || [ -z "$newtask" ] || jig_fail usage "spec item file: give one of --task and --new"
+      [ -n "$task" ] || [ -n "$newtask" ] || jig_fail usage "spec item file: --task or --new is required"
+      [ -z "$goal_given" ] || [ -n "$newtask" ] || jig_fail usage "spec item file: --goal goes with --new"
+      if [ -n "$newtask" ]; then
+        jig_valid_id "$newtask" || jig_fail usage "spec item file: invalid task id: $newtask"
+        if [ -n "$goal_given" ]; then
+          jig_goal_check "spec item file" "$goal"
+          goal=$JIG_GOAL
+        fi
+        task=$newtask
+      else
+        jig_valid_id "$task" || jig_fail usage "spec item file: invalid task id: $task"
+      fi
+      _SPEC_ITEM_NEW=$newtask
       ;;
   esac
   jig_require_init
@@ -3291,8 +3316,13 @@ _spec_item_main() {
   jig_record_changed
   ot_commit "$msg" "$rel"
   ot_ship "Roadmap edits: $id" "Edits to the roadmap of \`$id\`, made through Jig on a branch of its own: nobody's checkout moved. Each commit is one edit, and further edits land here."
-  # After the record: the commit stands, so a link that fails is an answer, not a refusal.
-  [ "$sub" != file ] || _spec_item_link "$id" "$task" "$_SPEC_ITEM_PHASE"
+  # After the record: the commit stands, so a task that cannot be filed or a link that
+  # fails is an answer, not a refusal.
+  if [ "$sub" = file ]; then
+    local filed=1
+    [ -z "$newtask" ] || _spec_item_new_task "$id" "$task" "$goal_given" "$goal" || filed=0
+    [ "$filed" = 0 ] || _spec_item_link "$id" "$task" "$_SPEC_ITEM_PHASE"
+  fi
 
   # The item as the roadmap now has it. Its handle holds, but for one of a repeated text,
   # which a move may renumber: the text then still finds it.
@@ -3320,6 +3350,7 @@ _spec_item_main() {
 
 _SPEC_ITEM_HANDLE=""
 _SPEC_ITEM_PHASE=""
+_SPEC_ITEM_NEW=""
 
 # _spec_item_where <place> <after> <section> <skip-index> <file> — the place a block
 # goes, for add and move: _SPEC_AT and its blank lines.
@@ -3371,14 +3402,19 @@ _spec_item_build_move() {
 }
 
 # _spec_item_build_file — the item gets the task in front (`fog:` goes: it is filed
-# now), and every refusal of `spec link` comes before anything is written.
+# now), and every refusal of `spec link` — or, with `--new`, of `task new` — comes before
+# anything is written.
 _spec_item_build_file() {
   local id="$1" item="$2" task="$3" norm="$4" new="$5" msg="$6" i
   _spec_map_find "$item"
   i=$_SPEC_I
   [ -z "${M_TID[$i]}" ] || jig_fail already-exists "spec item file: $item already names task ${M_TID[$i]}"
   [ "${M_CHECKED[$i]}" != 1 ] || jig_fail not-linkable "spec item file: $item is checked; a done item files no task"
-  _spec_link_check "$id" "$task"
+  if [ -n "$_SPEC_ITEM_NEW" ]; then
+    _spec_new_task_check "$task"
+  else
+    _spec_link_check "$id" "$task"
+  fi
   _SPEC_ITEM_PHASE=${S_PHASE[${M_SEC[$i]}]}
   JIG_SI_TASK="$task" awk -v at="${M_FIRST[$i]}" '
     NR == at && match($0, /^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]*/) {
@@ -3390,6 +3426,50 @@ _spec_item_build_file() {
     }
     { print }' "$norm" > "$new"
   printf 'File %s from the roadmap of %s\n\n%s\n' "$task" "$id" "${M_TEXT[$i]}" > "$msg"
+}
+
+# _spec_new_task_check <task-id> — may `task new` file this task in this checkout: the
+# refusals it would give, asked before anything is written, so that `spec item file --new`
+# files the task or refuses, never half. Leaves _SPEC_LINK_TDIR, the workspace to be made,
+# and _SPEC_LINK_CURRENT empty: a new task is linked to nothing yet.
+_spec_new_task_check() {
+  local tid="$1" tdir ws="$JIG_PROJECT/$JIG_AI_DIR/workspace"
+  tdir=$(spec_task_dir "$tid") || jig_fail usage "spec item file: invalid task id: $tid"
+  if [ -e "$tdir" ] || [ -L "$tdir" ]; then
+    jig_fail already-exists "spec item file: task already exists: $tid"
+  fi
+  # A checkout that borrows its task workspaces (a worktree of `task start --worktree`)
+  # or keeps a link above them would file the task outside itself; one that is a
+  # worktree of its own would file it where the clone's queue never sees it (`task new`).
+  if [ -L "$ws" ] || [ -L "$ws/tasks" ]; then
+    jig_fail not-linkable "spec item file: this checkout borrows its task workspaces; run it in the checkout that owns them"
+  fi
+  [ "$(jig_config_clone_root)" = "$JIG_PROJECT" ] \
+    || jig_fail not-linkable "spec item file: this worktree keeps no task workspaces of the clone; file $tid in $(jig_config_clone_root)"
+  _SPEC_LINK_TDIR=$tdir
+  _SPEC_LINK_CURRENT=""
+}
+
+# _spec_item_new_task <spec-id> <task-id> <goal-given> <goal> — file the task, after the
+# commit that names it stands. `task new` is a process of its own: it brings its own
+# checks, and it raises the revision once more, after this write's claim. A failure is a
+# note, not a refusal: the roadmap names the task, and the note says what to run.
+_spec_item_new_task() {
+  local sid="$1" tid="$2" given="$3" goal="$4" err rc=0 args
+  args=(task new "$tid")
+  [ -z "$given" ] || args+=(--goal "$goal")
+  err=$("$JIG_SELF" "${args[@]}" 2>&1 >/dev/null) || rc=$?
+  [ "$rc" != 0 ] || return 0
+  err=${err//$'\n'/ }
+  case "$err" in
+    *"already exists"*)
+      # Another `jig task new` took the id between the check and here: the task is theirs.
+      OT_NOTE="${OT_NOTE:+$OT_NOTE; }the task $tid already exists, filed by another run after this write checked; the roadmap names it: run \`jig spec link $sid $tid\` once the item has landed"
+      return 1
+      ;;
+  esac
+  OT_NOTE="${OT_NOTE:+$OT_NOTE; }could not file the task $tid (${err:-exit $rc}); run \`jig task new $tid\` and \`jig spec link $sid $tid\` once the item has landed"
+  return 1
 }
 
 # _spec_item_link <spec> <task> <phase> — its `Spec:` line, as `spec link` writes it.

@@ -29,7 +29,7 @@
 # never rewritten.
 # shellcheck shell=bash
 
-QUEUE_USAGE="usage: jig queue [list] [--json] | jig queue next [--json] | jig queue set <ref> --priority <0-5|none> | jig queue move <ref> (--before <ref> | --after <ref> | --top | --bottom) | jig queue depend <ref> --on <ref> --reason <text> | jig queue undepend <ref> --on <ref> | jig queue remove <ref> | jig queue request <ref> pause [--reason <text>] | jig queue cancel <ref> pause; every write takes [--revision <n>] [--json]; <ref> is task:<id>, epic:<spec-id> or <id>"
+QUEUE_USAGE="usage: jig queue [list] [--json] | jig queue next [--json] | jig queue set <ref> --priority <0-5|none> | jig queue move <ref> (--before <ref> | --after <ref> | --top | --bottom) | jig queue depend <ref> --on <ref> --reason <text> | jig queue undepend <ref> --on <ref> | jig queue remove <ref> | jig queue request <ref> pause [--reason <text>] | jig queue cancel <ref> pause | jig queue prune [--dry-run]; every write takes [--revision <n>] [--json]; <ref> is task:<id>, epic:<spec-id> or <id>"
 
 QUEUE_FORMAT=$_JIG_QUEUE_FORMAT
 QUEUE_STEP=100
@@ -66,6 +66,7 @@ _queue_main() {
   case "$sub" in
     list) _queue_list ${args[@]+"${args[@]}"} ;;
     next) _queue_next ${args[@]+"${args[@]}"} ;;
+    prune) _queue_prune ${args[@]+"${args[@]}"} ;;
     set | move | depend | undepend | remove | request | cancel) _queue_write "$sub" ${args[@]+"${args[@]}"} ;;
     help | -h | --help) printf '%s\n' "$QUEUE_USAGE" ;;
     *) jig_fail usage "queue: unknown subcommand: $sub; $QUEUE_USAGE" ;;
@@ -153,8 +154,9 @@ _queue_level() {
 # then dependencies, then requests (by reference and kind), then the lines of
 # other kinds as they were. The change comes through the environment
 # (conventions/shell.md: free text never through `awk -v`): Q_OP
-# set|move|depend|undepend|remove|request|cancel|read, Q_REF, Q_LEVEL, Q_PRIO,
-# Q_PLACE top|bottom|before|after, Q_ANCHOR, Q_ON, Q_REASON, Q_KIND, Q_AT.
+# set|move|depend|undepend|remove|request|cancel|absorb|prune|read, Q_REF,
+# Q_LEVEL, Q_PRIO, Q_PLACE top|bottom|before|after, Q_ANCHOR, Q_ON, Q_REASON,
+# Q_KIND, Q_AT, and for prune Q_DROP and Q_MET (references, one per line).
 # Exit status names a refusal: 3 the anchor is not in the queue, 4 the anchor
 # is on another level, 5 a reference to itself, 6 another format version, 7 a
 # dependency cycle, 8 the item, dependency or request is not in the queue, 9
@@ -310,6 +312,18 @@ _queue_apply() {
             jj = ++dn; dsub[jj] = o; don[jj] = don[j]; drea[jj] = drea[j]; dalive[jj] = 1; didx[k] = jj
           }
         }
+      } else if (op == "prune") {
+        # Finished tasks leave the queue (adr-20261107-a-finished-task-leaves-
+        # the-queue): each ref of Q_DROP goes with what it waits for and what
+        # it asked, and every wait on a ref of Q_MET goes, being met. One
+        # write, whatever the count.
+        nq = split(ENVIRON["Q_DROP"], qd, "\n")
+        for (j = 1; j <= nq; j++) if (qd[j] != "") drop[qd[j]] = 1
+        nq = split(ENVIRON["Q_MET"], qd, "\n")
+        for (j = 1; j <= nq; j++) if (qd[j] != "") met[qd[j]] = 1
+        for (j = 1; j <= n; j++) if (ref[j] in drop) alive[j] = 0
+        for (j = 1; j <= dn; j++) if ((dsub[j] in drop) || (don[j] in met)) dalive[j] = 0
+        for (j = 1; j <= rn; j++) if (rsub[j] in drop) ralive[j] = 0
       } else if (op == "remove") {
         if (!(r in idx)) exit 8
         alive[idx[r]] = 0
@@ -538,7 +552,8 @@ _queue_write() {
 # queue_absorb <from-id> <into-id> — move the waits of a task that `jig task
 # merge` absorbed onto the task that took its work, in one write against the
 # revision read here (adr-20261019-the-queue-is-one-file-written-against-a-
-# revision). The absorbed task's own item stays, as an archived task's does.
+# revision). The absorbed task's own item goes when it is archived
+# (adr-20261107-a-finished-task-leaves-the-queue).
 # Nothing to do, and nothing written, when the clone has no queue yet.
 queue_absorb() {
   local from="task:$1" into="task:$2" file new expected rc=0
@@ -647,6 +662,165 @@ _queue_request_json() {
     out="${out}null"
   fi
   printf '%s}\n' "$out"
+}
+
+# --- finished tasks ----------------------------------------------------------------
+
+# _queue_prune — `jig queue prune [--dry-run] [--revision <n>] [--json]`: take
+# out of the queue every task that is finished, in one write
+# (adr-20261107-a-finished-task-leaves-the-queue). A task is finished when its
+# status is consolidated, abandoned or archived, or its workspace is gone; its
+# item goes with what it waits for and what it asked. A wait on a task the
+# advice reads as finished (_queue_next_dep_state: closed, or merged as the
+# last housekeeping run saw it) goes too, being met, so it never turns broken
+# once the workspace is purged. A wait on an abandoned, archived or vanished
+# task stays: it reads broken, and the advice names `jig queue undepend`.
+# Epic items are left alone. `jig task` (close, abandon, archive) and `jig
+# housekeeping` call it; with nothing to take out it writes nothing, and a
+# dry run says what it would take out and writes nothing either.
+_queue_prune() {
+  local dry=0 rev="" rev_given=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --revision) _queue_need_value "$1" $#; rev=$2; rev_given=1; shift 2 ;;
+      *) jig_fail usage "queue prune: unexpected argument: $1" ;;
+    esac
+  done
+  [ -z "$rev_given" ] || [ -n "$rev" ] || jig_fail usage "queue: --revision is empty"
+  [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "queue: --revision is not a revision: $rev"
+  jig_require_init
+  # shellcheck source=lib/hklog.sh
+  . "$JIG_LIB/hklog.sh"
+  local file expected items kind f2 f3 f4 f5 id st gone_ok=0 seen=" " merged open_ids
+  local drop="" met="" said=""
+  if [ -n "$rev" ]; then expected=$rev; else expected=$(jig_revision_read); fi
+  file=$(queue_file)
+  if [ -f "$file" ]; then
+    _jig_queue_readable "$file" \
+      || jig_die "queue: $file is in another format than this jig writes ($QUEUE_FORMAT); upgrade jig"
+    items=$(jig_queue_items "$file")
+  else
+    items=""
+  fi
+  ! _queue_prune_sees_workspace || gone_ok=1
+  merged=" $(hklog_ids ' remote=merged ' | tr '\n' ' ') "
+  open_ids=" $(hklog_ids ' remote=(open|closed) ' | tr '\n' ' ') "
+  while IFS=$'\t' read -r kind f2 f3 f4 f5; do
+    case "$kind" in
+      item)
+        case "$f2" in task:*) ;; *) continue ;; esac
+        id=${f2#task:}
+        jig_valid_id "$id" || continue
+        if [ -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$id/state" ]; then
+          st=$(_jig_task_state_value "$id" status)
+          case "$st" in consolidated | abandoned | archived) ;; *) continue ;; esac
+        else
+          [ "$gone_ok" = 1 ] || continue
+          st=gone
+        fi
+        drop="$drop$f2"$'\n'
+        said="${said}removed"$'\t'"$f2"$'\t'"$st"$'\n' ;;
+      dep)
+        case "$f2" in task:*) ;; *) continue ;; esac
+        case "$seen" in *" $f2 "*) continue ;; esac
+        seen="$seen$f2 "
+        [ "$(_queue_next_dep_state "$f2" "$merged" "$open_ids")" = finished ] || continue
+        met="$met$f2"$'\n' ;;
+    esac
+  done <<EOF
+$items
+EOF
+  # Which waits the met ones are, as the answer names them: every dependency
+  # line whose target is met, held by an item that does not leave anyway.
+  if [ -n "$met" ]; then
+    said="$said$(printf '%s\n' "$items" | Q_MET="$met" Q_DROP="$drop" awk -F '\t' '
+      BEGIN {
+        n = split(ENVIRON["Q_MET"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") met[a[i]] = 1
+        n = split(ENVIRON["Q_DROP"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") drop[a[i]] = 1
+      }
+      $1 == "item" { cur = $2 }
+      $1 == "dep" && ($2 in met) && !(cur in drop) { print "met\t" cur "\t" $2 }
+    ')"
+  fi
+  if [ "$dry" = 0 ] && [ -n "$drop$met" ]; then
+    local new rc=0
+    new="$file.tmp.$$"
+    jig_cleanup_add "$new"
+    Q_OP=prune Q_REF="" Q_DROP="$drop" Q_MET="$met" _queue_apply "$file" > "$new" || rc=$?
+    case "$rc" in
+      0) ;;
+      6) jig_die "queue: $file is in another format than this jig writes ($QUEUE_FORMAT); upgrade jig" ;;
+      *) jig_die "queue: cannot read $file" ;;
+    esac
+    if cmp -s "$file" "$new"; then
+      rm -f "$new"
+    else
+      _queue_commit "$expected" "$new" "$file"
+      jig_status_page_flush
+    fi
+  fi
+  if [ -n "$_QUEUE_AS_JSON" ]; then
+    _queue_prune_json "$said" "$dry"
+  else
+    _queue_prune_text "$said" "$dry"
+  fi
+}
+
+# _queue_prune_sees_workspace — exit 0 when this checkout's task workspace is
+# the one the queue's own checkout holds (the clone's main checkout, where a
+# worktree's link leads). Only then is a task with no state file gone: a
+# checkout that cannot see the workspace must not empty the queue.
+_queue_prune_sees_workspace() {
+  local here there root
+  root=$(jig_config_clone_root)
+  [ -d "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks" ] && [ -d "$root/$JIG_AI_DIR/workspace/tasks" ] || return 1
+  here=$(cd "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks" && pwd -P) || return 1
+  there=$(cd "$root/$JIG_AI_DIR/workspace/tasks" && pwd -P) || return 1
+  [ "$here" = "$there" ]
+}
+
+# _queue_prune_text <said> <dry> — the answer for a person, one line per item
+# taken out and per wait met.
+_queue_prune_text() {
+  local kind f2 f3 any=""
+  while IFS=$'\t' read -r kind f2 f3; do
+    case "$kind" in
+      removed)
+        any=1
+        if [ "$2" = 1 ]; then printf 'queue: would remove %s (%s)\n' "$f2" "$f3"
+        else printf 'queue: %s removed (%s)\n' "$f2" "$f3"; fi ;;
+      met)
+        any=1
+        if [ "$2" = 1 ]; then printf 'queue: %s would no longer wait for %s (finished)\n' "$f2" "$f3"
+        else printf 'queue: %s no longer waits for %s (finished)\n' "$f2" "$f3"; fi ;;
+    esac
+  done <<EOF
+$1
+EOF
+  [ -n "$any" ] || printf 'queue: no finished task to take out\n'
+}
+
+# _queue_prune_json <said> <dry> — the producer's data for `jig queue prune
+# --json` (schemas/json.md, "jig queue prune --json").
+_queue_prune_json() {
+  local kind f2 f3 removed="" met="" dry=false
+  [ "$2" = 0 ] || dry=true
+  while IFS=$'\t' read -r kind f2 f3; do
+    case "$kind" in
+      removed)
+        removed="$removed${removed:+,}"
+        json_quote "$f2"; removed="$removed{\"ref\":$_JSON"
+        json_quote "$f3"; removed="$removed,\"status\":$_JSON}" ;;
+      met)
+        met="$met${met:+,}"
+        json_quote "$f2"; met="$met{\"ref\":$_JSON"
+        json_quote "$f3"; met="$met,\"on\":$_JSON}" ;;
+    esac
+  done <<EOF
+$1
+EOF
+  printf '{"dry_run":%s,"removed":[%s],"met":[%s]}\n' "$dry" "$removed" "$met"
 }
 
 # --- the listing -------------------------------------------------------------------

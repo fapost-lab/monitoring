@@ -24,14 +24,15 @@ metadata only — decide whether it matters, and pull it in with `--ids <id>` wh
 Then say what you read:
 
 ```
-.ai/scripts/jig context acknowledge --task <id> --files <list>|-
+.ai/scripts/jig context acknowledge --task <id> --stage implement --files <list>|-
 .ai/scripts/jig context guard --task <id> --stage implement
 ```
 
-Run the guard before the first edit and again whenever the planned file list grows.
-Acknowledge only what you actually read — the ledger records your claim, not your
-comprehension, so a guard you satisfied without reading buys nothing and reports a
-check that did not happen. When the task has no workspace the guard says so and exits 0;
+Run the guard before the first edit and again whenever the planned file list grows; it names
+why each pending document is owed. Acknowledge only what you actually read — the ledger
+records your claim, not your comprehension, so a guard you satisfied without reading buys
+nothing and reports a check that did not happen. A claim you should not have made is
+withdrawn with `--revoke` in place of `--stage`. When the task has no workspace the guard says so and exits 0;
 that line is the honest result, not a pass to quote as one.
 
 For T3 and T4, check that the human approved the design as it was shown to them, in this

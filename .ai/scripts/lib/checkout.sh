@@ -478,6 +478,11 @@ _jig_checkout_record_inner() {
 # taking it: a coordinator does all of those for tasks other sessions take.
 # The task is the first argument that is a valid id with a workspace, the
 # test rule 1 of the working record's naming makes.
+#
+# `task set <id> status consolidated` is the close, and so is not working the
+# task: were it taken, the record's write would raise the clone's revision
+# before the command's own claim of `--revision <n>`, and a close from a
+# session would always be refused as stale-revision.
 _jig_checkout_works() {
   local a
   case "${1:-}" in
@@ -485,6 +490,9 @@ _jig_checkout_works() {
       case "${2:-}" in
         start | bootstrap | set | artifact | finding | autopilot | gate | receipt) ;;
         *) return 1 ;;
+      esac
+      case "$*" in
+        "task set "*" status consolidated" | "task set "*" status consolidated "*) return 1 ;;
       esac
       shift 2
       ;;

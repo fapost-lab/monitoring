@@ -15,7 +15,7 @@ CTX_USAGE="usage: jig context [--task <id>] [--files <list>|-] [--domains a,b] [
        jig context resolve   [selectors] [--catalog]
        jig context pending   [selectors]
        jig context guard     [selectors]
-       jig context acknowledge --task <id> --files <list>|-
+       jig context acknowledge --task <id> [--stage <stage> | --revoke] --files <list>|-
 
 selectors: --task <id>|--no-task --stage <stage> --files <list>|- --domains a,b --topics a,b --ids a,b --all"
 
@@ -219,34 +219,38 @@ _ctx_domain_matches_any() {
   return 1
 }
 
-# _ctx_doc_reason <doc> <files> <domains> [block] — print "paths: <glob>" or
-# "domains: <domain>" for the first matching entry (frontmatter order,
-# paths checked before domains) and exit 0; exit 1 and print nothing when
-# neither matches. Takes the block already read when the caller has one
-# (_ctx_matched_docs), so this and it share one fm_block per document instead
-# of each reading the file again.
-_ctx_doc_reason() {
-  local doc="$1" files="$2" domains="$3" block="${4-}" glob dom
-  [ $# -ge 4 ] || block=$(fm_block "$doc")
+# _ctx_doc_reason_v <var> <files> <domains> <block> — set <var> to "paths: <glob>"
+# or "domains: <domain>" for the first matching entry (frontmatter order, paths
+# checked before domains) and exit 0; exit 1 with <var> empty when neither
+# matches. Without a process: _ctx_matched_docs asks it for every document.
+_ctx_doc_reason_v() {
+  local __cdr_files="$2" __cdr_domains="$3" __cdr_block="$4" __cdr_list __cdr_item
+  printf -v "$1" '%s' ''
 
-  if [ -n "$files" ]; then
-    while IFS= read -r glob; do
-      [ -n "$glob" ] || continue
-      if _ctx_path_matches_any "$glob" "$files"; then
-        printf 'paths: %s\n' "$glob"
+  if [ -n "$__cdr_files" ]; then
+    fm_list_block_v __cdr_list "$__cdr_block" paths
+    while IFS= read -r __cdr_item; do
+      [ -n "$__cdr_item" ] || continue
+      if _ctx_path_matches_any "$__cdr_item" "$__cdr_files"; then
+        printf -v "$1" 'paths: %s' "$__cdr_item"
         return 0
       fi
-    done < <(fm_list_block "$block" paths)
+    done <<EOF
+$__cdr_list
+EOF
   fi
 
-  if [ -n "$domains" ]; then
-    while IFS= read -r dom; do
-      [ -n "$dom" ] || continue
-      if _ctx_domain_matches_any "$dom" "$domains"; then
-        printf 'domains: %s\n' "$dom"
+  if [ -n "$__cdr_domains" ]; then
+    fm_list_block_v __cdr_list "$__cdr_block" domains
+    while IFS= read -r __cdr_item; do
+      [ -n "$__cdr_item" ] || continue
+      if _ctx_domain_matches_any "$__cdr_item" "$__cdr_domains"; then
+        printf -v "$1" 'domains: %s' "$__cdr_item"
         return 0
       fi
-    done < <(fm_list_block "$block" domains)
+    done <<EOF
+$__cdr_list
+EOF
   fi
 
   return 1
@@ -267,19 +271,18 @@ _ctx_matched_docs() {
   local block source_doc id
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
-    fm_has "$doc" || continue
-    block=$(fm_block "$doc")
+    fm_read_v block "$doc" || continue
 
     if [ "$show_all" -ne 1 ]; then
-      status=$(fm_get_block "$block" status)
+      fm_get_block_v status "$block" status
       jig_knowledge_status_resolvable "$status" || continue
     fi
 
-    reason=$(_ctx_doc_reason "$doc" "$files" "$domains" "$block") || continue
+    _ctx_doc_reason_v reason "$files" "$domains" "$block" || continue
     relpath=$(_ctx_read_path "$doc") || exit 1
-    source_doc=$(fm_get_block "$block" source)
+    fm_get_block_v source_doc "$block" source
     if [ -n "$source_doc" ]; then
-      id=$(fm_get_block "$block" id)
+      fm_get_block_v id "$block" id
       reason="$reason; linked by $id"
     fi
     out="$out
@@ -995,6 +998,10 @@ _ctx_ledger_file() {
 
 # _ctx_check_knowledge_path <relpath> — a caller-supplied path is validated
 # before it is joined to the project root (RULES.md invariant, ADR-0008).
+# Sets _CTX_PATH_PROBLEM to what is wrong with it and returns 1, or returns 0:
+# `acknowledge` checks every path of a batch and refuses them all in one
+# message. Called as a plain command, never in `$(...)`, so that a batch starts
+# no process per path (conventions/shell.md).
 #
 # The one exception to "repository-relative" is a document a `Linked:` line of
 # the task reaches in a neighbouring repository: accepted when it is one of
@@ -1002,16 +1009,19 @@ _ctx_ledger_file() {
 # computes once), never any other absolute path
 # (adr-20261029-a-task-reads-a-neighbouring-repository-through-a-link).
 _CTX_LINKED_DOCS=""
+_CTX_PATH_PROBLEM=""
 _ctx_check_knowledge_path() {
   local rel="$1"
+  _CTX_PATH_PROBLEM=""
   case "$rel" in
     /*)
       if [ -n "$_CTX_LINKED_DOCS" ] && jig_has_line "$rel" "$_CTX_LINKED_DOCS"; then
         return 0
       fi
-      jig_die "context acknowledge: path must be repository-relative: $rel (an absolute path only for a document a Linked: line of the task reaches)"
+      printf -v _CTX_PATH_PROBLEM 'path must be repository-relative: %s (an absolute path only for a document a Linked: line of the task reaches)' "$rel"
+      return 1
       ;;
-    *..*) jig_die "context acknowledge: path may not contain '..': $rel" ;;
+    *..*) printf -v _CTX_PATH_PROBLEM "path may not contain '..': %s" "$rel"; return 1 ;;
   esac
   case "$rel" in
     "$JIG_AI_DIR/knowledge/"*.md) ;;
@@ -1019,29 +1029,102 @@ _ctx_check_knowledge_path() {
       # A source an accepted stub links is read in the stub's place, so its
       # reading is acknowledged too — that file, not any file (ADR-0015 as
       # amended).
-      _ctx_is_linked_source "$rel" \
-        || jig_die "context acknowledge: not a knowledge document or a linked source: $rel"
-      ;;
-  esac
-  case "$rel" in
-    "$JIG_AI_DIR/knowledge/"*.md) ;;
-    *)
+      if ! _ctx_is_linked_source "$rel"; then
+        printf -v _CTX_PATH_PROBLEM 'not a knowledge document or a linked source: %s' "$rel"
+        return 1
+      fi
       # The same test resolution applies: no symlink, nothing outside the
       # repository (jig_knowledge_read_path).
       if [ ! -f "$JIG_PROJECT/$rel" ] || [ -L "$JIG_PROJECT/$rel" ]; then
-        jig_die "context acknowledge: no such document: $rel"
+        printf -v _CTX_PATH_PROBLEM 'no such document: %s' "$rel"
+        return 1
       fi
       local root dir
       root=$(cd -P "$JIG_PROJECT" && pwd -P)
-      dir=$(cd -P "$(dirname "$JIG_PROJECT/$rel")" 2>/dev/null && pwd -P) \
-        || jig_die "context acknowledge: no such document: $rel"
+      if ! dir=$(cd -P "$(dirname "$JIG_PROJECT/$rel")" 2>/dev/null && pwd -P); then
+        printf -v _CTX_PATH_PROBLEM 'no such document: %s' "$rel"
+        return 1
+      fi
       case "$dir/" in
         "$root/"*) ;;
-        *) jig_die "context acknowledge: linked source leaves the repository: $rel" ;;
+        *) printf -v _CTX_PATH_PROBLEM 'linked source leaves the repository: %s' "$rel"; return 1 ;;
       esac
       ;;
   esac
-  [ -f "$JIG_PROJECT/$rel" ] || jig_die "context acknowledge: no such document: $rel"
+  if [ ! -f "$JIG_PROJECT/$rel" ]; then
+    printf -v _CTX_PATH_PROBLEM 'no such document: %s' "$rel"
+    return 1
+  fi
+  return 0
+}
+
+# _ctx_check_revoked_path <relpath> <ledger-paths> — the shape check for a
+# path whose acknowledgement is withdrawn: the same refusals of an absolute
+# path and of `..`, and the path must be in the ledger. The document need not
+# exist any more: an acknowledgement of a deleted document is withdrawn too.
+# Sets _CTX_PATH_PROBLEM and returns 1, as above.
+_ctx_check_revoked_path() {
+  local rel="$1" have="$2"
+  _CTX_PATH_PROBLEM=""
+  case "$rel" in
+    /*)
+      if ! jig_has_line "$rel" "$have"; then
+        printf -v _CTX_PATH_PROBLEM 'path must be repository-relative: %s (an absolute path only for a document a Linked: line of the task reaches)' "$rel"
+        return 1
+      fi
+      ;;
+    *..*) printf -v _CTX_PATH_PROBLEM "path may not contain '..': %s" "$rel"; return 1 ;;
+  esac
+  if ! jig_has_line "$rel" "$have"; then
+    printf -v _CTX_PATH_PROBLEM 'not acknowledged for this task: %s' "$rel"
+    return 1
+  fi
+  return 0
+}
+
+# _ctx_normalise_path_v <var> <path> — sets <var> to the path as guard and
+# resolve print it. A
+# leading `./` goes, and an absolute path inside the project becomes
+# repository-relative: an agent in a task worktree often writes one, and it
+# names the same document. Nothing is accepted by this alone — the result is
+# checked as any other path (_ctx_check_knowledge_path). A linked document's
+# absolute path is kept as it is.
+_ctx_normalise_path_v() {
+  local _np_var="$1" p="$2" dir base phys
+  while :; do
+    case "$p" in
+      ./*) p="${p#./}" ;;
+      *) break ;;
+    esac
+  done
+  case "$p" in
+    /*)
+      if [ -n "$_CTX_LINKED_DOCS" ] && jig_has_line "$p" "$_CTX_LINKED_DOCS"; then
+        printf -v "$_np_var" '%s' "$p"
+        return 0
+      fi
+      case "$p" in
+        "$JIG_PROJECT/"*) printf -v "$_np_var" '%s' "${p#"$JIG_PROJECT/"}"; return 0 ;;
+      esac
+      # The same directory reached by another spelling — /var and
+      # /private/var on macOS — compared physically (conventions/shell.md).
+      dir=$(dirname "$p")
+      base=$(basename "$p")
+      # One subshell, and only for an absolute path outside the project's
+      # own spelling.
+      if phys=$(cd -P "$dir" 2>/dev/null && pwd -P); then
+        case "$phys/" in
+          "$JIG_PROJECT/"*)
+            phys="${phys#"$JIG_PROJECT"}"
+            phys="${phys#/}"
+            if [ -n "$phys" ]; then printf -v "$_np_var" '%s/%s' "$phys" "$base"; else printf -v "$_np_var" '%s' "$base"; fi
+            return 0
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  printf -v "$_np_var" '%s' "$p"
 }
 
 # _ctx_is_linked_source <relpath> — true when a resolvable stub links <relpath>.
@@ -1056,8 +1139,22 @@ _ctx_is_linked_source() {
   return 1
 }
 
+# jig context acknowledge --task <id> [--stage <stage> | --revoke] --files <list>|-
+#
+# Records documents the agent states it has read, or with --revoke withdraws
+# such a record. A revoke drops a path's line whatever stage it was made at, so
+# `--revoke --stage` is refused rather than the stage silently ignored. Each ledger line is `<hash><TAB><path><TAB><stage>`: the stage
+# the acknowledgement was made at, `-` when none was given. A line written
+# before the stage field existed has two fields and reads as made at no stage.
+# The stage is the acknowledger's own statement, with the standing of the
+# acknowledgement itself: `guard` reports it, and nothing gates on it (ADR-0015
+# as amended 2026-11-06).
+#
+# A batch is all or nothing: every path is checked first, every refused one is
+# named, and the ledger is untouched unless all of them pass.
 ctx_acknowledge() {
-  local task_id="" files_arg="" files_stdin=0 files ledger tmp rel t hash count
+  local task_id="" files_arg="" files_stdin=0 files ledger tmp rel t hash rest count
+  local stage="-" stage_given=0 revoke=0 norm="" problems="" have=""
   t=$(printf '\t')
 
   while [ $# -gt 0 ]; do
@@ -1068,9 +1165,20 @@ ctx_acknowledge() {
         if [ "$2" = "-" ]; then files_stdin=1; else files_arg="$2"; fi
         shift 2
         ;;
+      --stage)
+        [ $# -ge 2 ] || jig_die "context: --stage requires a value"
+        jig_valid_stage "$2" || jig_die "context: invalid stage: $2"
+        stage="$2"
+        stage_given=1
+        shift 2
+        ;;
+      --revoke) revoke=1; shift ;;
       *) jig_die "context: unknown argument: $1" ;;
     esac
   done
+  if [ "$revoke" -eq 1 ] && [ "$stage_given" -eq 1 ]; then
+    jig_die "context acknowledge: --revoke takes no --stage: a revoke withdraws the path's acknowledgement whatever stage it was made at"
+  fi
 
   [ -n "$task_id" ] || jig_die "context acknowledge: --task is required"
   [ -f "$(task_dir "$task_id")/state" ] || jig_die "context: unknown task: $task_id"
@@ -1088,42 +1196,78 @@ ctx_acknowledge() {
 
   ledger=$(_ctx_ledger_file "$task_id")
   tmp="$ledger.tmp.$$"
+  # Registered before anything can refuse: a refusal must not leave either
+  # behind in the workspace (conventions/shell.md).
   jig_cleanup_add "$tmp"
+  jig_cleanup_add "$tmp.rel"
+  jig_cleanup_add "$tmp.hash"
   _CTX_LINKED_DOCS=$(_ctx_linked_docs "$task_id")
+  if [ -f "$ledger" ]; then have=$(cut -f2 "$ledger"); fi
 
-  # Rewrite through a temporary and `mv` (convention-shell): a crash must not
-  # leave a half-written ledger, which would read as "already acknowledged".
-  : > "$tmp"
-  if [ -f "$ledger" ]; then
-    while IFS="$t" read -r hash rel; do
-      [ -n "$rel" ] || continue
-      if jig_has_line "$rel" "$files"; then continue; fi
-      printf '%s%s%s\n' "$hash" "$t" "$rel" >> "$tmp"
-    done < "$ledger"
-  fi
-
-  # Every path is validated before any is hashed, then all are hashed —
-  # repository-relative ones by one git process, linked documents by one per
-  # directory (_ctx_hash_paths) — into the ledger's own `<hash><TAB><path>`.
+  # Every path is normalised and checked before anything is written or hashed.
   count=0
   : > "$tmp.rel"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
-    _ctx_check_knowledge_path "$rel"
+    _ctx_normalise_path_v rel "$rel"
+    if [ "$revoke" -eq 1 ]; then
+      _ctx_check_revoked_path "$rel" "$have" || true
+    else
+      _ctx_check_knowledge_path "$rel" || true
+    fi
+    if [ -n "$_CTX_PATH_PROBLEM" ]; then
+      problems="$problems  $_CTX_PATH_PROBLEM"$'\n'
+      continue
+    fi
+    if jig_has_line "$rel" "$norm"; then continue; fi
+    norm="$norm$rel"$'\n'
     printf '%s\n' "$rel" >> "$tmp.rel"
     count=$((count + 1))
   done < <(printf '%s\n' "$files")
-  jig_cleanup_add "$tmp.hash"
-  if ! _ctx_hash_paths "$tmp.rel" > "$tmp.hash"; then
-    rm -f "$tmp" "$tmp.rel" "$tmp.hash"
-    jig_die "context acknowledge: could not hash the documents"
+  if [ -n "$problems" ]; then
+    rm -f "$tmp.rel"
+    printf '%s' "$problems" | sed 's/^  /context acknowledge: /' >&2
+    jig_die "context acknowledge: $(printf '%s' "$problems" | sed '/^$/d' | wc -l | tr -d ' ') path(s) refused; nothing recorded. Give the paths as jig context guard prints them"
   fi
-  cat "$tmp.hash" >> "$tmp"
+
+  # Rewrite through a temporary and `mv` (convention-shell): a crash must not
+  # leave a half-written ledger, which would read as "already acknowledged".
+  # The lines for the given paths are dropped and, unless revoking, written
+  # again with their new hash and stage; every other line is kept whole.
+  : > "$tmp"
+  if [ -f "$ledger" ]; then
+    while IFS="$t" read -r hash rel rest; do
+      [ -n "$rel" ] || continue
+      if jig_has_line "$rel" "$norm"; then continue; fi
+      if [ -n "$rest" ]; then
+        printf '%s%s%s%s%s\n' "$hash" "$t" "$rel" "$t" "$rest" >> "$tmp"
+      else
+        printf '%s%s%s\n' "$hash" "$t" "$rel" >> "$tmp"
+      fi
+    done < "$ledger"
+  fi
+
+  if [ "$revoke" -eq 0 ]; then
+    # Repository-relative paths are hashed by one git process, linked
+    # documents by one per directory (_ctx_hash_paths), into the ledger's own
+    # `<hash><TAB><path>`; the stage, validated above, is appended.
+    if ! _ctx_hash_paths "$tmp.rel" > "$tmp.hash"; then
+      rm -f "$tmp" "$tmp.rel" "$tmp.hash"
+      jig_die "context acknowledge: could not hash the documents"
+    fi
+    sed "s/\$/$t$stage/" "$tmp.hash" >> "$tmp"
+  fi
   rm -f "$tmp.rel" "$tmp.hash"
 
   sort -o "$tmp" "$tmp"
   mv "$tmp" "$ledger"
-  printf 'acknowledged %s document(s) for %s\n' "$count" "$task_id"
+  if [ "$revoke" -eq 1 ]; then
+    printf 'revoked %s document(s) for %s\n' "$count" "$task_id"
+  elif [ "$stage" = "-" ]; then
+    printf 'acknowledged %s document(s) for %s\n' "$count" "$task_id"
+  else
+    printf 'acknowledged %s document(s) for %s at %s\n' "$count" "$task_id" "$stage"
+  fi
 }
 
 # _ctx_tracked_paths <rows-file> — every path whose reading is tracked: the
@@ -1133,11 +1277,22 @@ ctx_acknowledge() {
 # of. A linked task's are another task's output, which this task owes a
 # reading of: that is what the link says.
 _ctx_tracked_paths() {
+  _ctx_tracked_rows "$1" | cut -f1
+}
+
+# _ctx_tracked_rows <rows-file> — the same paths, each with the reason it is
+# tracked, as resolve prints it: `global`, `paths: <glob>`, `domains: <d>`,
+# `requires: <id>`, `id: <id>`, or `linked`. One row per path, sorted. What
+# guard shows next to a pending document, so that what the diff asks a reader
+# to read is said, not only listed.
+_ctx_tracked_rows() {
+  local t
+  t=$(printf '\t')
   {
-    _ctx_global_rows | cut -f1
-    _ctx_read_rows "$1" | cut -f1
-    _ctx_linked_docs "$CTX_TASK"
-  } | sort -u
+    _ctx_global_rows
+    _ctx_read_rows "$1"
+    _ctx_linked_docs "$CTX_TASK" | sed "s/\$/${t}linked/"
+  } | awk -F '\t' 'NF && !seen[$1]++' | sort
 }
 
 # _ctx_pending_paths <rows-file> <ledger> — tracked documents with no
@@ -1195,7 +1350,8 @@ ctx_pending() {
 ctx_guard() {
   _ctx_parse_selectors "$@"
 
-  local rows ledger pending tracked_count pending_count
+  local rows ledger pending tracked tracked_count pending_count t
+  t=$(printf '\t')
   rows="${TMPDIR:-/tmp}/jig-context-required.$$"
   _ctx_required_rows "$rows"
 
@@ -1211,19 +1367,69 @@ ctx_guard() {
   ledger=$(_ctx_ledger_file "$CTX_TASK")
 
   pending=$(_ctx_pending_paths "$rows" "$ledger")
-  tracked_count=$(_ctx_tracked_paths "$rows" | sed '/^$/d' | wc -l | tr -d ' ')
+  tracked=$(_ctx_tracked_rows "$rows")
+  tracked_count=$(printf '%s\n' "$tracked" | sed '/^$/d' | wc -l | tr -d ' ')
   rm -f "$rows"
 
   if [ -z "$pending" ]; then
     printf 'context guard: ok (%s document(s) acknowledged)\n' "$tracked_count"
+    _ctx_guard_attribution "$ledger" "$tracked"
     return 0
   fi
 
   pending_count=$(printf '%s\n' "$pending" | sed '/^$/d' | wc -l | tr -d ' ')
   printf 'context guard: %s of %s document(s) not acknowledged:\n' \
     "$pending_count" "$tracked_count" >&2
-  printf '%s\n' "$pending" | sed 's/^/  /' >&2
-  printf 'read them, then: jig context acknowledge --task %s --files <list>\n' \
-    "$CTX_TASK" >&2
+  # Each with the reason it is required, as resolve gives it.
+  {
+    printf '%s\n' "$tracked" | sed "s/^/R$t/"
+    printf '%s\n' "$pending" | sed "s/^/P$t/"
+  } | awk -F '\t' '
+    $1 == "R" { why[$2] = $3; next }
+    $1 == "P" && $2 != "" {
+      if (why[$2] != "") printf "  %s  (%s)\n", $2, why[$2]
+      else printf "  %s\n", $2
+    }
+  ' >&2
+  if [ -n "$CTX_STAGE" ]; then
+    printf 'read them, then: jig context acknowledge --task %s --stage %s --files <list>\n' \
+      "$CTX_TASK" "$CTX_STAGE" >&2
+  else
+    printf 'read them, then: jig context acknowledge --task %s --files <list>\n' \
+      "$CTX_TASK" >&2
+  fi
   return 1
+}
+
+# _ctx_guard_attribution <ledger> <tracked-rows> — whose acknowledgements a
+# passing guard took: one line per stage they were made at, and a line saying
+# so when none was made at the stage this guard was asked for. A reviewer's
+# guard passes on the implementer's acknowledgements as readily as on its own;
+# this is where that becomes visible. It reports, and changes nothing about
+# what passes (ADR-0015 as amended 2026-11-06).
+_ctx_guard_attribution() {
+  local ledger="$1" tracked="$2" t counts stage n here=0
+  t=$(printf '\t')
+  [ -f "$ledger" ] || return 0
+  counts=$({
+    sed "s/^/L$t/" "$ledger"
+    printf '%s\n' "$tracked" | cut -f1 | sed "s/^/T$t/"
+  } | awk -F '\t' '
+    $1 == "L" { st[$3] = (NF >= 4 && $4 != "") ? $4 : "-"; next }
+    $1 == "T" && $2 != "" { s = ($2 in st) ? st[$2] : "-"; n[s]++ }
+    END { for (k in n) print k "\t" n[k] }
+  ' | sort)
+  while IFS="$t" read -r stage n; do
+    [ -n "$stage" ] || continue
+    if [ "$stage" = "-" ]; then
+      printf '  %s acknowledged at no stage\n' "$n"
+    else
+      printf '  %s acknowledged at %s\n' "$n" "$stage"
+      if [ "$stage" = "$CTX_STAGE" ]; then here=1; fi
+    fi
+  done <<< "$counts"
+  if [ -n "$CTX_STAGE" ] && [ "$here" -eq 0 ]; then
+    printf '  none acknowledged at %s: this guard passed on acknowledgements made elsewhere\n' "$CTX_STAGE"
+  fi
+  return 0
 }

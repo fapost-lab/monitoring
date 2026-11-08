@@ -114,6 +114,110 @@ $p
   fi
 }
 
+# --- a signal that is not left waiting -------------------------------------
+#
+# A trapped signal runs its handler only when the command the shell is waiting on
+# has ended: `exit 143` above waits out a `sleep 100`, a test run, or one long
+# expansion in the shell itself (a quadratic string loop took almost 20 hours to
+# reach it, and its children outlived the parent). `wait` is the one builtin a
+# trapped signal interrupts, so the dispatcher runs the command as a background
+# job and waits for it here. On SIGTERM or SIGINT the job and everything under it
+# get SIGTERM (their cleanup runs), and SIGKILL after JIG_TERM_GRACE seconds
+# (default 5; digits only) to what is still there. The job keeps its standard
+# input. A background job ignores SIGINT, so 130 and 143 come from this process,
+# not from the job's own traps above. SIGKILL of this process cannot be handled:
+# the job is orphaned and goes on, which is the price of a signal nothing catches
+# (its lock and busy records name this pid, so they read as stale at once and a
+# later run may take them while the orphan still works).
+
+# _jig_descendants <pid> — every process under <pid>, one per line. Always
+# succeeds: it runs in the signal handler under `set -e`, and a failure there
+# killed the handler with status 1 before it signalled anything, orphaning the
+# job. `ps -o` is POSIX, but the `ps` of Git Bash (MSYS, Cygwin) has no `-o`
+# and fails; Cygwin and MSYS give every process a `/proc/<pid>/ppid` instead,
+# which Linux and macOS do not, so the fallback is read only where `ps` failed.
+# _JIG_PROC_ROOT moves that directory for the tests.
+_jig_descendants() {
+  local rows
+  rows=$(ps -A -o pid= -o ppid= 2>/dev/null) || rows=""
+  [ -n "$rows" ] || rows=$(_jig_proc_parents)
+  printf '%s\n' "$rows" | awk -v root="$1" '
+    NF >= 2 { n++; id[n] = $1; par[$1] = $2 }
+    END {
+      mark[root] = 1; changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= n; i++)
+          if (!(id[i] in mark) && (par[id[i]] in mark)) { mark[id[i]] = 1; print id[i]; changed = 1 }
+      }
+    }' || true
+  return 0
+}
+
+# _jig_proc_parents — `<pid> <ppid>` per process, from /proc/<pid>/ppid. A
+# process that ends during the walk is skipped: `2>/dev/null` comes before the
+# input redirection, so the failed open is silent too.
+_jig_proc_parents() {
+  local d ppid
+  for d in "${_JIG_PROC_ROOT:-/proc}"/[0-9]*; do
+    [ -f "$d/ppid" ] || continue
+    ppid=""
+    read -r ppid 2>/dev/null < "$d/ppid" || [ -n "$ppid" ] || continue
+    printf '%s %s\n' "${d##*/}" "$ppid"
+  done
+  return 0
+}
+
+_JIG_SUP_PID=""
+
+# _jig_any_alive <pid>... — true while one of them still runs.
+_jig_any_alive() {
+  local p
+  for p in "$@"; do
+    if kill -0 "$p" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+
+# _jig_supervise_signal <exit code> — end the job and its tree, then exit.
+_jig_supervise_signal() {
+  local code="$1" tree grace="${JIG_TERM_GRACE:-5}" until
+  case "$grace" in ''|*[!0-9]*) grace=5 ;; esac
+  # The tree is read once, before anything dies: a child the job leaves behind
+  # when it exits on TERM is still in this list for the SIGKILL below.
+  # Should the tree be unreadable after all, the job alone still gets the
+  # signals and this process still exits with <code>.
+  tree="$(_jig_descendants "$_JIG_SUP_PID" || true) $_JIG_SUP_PID"
+  # shellcheck disable=SC2086
+  kill -TERM $tree 2>/dev/null || true
+  # Wait for every process of the tree, not only the job: the job subshell has no
+  # TERM trap and dies at once, while a command below it is still running its own
+  # exit cleanup; SIGKILL at that moment would take the cleanup with it.
+  until=$((SECONDS + grace))
+  # shellcheck disable=SC2086
+  while _jig_any_alive $tree && [ "$SECONDS" -lt "$until" ]; do
+    sleep 0.1
+  done
+  # shellcheck disable=SC2086
+  kill -KILL $tree 2>/dev/null || true
+  wait "$_JIG_SUP_PID" 2>/dev/null || true
+  exit "$code"
+}
+
+# jig_supervise <command> [args] — run it as a job that SIGTERM and SIGINT reach
+# at once; its exit status is this one's. Call it once, from the main shell.
+jig_supervise() {
+  local rc=0
+  # The explicit `exit`: bash 3.2 skips the EXIT trap of a background subshell
+  # that only runs off its end, and the command's cleanup lives in that trap.
+  { "$@"; exit "$?"; } 0<&0 &
+  _JIG_SUP_PID=$!
+  trap '_jig_supervise_signal 143' TERM
+  trap '_jig_supervise_signal 130' INT
+  wait "$_JIG_SUP_PID" || rc=$?
+  return "$rc"
+}
+
 _jig_exit_run() {
   [ "$_JIG_EXIT_LEVEL" = "${BASH_SUBSHELL:-0}" ] || return 0
   local line
@@ -225,6 +329,31 @@ jig_valid_id() {
   esac
 }
 
+# jig_goal_check <who> <goal> — the goal of a task, which `task new --goal` and
+# `spec item file --new --goal` both take. It is the paragraph under `## Goal` that
+# `task list --goals` and `task list --json` read back: one line, so that it stays one
+# paragraph, and not a heading, so that it stays under `## Goal`. Refuses `usage`;
+# leaves the trimmed goal in JIG_GOAL.
+JIG_GOAL=""
+jig_goal_check() {
+  local who="$1" goal="$2"
+  case "$goal" in
+    *$'\n'* | *$'\r'*) jig_fail usage "$who: --goal is one line: the goal paragraph of task.md" ;;
+  esac
+  case "$goal" in
+    *[![:space:]]*) ;;
+    *) jig_fail usage "$who: --goal is empty" ;;
+  esac
+  # Trimmed: leading blanks would make the paragraph a code block.
+  goal=${goal#"${goal%%[![:space:]]*}"}
+  goal=${goal%"${goal##*[![:space:]]}"}
+  case "$goal" in
+    '#'*) jig_fail usage "$who: --goal cannot start with #: it would read as a heading" ;;
+  esac
+  # shellcheck disable=SC2034 # read by the callers
+  JIG_GOAL=$goal
+}
+
 # Die unless the project has been initialised with jig init.
 # jig_has_line <line> <text> — exit 0 when <line> is a whole line of <text>,
 # compared as a string. A `case`, never `printf | grep -qxF`: bash writes a
@@ -288,19 +417,23 @@ EOF
   printf '%s\n' "$v"
 }
 
-# jig_version_newer <a> <b> — true when release version <a> (`X.Y.Z`) is
+# jig_version_newer <a> <b> — true when release version <a> (`X.Y.Z`, or
+# `X.Y.Z+<build>`, ordered by its `X.Y.Z`) is
 # strictly newer than <b>, comparing each field as a number: 0.10.0 is newer
 # than 0.9.0. False for equal versions and for anything that is not three
 # numeric fields, so an unparsable version never reads as an upgrade.
 jig_version_newer() {
-  local a1 a2 a3 b1 b2 b3
-  jig_release_version "v$1" >/dev/null || return 1
-  jig_release_version "v$2" >/dev/null || return 1
+  local a1 a2 a3 b1 b2 b3 a="${1%%+*}" b="${2%%+*}"
+  # A `+<build>` part (unreleased code, `X.Y.Z+<sha>`) takes no part in the
+  # order, as in semver: it is compared by the release number it was built on
+  # (adr-20261106-copy-mode-projects-take-released-code-only).
+  jig_release_version "v$a" >/dev/null || return 1
+  jig_release_version "v$b" >/dev/null || return 1
   IFS=. read -r a1 a2 a3 <<EOF
-$1
+$a
 EOF
   IFS=. read -r b1 b2 b3 <<EOF
-$2
+$b
 EOF
   # 10#: a field with a leading zero is still decimal, not octal.
   a1=$((10#$a1)); a2=$((10#$a2)); a3=$((10#$a3))
@@ -360,6 +493,158 @@ jig_declared_version() {
 '*) return 1 ;;
   esac
   printf '%s\n' "$found"
+}
+
+# --- released and unreleased sources ------------------------------------------
+#
+# A framework checkout is a released source only when its HEAD carries the
+# release tag of the version it declares. Anything else — a branch past the
+# tag, a detached commit, a copy without git — is unreleased code, even when it
+# declares a released number: `main` keeps the last release's JIG_VERSION until
+# the next release raises it. A copy-mode project takes released code only,
+# unless asked for unreleased code by name
+# (adr-20261106-copy-mode-projects-take-released-code-only).
+
+# _jig_source_git <dir> — true when <dir> is the top of a git checkout of its
+# own, not merely inside somebody else's repository (a copy of the framework
+# placed inside a project would otherwise answer with the project's tags).
+_jig_source_git() {
+  local top phys
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+  top=$(cd -P "$top" 2>/dev/null && pwd -P) || return 1
+  phys=$(cd -P "$1" 2>/dev/null && pwd -P) || return 1
+  [ "$top" = "$phys" ]
+}
+
+# jig_source_release <dir> — true when framework checkout <dir> stands at the
+# release tag of the version it declares (`v<JIG_VERSION>` points at HEAD). A
+# branch whose HEAD carries that tag counts: its bytes are the release's.
+# Uncommitted changes are not looked at here: this is the cheap question
+# `jig status` and `jig --version` ask on every run. Taking files asks
+# jig_source_released, which also asks jig_source_clean.
+jig_source_release() {
+  local declared tags
+  declared=$(jig_declared_version "$1") || return 1
+  jig_release_version "v$declared" >/dev/null || return 1
+  _jig_source_git "$1" || return 1
+  # Read whole, then searched: a pipe into an early-quitting reader can die
+  # of SIGPIPE under pipefail (conventions/shell.md).
+  tags=$(git -C "$1" tag --points-at HEAD 2>/dev/null) || return 1
+  jig_has_line "v$declared" "$tags"
+}
+
+# jig_source_changes <dir> — the uncommitted changes of checkout <dir>, as
+# `git status --porcelain` lists them; fails when git cannot read them.
+# --untracked-files=all pins what counts as a change: with
+# status.showUntrackedFiles=no in someone's git config, plain --porcelain
+# hides untracked files and a dirty checkout would read as clean. Shared with
+# self-update, which refuses a checkout with changes for the same reason.
+jig_source_changes() {
+  git -C "$1" status --porcelain --untracked-files=all 2>/dev/null
+}
+
+# jig_source_clean <dir> — true when checkout <dir> has no tracked, staged or
+# untracked change. The answer is kept for the process: an upgrade asks it
+# for the refusal and again for the version it records, and on Git Bash each
+# `git status` is a slow process start.
+_JIG_SOURCE_CLEAN_DIR=""
+_JIG_SOURCE_CLEAN_RC=""
+jig_source_clean() {
+  local changes
+  if [ -n "$_JIG_SOURCE_CLEAN_DIR" ] && [ "$_JIG_SOURCE_CLEAN_DIR" = "$1" ]; then
+    return "$_JIG_SOURCE_CLEAN_RC"
+  fi
+  _JIG_SOURCE_CLEAN_RC=1
+  if changes=$(jig_source_changes "$1") && [ -z "$changes" ]; then
+    _JIG_SOURCE_CLEAN_RC=0
+  fi
+  _JIG_SOURCE_CLEAN_DIR=$1
+  return "$_JIG_SOURCE_CLEAN_RC"
+}
+
+# jig_source_released <dir> — true when <dir> holds a release's bytes: at its
+# release tag (jig_source_release) and with no local change. A checkout at a
+# tag with edited or added files is unreleased code under a release's number
+# (adr-20261106-copy-mode-projects-take-released-code-only).
+jig_source_released() {
+  jig_source_release "$1" && jig_source_clean "$1"
+}
+
+# jig_source_taken_version <dir> — the version a copy-mode project records
+# when it takes files from <dir>: jig_source_version, and `X.Y.Z+<sha>.dirty`
+# when the checkout has local changes, at a release tag or past one.
+jig_source_taken_version() {
+  local v sha
+  v=$(jig_source_version "$1") || return 1
+  if ! _jig_source_git "$1" || jig_source_clean "$1"; then
+    printf '%s\n' "$v"
+    return 0
+  fi
+  case "$v" in
+    *+*) printf '%s.dirty\n' "$v" ;;
+    *)
+      sha=$(git -C "$1" rev-parse --short=7 HEAD 2>/dev/null) || sha=unknown
+      printf '%s+%s.dirty\n' "$v" "${sha:-unknown}" ;;
+  esac
+}
+
+# jig_source_version <dir> — the version of framework checkout <dir> as a
+# person should read it: the declared `X.Y.Z` at its release tag, otherwise
+# `X.Y.Z+<short sha>`, or `X.Y.Z+unknown` without a git checkout of its own.
+jig_source_version() {
+  local declared sha
+  declared=$(jig_declared_version "$1") || return 1
+  if jig_source_release "$1"; then
+    printf '%s\n' "$declared"
+  elif _jig_source_git "$1" \
+       && sha=$(git -C "$1" rev-parse --short=7 HEAD 2>/dev/null) && [ -n "$sha" ]; then
+    printf '%s+%s\n' "$declared" "$sha"
+  else
+    printf '%s+unknown\n' "$declared"
+  fi
+}
+
+# jig_version_core <version> — <version> without its `+<build>` part: the
+# release number an unreleased version was built on.
+jig_version_core() {
+  printf '%s\n' "${1%%+*}"
+}
+
+# jig_source_where <dir> — where an unreleased checkout stands, in words:
+# "on branch main at 278958c", "detached at 278958c", "not a git checkout".
+jig_source_where() {
+  local sha branch
+  if ! _jig_source_git "$1"; then
+    printf 'not a git checkout\n'
+    return 0
+  fi
+  sha=$(git -C "$1" rev-parse --short=7 HEAD 2>/dev/null) || sha="?"
+  if branch=$(git -C "$1" symbolic-ref -q --short HEAD 2>/dev/null); then
+    printf 'on branch %s at %s\n' "$branch" "$sha"
+  else
+    printf 'detached at %s\n' "$sha"
+  fi
+}
+
+# jig_require_released_source <command> <source> <unreleased> — refuse, as
+# `unreleased-source`, to install a copy-mode project from <source> when it is
+# not a release, unless <unreleased> is 1 (`--unreleased`). The message names
+# where the checkout stands and the two ways out.
+jig_require_released_source() {
+  local cmd="$1" source="$2" unreleased="$3" declared back
+  [ "$unreleased" != 1 ] || return 0
+  if jig_source_release "$source"; then
+    jig_source_clean "$source" && return 0
+    jig_fail unreleased-source "$cmd: the source is not a release: $source is at its release tag with uncommitted changes ($(jig_source_taken_version "$source" 2>/dev/null || printf '%s' "$(jig_declared_version "$source" 2>/dev/null)")). A copy-mode project takes released code only; see the changes with \`git -C $source status --short\` and commit them elsewhere or stash them (\`git -C $source stash -u\`); or take this code on purpose: jig $cmd --unreleased"
+  fi
+  declared=$(jig_declared_version "$source" 2>/dev/null) || declared="?"
+  if _jig_source_git "$source" \
+     && git -C "$source" rev-parse -q --verify "refs/tags/v$declared" >/dev/null 2>&1; then
+    back="return it to a release: git -C $source checkout v$declared"
+  else
+    back="use a released Jig: install.sh without --ref, or check out a release tag (git tag -l 'v*')"
+  fi
+  jig_fail unreleased-source "$cmd: the source is not a release: $source is $(jig_source_where "$source") ($(jig_source_version "$source" 2>/dev/null || printf '%s' "$declared")). A copy-mode project takes released code only; $back; or take this code on purpose: jig $cmd --unreleased"
 }
 
 # jig_global_executable — the physical path of the `jig` the current PATH
@@ -457,6 +742,27 @@ jig_link_dir() {
     *) return 1 ;;
   esac
   [ -L "$2" ]
+}
+
+# jig_worktree_leftover <path> — clear what `git worktree remove` leaves behind
+# on Windows, once git no longer has the worktree: links, never what they point
+# at — `find` does not follow them; `rm -f`, and `rmdir` where that fails — and
+# then empty directories, deepest first; `rmdir` cannot
+# remove a directory that still holds anything. Non-zero when anything else
+# remains, which stays where it is. Measured on windows-latest, 2026-09-14: git
+# removed the tracked files of a task worktree and left the directory, with
+# `.ai/…` and the junction that borrowed the tasks directory still in it. Never
+# `rm -rf`: under Git Bash it can go through a junction into what it borrows.
+# Callers: housekeeping, on a task worktree it proved is ours, and the own tree
+# (owntree.sh), on the one path `_ot_tree_path` builds.
+jig_worktree_leftover() {
+  local path="$1" entry
+  while IFS= read -r entry; do
+    [ -L "$entry" ] || continue
+    rm -f "$entry" 2>/dev/null || rmdir "$entry" 2>/dev/null || true
+  done < <(find "$path" -type l 2>/dev/null)
+  find "$path" -depth -type d -exec rmdir {} \; 2>/dev/null || true
+  [ ! -e "$path" ]
 }
 
 # How this machine copies a directory fastest: the `cp` flags in
@@ -886,10 +1192,74 @@ jig_fresh_base_ref() {
 # hangs for a different reason — a stalled TCP connection, a slow forge.
 # That would need a process-level timeout, and `timeout`/`gtimeout` is not
 # guaranteed to exist (ADR-0002: git is the only required dependency), so
-# none is added here; a caller cannot be made to wait no longer than N
-# seconds without one.
+# none is added here; a caller that must not wait past a budget runs the
+# call through jig_net below.
 jig_git_batch_ssh() {
   printf '%s -o BatchMode=yes\n' "${GIT_SSH_COMMAND:-ssh}"
+}
+
+# _JIG_NET_DEADLINE — the epoch second after which no call through jig_net may
+# still run; empty, the default, bounds nothing. Set by the one caller that
+# holds a lock with a ttl while it reaches the network: a write in Jig's own
+# tree (lib/owntree.sh), whose live holder would read as gone past that ttl.
+# _JIG_NET_CALL caps a single call below the deadline (JIG_NET_CALL in the
+# environment overrides it, for tests), so one stalled call does not use up
+# what the calls after it are owed.
+_JIG_NET_DEADLINE=""
+_JIG_NET_CALL=120
+case "${JIG_NET_CALL:-}" in
+  '' | *[!0-9]*) ;;
+  *) _JIG_NET_CALL=$JIG_NET_CALL ;;
+esac
+
+# jig_net <program> [args...] — run a program that reaches the network: as is
+# while _JIG_NET_DEADLINE is empty, and otherwise killed once it has run
+# min(_JIG_NET_CALL, what is left before the deadline) seconds, exit 124, with
+# nothing it printed passed on but one line on stderr that names the cut-off,
+# so a caller that reports what failed says why. Past the deadline it is not
+# started: 124 too. A program, never a shell function: the background job is
+# the program itself, so the kill reaches it and not a subshell its child
+# outlives. TERM, not KILL: git takes its own `.lock` files away on TERM. Its
+# output comes back through files once it has ended, stderr first and stdout
+# last: a caller that reads `2>&1` takes its answer from the last line (the
+# URL `gh pr create` prints), and a warning gh writes to stderr first must
+# not end up there.
+# Bounded by hand for ADR-0002, as jig_ls_remote_tags is (conventions/shell.md).
+jig_net() {
+  local now left out err pid rc=0 ticks=0
+  if [ -z "$_JIG_NET_DEADLINE" ]; then
+    "$@"
+    return
+  fi
+  now=$(date +%s)
+  left=$((_JIG_NET_DEADLINE - now))
+  [ "$left" -le "$_JIG_NET_CALL" ] || left=$_JIG_NET_CALL
+  if [ "$left" -le 0 ]; then
+    printf '%s: not started, no time left for the network under the lock\n' "$1" >&2
+    return 124
+  fi
+  out=$(mktemp "${TMPDIR:-/tmp}/jig-net.XXXXXX") || return 1
+  jig_cleanup_add "$out"
+  err="$out.err"
+  jig_cleanup_add "$err"
+  "$@" >"$out" 2>"$err" </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$ticks" -ge $((left * 5)) ]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f "$out" "$err"
+      printf '%s: no answer within %ss; cut off\n' "$1" "$left" >&2
+      return 124
+    fi
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  wait "$pid" || rc=$?
+  cat "$err" >&2
+  cat "$out"
+  rm -f "$out" "$err"
+  return "$rc"
 }
 
 # --- the newest published release -------------------------------------------
@@ -988,7 +1358,7 @@ jig_fetch_branches() {
   for name in "$@"; do
     [ -n "$name" ] || continue
     if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
-         git -C "$JIG_PROJECT" fetch --quiet origin \
+         jig_net git -C "$JIG_PROJECT" fetch --quiet origin \
          "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1; then
       jig_warn "$who: could not fetch $name from origin; using the refs this checkout has"
     fi
@@ -998,9 +1368,53 @@ jig_fetch_branches() {
 
 # --- forge -------------------------------------------------------------------
 
+# _jig_forge_by_name <url-or-host> — github|gitlab|none, read off the name.
+_jig_forge_by_name() {
+  case "$1" in
+    *github.com*) printf 'github\n' ;;
+    *gitlab.com*|*gitlab.*) printf 'gitlab\n' ;;
+    *) printf 'none\n' ;;
+  esac
+}
+
+# _jig_ssh_alias_hostname <url> — the host an SSH remote really reaches, as
+# `ssh -G` resolves it from the user's ssh config; nothing for a URL that is
+# not SSH, or when ssh is missing or answers nothing.
+#
+# A person with two accounts on one forge reaches it through a `Host` alias
+# (`git@github-personal:owner/repo.git`, `HostName github.com`). The origin URL
+# then names no forge, git and gh resolve the alias anyway, and `task ship` and
+# `spec ship` said "no forge available" on every pull request. `ssh -G` only
+# prints the resolved configuration: it opens no connection. ssh is optional
+# (ADR-0002): without it the answer stays what the URL says.
+_jig_ssh_alias_hostname() {
+  local url="$1" host
+  case "$url" in
+    ssh://*)
+      host=${url#ssh://}
+      host=${host%%/*}
+      host=${host#*@}
+      host=${host%%:*}
+      ;;
+    *://*) return 0 ;;
+    *:*)
+      # scp form, [user@]host:path. A path with a slash before the first
+      # colon is a local path, not a host.
+      host=${url%%:*}
+      case "$host" in */*) return 0 ;; esac
+      host=${host#*@}
+      ;;
+    *) return 0 ;;
+  esac
+  [ -n "$host" ] || return 0
+  command -v ssh >/dev/null 2>&1 || return 0
+  ssh -G "$host" </dev/null 2>/dev/null | sed -n 's/^hostname //p' || true
+}
+
 # jig_forge_kind — which forge CLI this checkout should use: cfg `forge`
 # (auto|github|gitlab|none, default auto) resolved against the origin URL
-# when auto, then confirmed actually usable here — the CLI on PATH and
+# when auto — or against the host an SSH alias in it resolves to
+# (_jig_ssh_alias_hostname) — then confirmed actually usable here — the CLI on PATH and
 # authenticated. Prints github|gitlab|none; dies only on an unrecognised
 # `forge` value, the one case a caller cannot paper over with "none".
 #
@@ -1025,23 +1439,26 @@ jig_forge_kind() {
   fi
 
   if [ "$want" = "auto" ]; then
-    case "$origin" in
-      *github.com*) want="github" ;;
-      *gitlab.com*|*gitlab.*) want="gitlab" ;;
-      *) printf 'none\n'; return 0 ;;
-    esac
+    want=$(_jig_forge_by_name "$origin")
+    if [ "$want" = none ]; then
+      want=$(_jig_forge_by_name "$(_jig_ssh_alias_hostname "$origin")")
+    fi
+    if [ "$want" = none ]; then
+      printf 'none\n'
+      return 0
+    fi
   fi
 
   case "$want" in
     github)
-      if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      if command -v gh >/dev/null 2>&1 && jig_net gh auth status >/dev/null 2>&1; then
         printf 'github\n'
       else
         printf 'none\n'
       fi
       ;;
     gitlab)
-      if command -v glab >/dev/null 2>&1 && glab auth status >/dev/null 2>&1; then
+      if command -v glab >/dev/null 2>&1 && jig_net glab auth status >/dev/null 2>&1; then
         printf 'gitlab\n'
       else
         printf 'none\n'
@@ -1325,7 +1742,7 @@ jig_ship_push() {
   local who="$1" branch="$2" out
   _jig_ship_outward "$who"
   if ! out=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
-             git -C "$JIG_PROJECT" push -u origin "$branch" 2>&1); then
+             jig_net git -C "$JIG_PROJECT" push -u origin "$branch" 2>&1); then
     jig_die "$who: git push failed:
 $out"
   fi
@@ -1368,7 +1785,7 @@ _jig_ship_pr_github() {
   local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" url out
   local extra=""
   [ "$draft" != 1 ] || extra="--draft"
-  url=$(gh pr list --head "$head" --state open --json url --jq '.[0].url' 2>/dev/null || printf '')
+  url=$(jig_net gh pr list --head "$head" --state open --json url --jq '.[0].url' 2>/dev/null || printf '')
   case "$url" in '' | null) url="" ;; esac
   if [ -n "$url" ]; then
     JIG_SHIP_URL="$url"
@@ -1376,7 +1793,7 @@ _jig_ship_pr_github() {
     return 0
   fi
   # shellcheck disable=SC2086 # $extra is one flag or nothing
-  out=$(gh pr create --base "$base" --head "$head" --title "$title" --body-file "$body_file" $extra 2>&1) \
+  out=$(jig_net gh pr create --base "$base" --head "$head" --title "$title" --body-file "$body_file" $extra 2>&1) \
     || jig_die "$who: gh pr create failed:
 $out"
   url=$(printf '%s\n' "$out" | tail -n 1)
@@ -1392,7 +1809,7 @@ _jig_ship_pr_gitlab() {
   local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" out url desc
   local extra=""
   [ "$draft" != 1 ] || extra="--draft"
-  out=$(glab mr list --source-branch "$head" --output json 2>/dev/null || printf '')
+  out=$(jig_net glab mr list --source-branch "$head" --output json 2>/dev/null || printf '')
   url=$(printf '%s' "$out" | jig_glab_fields web_url | head -n 1)
   if [ -n "$url" ]; then
     JIG_SHIP_URL="$url"
@@ -1401,7 +1818,7 @@ _jig_ship_pr_gitlab() {
   fi
   desc=$(cat "$body_file")
   # shellcheck disable=SC2086 # $extra is one flag or nothing
-  out=$(glab mr create --target-branch "$base" --source-branch "$head" --title "$title" --description "$desc" $extra 2>&1) \
+  out=$(jig_net glab mr create --target-branch "$base" --source-branch "$head" --title "$title" --description "$desc" $extra 2>&1) \
     || jig_die "$who: glab mr create failed:
 $out"
   url=$(printf '%s\n' "$out" | grep -oE 'https://[^[:space:]]+' | tail -n 1)
@@ -1713,7 +2130,7 @@ jig_pr_state() {
 
 _jig_pr_state_github() {
   local state
-  state=$(gh pr view "$1" --json state --jq .state 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  state=$(jig_net gh pr view "$1" --json state --jq .state 2>/dev/null) || { printf 'unknown\n'; return 0; }
   case "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" in
     merged) printf 'merged\n' ;;
     open) printf 'open\n' ;;
@@ -1726,7 +2143,7 @@ _jig_pr_state_gitlab() {
   local iid json state
   iid=$(_jig_ship_glab_mr "$1")
   [ -n "$iid" ] || { printf 'unknown\n'; return 0; }
-  json=$(glab mr view "$iid" --output json 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  json=$(jig_net glab mr view "$iid" --output json 2>/dev/null) || { printf 'unknown\n'; return 0; }
   state=$(printf '%s' "$json" | tr -d ' \n' | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
   case "$state" in
     merged) printf 'merged\n' ;;
@@ -2227,8 +2644,8 @@ export JIG_DOC_TYPES
 # consumer of jig_knowledge_docs — silently, which is the worst way to lose a
 # document (design.md, "Global documents are recognised by path").
 jig_knowledge_is_global() {
-  local rel
-  rel=$(jig_relpath "$1" "$JIG_PROJECT")
+  # jig_relpath without its `$(...)`: asked for every document of a walk.
+  local rel="${1#"${JIG_PROJECT%/}/"}"
   case "$rel" in
     "$JIG_AI_DIR/knowledge/GLOSSARY.md" | \
       "$JIG_AI_DIR/knowledge/ARCHITECTURE.md" | \
@@ -2341,12 +2758,42 @@ jig_knowledge_read_path() {
 # matcher context.sh and knowledge.sh both call.
 jig_glob_pattern() {
   local pattern
-  pattern=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/?/\\?/g; s/\[/\\[/g; s/\]/\\]/g')
-  pattern=$(printf '%s' "$pattern" | sed 's#[*][*]/#*#g; s#[*][*]#*#g')
-  case "$pattern" in
-    */) printf '%s*' "$pattern" ;;
-    *) printf '%s' "$pattern" ;;
+  jig_glob_pattern_v pattern "$1"
+  printf '%s' "$pattern"
+}
+
+# jig_glob_pattern_v <var> <glob> — jig_glob_pattern into <var>, without a
+# process: `jig context` asks it for every glob of every document. Literal
+# replacements through _jig_replace_all_v, not `${var//a/b}`: what a replacement
+# means there differs between bash 3.2 and the bash 5.2 of Linux and Git Bash.
+jig_glob_pattern_v() {
+  local __jgp_out="$2"
+  _jig_replace_all_v __jgp_out "$__jgp_out" "\\" "\\\\"
+  _jig_replace_all_v __jgp_out "$__jgp_out" '?' '\?'
+  _jig_replace_all_v __jgp_out "$__jgp_out" '[' '\['
+  _jig_replace_all_v __jgp_out "$__jgp_out" ']' '\]'
+  _jig_replace_all_v __jgp_out "$__jgp_out" '**/' '*'
+  _jig_replace_all_v __jgp_out "$__jgp_out" '**' '*'
+  case "$__jgp_out" in
+    */) __jgp_out="$__jgp_out*" ;;
   esac
+  printf -v "$1" '%s' "$__jgp_out"
+}
+
+# _jig_replace_all_v <var> <text> <find> <with> — every <find> in <text>, left
+# to right and never overlapping, replaced by <with>; all three literal.
+_jig_replace_all_v() {
+  local __jra_rest="$2" __jra_out=""
+  while :; do
+    case "$__jra_rest" in
+      *"$3"*)
+        __jra_out="$__jra_out${__jra_rest%%"$3"*}$4"
+        __jra_rest="${__jra_rest#*"$3"}"
+        ;;
+      *) break ;;
+    esac
+  done
+  printf -v "$1" '%s' "$__jra_out$__jra_rest"
 }
 
 # --- glob matching (one matcher, shared by context.sh and knowledge.sh) -------
@@ -2370,7 +2817,7 @@ jig_glob_pattern() {
 # every glob of every document).
 jig_path_matches_any() {
   local glob="$1" files="$2" pattern file
-  pattern=$(jig_glob_pattern "$glob")
+  jig_glob_pattern_v pattern "$glob"
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     # shellcheck disable=SC2254

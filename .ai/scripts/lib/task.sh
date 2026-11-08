@@ -103,6 +103,7 @@ _task_usage() {
       printf '       jig task autopilot <id> approve --reason <text>\n'
       printf '       jig task autopilot <id> decide --reason <text>\n'
       printf '       jig task autopilot <id> resume --answer <the human'"'"'s answer>\n'
+      printf '       jig task autopilot <id> handover --by human --answer <the person'"'"'s words>\n'
       printf '       jig task autopilot <id> end [--reason <how it ended>]\n'
       printf '       jig task autopilot <id> report\n'
       ;;
@@ -1038,23 +1039,11 @@ _task_new_body() {
   [ -z "$class" ] || _task_valid_class "$class" || jig_fail usage "task new: invalid class: $class"
   [ -z "$domains" ] || _task_valid_domains "$domains" || jig_fail usage "task new: invalid domains: $domains"
   # The goal is the paragraph under `## Goal` that `task list --goals` and
-  # `task list --json` read back (_task_goal): one line, so that it stays one
-  # paragraph, and not a heading, so that it stays under `## Goal`.
+  # `task list --json` read back (jig_goal_check, which `spec item file --new` shares).
   if [ "$goal_given" -eq 1 ]; then
     [ -z "$from" ] || jig_fail usage "task new: --goal and --from both write task.md; give one of them"
-    case "$goal" in
-      *$'\n'* | *$'\r'*) jig_fail usage "task new: --goal is one line: the goal paragraph of task.md" ;;
-    esac
-    case "$goal" in
-      *[![:space:]]*) ;;
-      *) jig_fail usage "task new: --goal is empty" ;;
-    esac
-    # Trimmed: leading blanks would make the paragraph a code block.
-    goal=${goal#"${goal%%[![:space:]]*}"}
-    goal=${goal%"${goal##*[![:space:]]}"}
-    case "$goal" in
-      '#'*) jig_fail usage "task new: --goal cannot start with #: it would read as a heading" ;;
-    esac
+    jig_goal_check "task new" "$goal"
+    goal=$JIG_GOAL
   fi
 
   # A task filed in a worktree that keeps a task directory of its own dies with
@@ -1164,7 +1153,7 @@ _task_new_body() {
     return 0
   fi
   jig_relpath "$dir" "$JIG_PROJECT"
-  jig_info "not queued: $id — jig queue set $id --priority <0-5>; the scale is in the jig-task skill"
+  _task_not_queued_hint "$id"
 }
 
 # task_start <id> — begin work on a filed task: cut its branch, check it out
@@ -1785,7 +1774,7 @@ _task_set_body() {
       fi
       ;;
     task_id | issue | branch | base_commit | base_branch | created_at | updated_at | paused | paused_at | paused_reason | paused_stash | paused_stash_applied \
-      | autopilot | autopilot_repairs | autopilot_mode | autopilot_phase | gate | gate_design | gate_by | pr_url \
+      | autopilot | autopilot_repairs | autopilot_mode | autopilot_phase | autopilot_handover | gate | gate_design | gate_by | pr_url \
       | archived_at | archived_reason | archived_from \
       | abandoned_at | abandoned_reason | moved_to | triage_task | triage_of \
       | absorbed_into | absorbs | partly_in | absorbs_partly \
@@ -1857,6 +1846,7 @@ _task_set_body() {
 
   if [ "$claim" -eq 1 ]; then
     _task_close_write "$id" "$dir" "$expected"
+    _task_queue_prune "$id" "task set"
     if [ "$as_json" -eq 1 ]; then
       printf '{"task":%s}\n' "$(_task_json_one "$id")"
     fi
@@ -1881,6 +1871,20 @@ _task_set_body() {
   if [ "$was" = abandoned ] && [ "$value" != abandoned ]; then
     _task_abandon_keys_clear "$id" "$dir"
   fi
+  if [ "$key" = status ]; then
+    case "$value" in
+      consolidated | abandoned) _task_queue_prune "$id" "task set" ;;
+      *) [ "$was" != abandoned ] || _task_not_queued_hint "$id" ;;
+    esac
+  fi
+}
+
+# _task_not_queued_hint <id> — the reminder `task new` gives, for a task that
+# is live and not in the queue: a task taken back from abandoned or archived
+# left its place when it finished (adr-20261107-a-finished-task-leaves-the-queue).
+_task_not_queued_hint() {
+  jig_queue_place "$1" && return 0
+  jig_info "not queued: $1 — jig queue set $1 --priority <0-5>; the scale is in the jig-task skill"
 }
 
 # _task_close_write <id> <dir> <expected> — the close of a write checked
@@ -2146,7 +2150,8 @@ _task_abandon_keys_clear() {
 # task_archive <id> — a person's archive of a task nobody will finish now
 # (adr-20261027-a-task-nobody-finished-is-archived-not-purged). The workspace
 # stays where it is, kept without a limit; only the status changes, and the
-# branch, worktree, pull request and queue place are left alone.
+# branch, worktree and pull request are left alone. Its queue entry goes
+# (adr-20261107-a-finished-task-leaves-the-queue).
 task_archive() {
   [ $# -eq 1 ] || jig_die "$(_task_usage archive)"
   jig_require_init
@@ -2172,6 +2177,7 @@ _task_archive() {
   _task_rewrite_state "$dir" archived_reason "$reason"
   _task_rewrite_state "$dir" archived_at "$(jig_today)"
   _task_rewrite_state "$dir" status archived
+  _task_queue_prune "$id" "task archive"
 }
 
 # task_unarchive <id> — return an archived task to the status it had. The
@@ -2196,6 +2202,10 @@ task_unarchive() {
   # An absorbed task that comes back is its own task again; the receiver
   # keeps `absorbs` as the record of the documents it took.
   _task_rewrite_state_remove "$dir" absorbed_into
+  # Back to live work, it is not queued any more: its entry went when it was
+  # archived. Back to abandoned, it is still finished, and a reminder to queue
+  # it would be undone by the next prune.
+  [ "$from" = abandoned ] || _task_not_queued_hint "$id"
 }
 
 # _task_list_add <list> <id> — <list>, comma-separated, with <id> added once.
@@ -2329,7 +2339,7 @@ task_merge() {
 #
 # `.ai/workspace/tasks/<id>/autopilot` — gitignored workspace file, TSV, one
 # line per event: `<UTC ISO time>\t<event>\t<text>` where event is one of
-# start, stage, repair, stop, resume, approve, decide, end and text is a
+# start, stage, repair, stop, resume, approve, decide, handover, end and text is a
 # single line with no tab (validated the same way as a findings-ledger field,
 # _task_finding_valid_field).
 #
@@ -2337,7 +2347,9 @@ task_merge() {
 # `autopilot_repairs: <n>` (the repair count for the current run, reset to 0
 # by `start` and by `resume`), `autopilot_mode: attended|unattended` (read
 # from `autopilot.unattended` once, by `start`, so changing the key halfway
-# changes nothing about a run). All three are script-owned, alongside `paused`
+# changes nothing about a run), `autopilot_handover: <UTC ISO time>` (a person
+# took a stopped run over: `handover`, never cleared, and no `start` after
+# it — adr-20261108-a-person-takes-over-a-stopped-run). All are script-owned, alongside `paused`
 # and the other keys `task set` refuses to write by hand (schemas/state.md).
 #
 # An unattended run asks nothing
@@ -2411,25 +2423,29 @@ _task_autopilot_log() {
 }
 
 # _task_autopilot_note <id> — "autopilot=on" or "autopilot=stopped" for
-# `jig status`'s task line; empty for `done` or no run at all (same shape as
+# `jig status`'s task line, "autopilot=handed-over" for a run a person took
+# over (a fact, not a wait: nothing in `jig status` reads it as attention);
+# empty for any other `done` or no run at all (same shape as
 # _task_worktree_note — the caller prepends its own separating space).
 _task_autopilot_note() {
   case "$(task_state_get "$1" autopilot)" in
     on) printf 'autopilot=on\n' ;;
     stopped) printf 'autopilot=stopped\n' ;;
+    done) [ -z "$(task_state_get "$1" autopilot_handover)" ] || printf 'autopilot=handed-over\n' ;;
   esac
 }
 
 # _task_autopilot_facts <id> — the run as data, for `report` and the status
 # page (ARCHITECTURE.md, Scripts layout: a report consumes an unformatted
 # producer rather than parsing a formatted one). One line,
-# `<state>\t<repairs>\t<stage>\t<stage-at>\t<stop-reason>\t<stop-at>\t<phase>`,
+# `<state>\t<repairs>\t<stage>\t<stage-at>\t<stop-reason>\t<stop-at>\t<phase>\t<handover-at>`,
 # every empty field written `-` so a tab-split read cannot collapse it;
 # nothing at all for a task that never started a run. The stage is the last
 # one the current run reached — since its last `start` or `resume` — and the
 # stop is the journal's last, which is the one a `stopped` run is waiting on.
 # <phase> is `autopilot_phase` when a coordinator started this run as one task
-# of a roadmap phase (adr-20260922-a-phase-run-is-coordinated).
+# of a roadmap phase (adr-20260922-a-phase-run-is-coordinated). <handover-at>
+# is `autopilot_handover`: when a person took the stopped run over.
 _task_autopilot_facts() {
   local facts
   _task_autopilot_facts_v facts "$1"
@@ -2442,7 +2458,7 @@ _task_autopilot_facts() {
 # event, and the text up to the next tab.
 _task_autopilot_facts_v() {
   local __taf_state __taf_file __taf_line __taf_at __taf_event __taf_text __taf_t=$'\t'
-  local __taf_stage="" __taf_stage_at="" __taf_stop="" __taf_stop_at="" __taf_repairs __taf_phase
+  local __taf_stage="" __taf_stage_at="" __taf_stop="" __taf_stop_at="" __taf_repairs __taf_phase __taf_handover
   printf -v "$1" '%s' ""
   task_state_var __taf_state "$2" autopilot
   [ -n "$__taf_state" ] || return 0
@@ -2471,11 +2487,13 @@ _task_autopilot_facts_v() {
   fi
   _task_autopilot_repairs_v __taf_repairs "$2"
   task_state_var __taf_phase "$2" autopilot_phase
-  printf -v "$1" '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$__taf_state" "$__taf_repairs" \
-    "${__taf_stage:--}" "${__taf_stage_at:--}" "${__taf_stop:--}" "${__taf_stop_at:--}" "${__taf_phase:--}"
+  task_state_var __taf_handover "$2" autopilot_handover
+  printf -v "$1" '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$__taf_state" "$__taf_repairs" \
+    "${__taf_stage:--}" "${__taf_stage_at:--}" "${__taf_stop:--}" "${__taf_stop_at:--}" "${__taf_phase:--}" \
+    "${__taf_handover:--}"
 }
 
-# jig task autopilot <id> start|stage|repair|stop|resume|end|report —
+# jig task autopilot <id> start|stage|repair|stop|resume|handover|end|report —
 # dispatches to the functions below. The task id comes before the action
 # (same order as `task set <id> <key> <value>`), so every action function
 # below takes <id> as its first argument.
@@ -2494,6 +2512,7 @@ task_autopilot() {
     approve) _task_autopilot_unattended_event "$id" approve "$@" ;;
     decide) _task_autopilot_unattended_event "$id" decide "$@" ;;
     resume) _task_autopilot_resume "$id" "$@" ;;
+    handover) _task_autopilot_handover "$id" "$@" ;;
     end) _task_autopilot_end "$id" "$@" ;;
     report) _task_autopilot_report "$id" "$@" ;;
     *) jig_die "$(_task_usage autopilot)" ;;
@@ -2555,12 +2574,17 @@ _task_autopilot_start() {
   local dir
   dir=$(task_dir "$id")
   _task_guard_write "$id" "task autopilot start"
+  # A person took this task's run over: a fresh run would give an unattended
+  # clone two repairs nobody granted
+  # (adr-20261108-a-person-takes-over-a-stopped-run).
+  [ -z "$(task_state_get "$id" autopilot_handover)" ] \
+    || jig_die "task autopilot start: $id was handed over to a person; it finishes without autopilot"
   case "$(task_state_get "$id" autopilot)" in
     on) jig_die "task autopilot start: already running: $id" ;;
     stopped)
       if [ "$(_task_autopilot_mode "$id")" = unattended ]; then
-        if [ "$(_task_autopilot_repairs "$id")" -ge 2 ]; then
-          jig_die "task autopilot start: $id exhausted its unattended repair limit; ship a draft"
+        if _task_autopilot_at_limit "$id"; then
+          jig_die "task autopilot start: $id exhausted its unattended repair limit; $(_task_autopilot_limit_roads "$id")"
         fi
         jig_die "task autopilot start: $id is stopped; if a human answered, run: jig task autopilot $id resume --answer <text> --by human"
       fi
@@ -2668,6 +2692,37 @@ _task_honour_pause_request() {
     _task_autopilot_log "$id" pause "$name not entered: $why"
   fi
   printf 'paused: %s (%s); stage %s not entered\n' "$id" "$why" "$name"
+}
+
+# _task_queue_prune <id> <verb> — once a status that finishes a task is
+# written (consolidated, abandoned, archived), take the finished tasks out of
+# the queue through `jig queue prune`, the queue's one writer
+# (adr-20261107-a-finished-task-leaves-the-queue). Best effort: the status
+# stands whatever the queue says. A stale revision is another write landing in
+# between: read again, up to three times; a queue that kept changing or
+# refused is warned about with the command that finishes the job. Nothing is
+# asked of a clone with no queue.
+_task_queue_prune() {
+  local id="$1" verb="$2" tries=0 out
+  [ -f "$(jig_queue_file)" ] || return 0
+  while :; do
+    if out=$(JIG_INTERNAL_REDRAW=1 "$JIG_SELF" queue prune --json 2>/dev/null); then
+      case "$out" in
+        *"\"ref\":\"task:$id\",\"status\""*) jig_info "$verb: task:$id left the queue" ;;
+      esac
+      return 0
+    fi
+    # The code as json.sh's envelope prints it (_task_pause_take_request).
+    case "$out" in
+      *'"code":"stale-revision"'*) ;;
+      *) jig_warn "$verb: $id stays in the queue; take it out with jig queue prune"; return 0 ;;
+    esac
+    tries=$((tries + 1))
+    if [ "$tries" -ge 3 ]; then
+      jig_warn "$verb: the queue kept changing; $id stays in it — jig queue prune"
+      return 0
+    fi
+  done
 }
 
 # _task_pause_take_request <id> <verb> — when the queue holds a pause request
@@ -2872,23 +2927,101 @@ _task_autopilot_resume() {
 # it after checking the answer itself; the actions table (_task_actions) asks
 # it with the `--by` the run's mode needs.
 _task_autopilot_resume_refusal() {
-  local id="$1" by="$2" run mode repairs
+  local id="$1" by="$2" run mode
   task_state_var run "$id" autopilot
   if [ "$run" != "stopped" ]; then
     printf 'task autopilot resume: not stopped: %s\n' "$id"
     return 0
   fi
   _task_autopilot_mode_v mode "$id"
-  _task_autopilot_repairs_v repairs "$id"
   if [ "$mode" = unattended ]; then
     if [ "$by" != human ]; then
       printf 'task autopilot resume: an unattended run needs an actual human answer and --by human; otherwise ship a draft\n'
-    elif [ "$repairs" -ge 2 ]; then
-      printf 'task autopilot resume: %s exhausted its unattended repair limit; ship a draft\n' "$id"
+    elif _task_autopilot_at_limit "$id"; then
+      printf 'task autopilot resume: %s exhausted its unattended repair limit; %s\n' "$id" "$(_task_autopilot_limit_roads "$id")"
     fi
   elif [ -n "$by" ]; then
     printf 'task autopilot resume: --by human is only for an unattended run\n'
   fi
+  return 0
+}
+
+# _task_autopilot_at_limit <id> — exit 0 when <id>'s run was started
+# unattended and has spent both repairs: what nothing resumes, and what ends in
+# its draft or a handover. The one predicate start, resume, the gate and the
+# status page's stop card ask (ARCHITECTURE.md: a report consumes it).
+_task_autopilot_at_limit() {
+  local mode repairs
+  _task_autopilot_mode_v mode "$1"
+  [ "$mode" = unattended ] || return 1
+  _task_autopilot_repairs_v repairs "$1"
+  [ "$repairs" -ge 2 ]
+}
+
+# _task_autopilot_limit_roads <id> — what is left for a stopped unattended run
+# at its repair limit, as the refusals that meet it name it: the draft, or a
+# person taking the task over (adr-20261108-a-person-takes-over-a-stopped-run).
+_task_autopilot_limit_roads() {
+  printf 'ship a draft, or, if a person takes the task on: jig task autopilot %s handover --by human --answer <text>\n' "$1"
+}
+
+# handover --by human --answer <text>: a person takes a stopped run over and
+# finishes the task without autopilot (adr-20261108-a-person-takes-over-a-stopped-run).
+# Either mode, at the repair limit or before it. The run ends (`done`), and
+# `autopilot_handover` records when, so `start` never begins a fresh run with
+# fresh repairs. Mode and repair count stay as the record of what the run was.
+# The script cannot tell a person from an agent: `--by human` is the claim and
+# the answer is quoted where the person reads it — the journal, the report in
+# the pull request, Telegram.
+_task_autopilot_handover() {
+  local id="$1"
+  shift
+  local answer="" has_answer=0 by="" refusal now
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --answer)
+        [ $# -ge 2 ] || jig_die "task autopilot handover: --answer requires a value"
+        answer="$2"; has_answer=1; shift 2 ;;
+      --by)
+        [ $# -ge 2 ] || jig_die "task autopilot handover: --by requires human"
+        [ "$2" = human ] || jig_die "task autopilot handover: --by accepts human only"
+        by=human; shift 2 ;;
+      *) jig_die "task autopilot handover: unknown argument: $1" ;;
+    esac
+  done
+  local dir
+  dir=$(task_dir "$id")
+  _task_guard_write "$id" "task autopilot handover"
+  refusal=$(_task_autopilot_handover_refusal "$id") || exit 1
+  [ -z "$refusal" ] || jig_die "$refusal"
+  [ "$by" = human ] \
+    || jig_die "task autopilot handover: --by human is required: only a person takes a run over, never the agent that ran it"
+  [ "$has_answer" -eq 1 ] \
+    || jig_die "task autopilot handover: --answer is required: the person's words, what they take on and why: jig task autopilot $id handover --by human --answer <text>"
+  [ -n "$answer" ] || jig_die "task autopilot handover: --answer must not be empty"
+  _task_finding_valid_field "$answer" \
+    || jig_die "task autopilot handover: --answer must be a single line with no tab"
+
+  now=$(_task_autopilot_now)
+  _task_rewrite_state "$dir" autopilot "done"
+  _task_rewrite_state "$dir" autopilot_handover "$now"
+  _task_autopilot_log "$id" handover "human: $answer"
+  _task_autopilot_notify "$id" handover "taken over by a person: $answer"
+  printf 'autopilot: handed over; the task goes on without autopilot\n'
+}
+
+# _task_autopilot_handover_refusal <id> — why `jig task autopilot <id>
+# handover --by human --answer <text>` refuses this task by its state, or
+# nothing when it would hand the run over. Shared with the actions table
+# (_task_actions).
+_task_autopilot_handover_refusal() {
+  local id="$1" run
+  task_state_var run "$id" autopilot
+  case "$run" in
+    stopped) ;;
+    on) printf 'task autopilot handover: %s is running; ask the agent to stop it first: jig task autopilot %s stop --reason <text>\n' "$id" "$id" ;;
+    *) printf 'task autopilot handover: %s has no stopped autopilot run\n' "$id" ;;
+  esac
   return 0
 }
 
@@ -2920,7 +3053,17 @@ _task_autopilot_end() {
   local dir
   dir=$(task_dir "$id")
   _task_guard_write "$id" "task autopilot end"
-  [ "$(task_state_get "$id" autopilot)" = "on" ] \
+  local run
+  run=$(task_state_get "$id" autopilot)
+  # A stopped run waits for its person; ending it here would say nothing about
+  # who goes on with the work.
+  [ "$run" != stopped ] \
+    || jig_die "task autopilot end: $id is stopped; if a person takes the task on: jig task autopilot $id handover --by human --answer <text>"
+  # A handover already ended the run, and `start` is refused after one: the
+  # usual "run: start" hint would point at a dead end.
+  [ -z "$(task_state_get "$id" autopilot_handover)" ] \
+    || jig_die "task autopilot end: $id's run already ended when a person took it over; there is nothing to end"
+  [ "$run" = "on" ] \
     || jig_die "task autopilot end: no active autopilot run: $id; run: jig task autopilot $id start"
   if [ "$(_task_autopilot_mode "$id")" = unattended ] && [ "$(task_state_get "$id" knowledge_consolidated)" != true ]; then
     jig_die "task autopilot end: $id's unattended run ends after consolidation (knowledge_consolidated true); a run whose repairs ran out stays stopped and ships a draft"
@@ -2979,6 +3122,8 @@ _task_autopilot_report() {
   # person checks both where they read the run: in the pull request.
   block=$(awk -F '\t' '$2 == "resume" && $3 != "" { print "- " $3 }' "$file")
   [ -z "$block" ] || printf '\nResumed on an answer (check it was yours):\n%s\n' "$block"
+  block=$(awk -F '\t' '$2 == "handover" { print "- " $3 }' "$file")
+  [ -z "$block" ] || printf '\nTaken over by a person (check it was yours):\n%s\n' "$block"
   local from
   from=$(task_state_get "$id" class_lowered_from)
   if [ -n "$from" ]; then
@@ -3010,6 +3155,7 @@ _task_autopilot_report() {
   repairs=$(printf '%s\n' "$facts" | cut -f 2)
   [ -n "$repairs" ] || repairs=0
   [ "$(_task_autopilot_mode "$id")" != unattended ] || mode=", unattended"
+  [ "$(printf '%s\n' "$facts" | cut -f 8)" = "-" ] || state="$state (handed over)"
   _task_autopilot_depth_line "$id"
   printf 'autopilot: %s, repairs: %s/2%s\n' "$state" "$repairs" "$mode"
 }
@@ -4327,7 +4473,7 @@ task_gate() {
 # approval. Shared with the actions table (_task_actions), which asks it for
 # `--by human`: the approval a person gives.
 _task_gate_refusal() {
-  local id="$1" by="$2" class run mode repairs design
+  local id="$1" by="$2" class run mode design
   task_state_var run "$id" autopilot
   if [ "$by" = agent ]; then
     _task_autopilot_mode_v mode "$id"
@@ -4346,12 +4492,11 @@ _task_gate_refusal() {
       return 0
     fi
     # Not on, so stopped.
-    _task_autopilot_repairs_v repairs "$id"
-    if [ "$repairs" -ge 2 ]; then
-      printf 'task gate: %s exhausted its unattended repair limit; ship a draft\n' "$id"
+    if _task_autopilot_at_limit "$id"; then
+      printf 'task gate: %s exhausted its unattended repair limit; %s\n' "$id" "$(_task_autopilot_limit_roads "$id")"
       return 0
     fi
-    printf 'task gate: %s is stopped; if a human answered, run: jig task autopilot %s resume --answer <text> --by human; then approve with --by agent\n' "$id" "$id"
+    printf 'task gate: %s is stopped; if a human answered, run: jig task autopilot %s resume --answer <text> --by human; then approve with --by agent; or, if a person takes the task on: jig task autopilot %s handover --by human --answer <text>\n' "$id" "$id" "$id"
     return 0
   fi
   task_state_var class "$id" class
@@ -5026,7 +5171,7 @@ _task_list_json_task() {
 _task_list_json_task_v() {
   local __tlj_var="$1" id="$2" worktrees="$3" flagged="$4" line o t=$'\t' v
   local class status issue consolidated paused created updated branch base pr_url gate_by
-  local wt n gate facts state repairs stage stage_at stop stop_at phase goal flag flags="" mode atext
+  local wt n gate facts state repairs stage stage_at stop stop_at phase handover_at goal flag flags="" mode atext
   task_state_var class "$id" class
   task_state_var status "$id" status
   task_state_var issue "$id" issue
@@ -5096,7 +5241,7 @@ _task_list_json_task_v() {
 
   _task_autopilot_facts_v facts "$id"
   if [ -n "$facts" ]; then
-    IFS="$t" read -r state repairs stage stage_at stop stop_at phase <<EOF
+    IFS="$t" read -r state repairs stage stage_at stop stop_at phase handover_at <<EOF
 $facts
 EOF
     [ "$stage" != "-" ] || stage=""
@@ -5104,6 +5249,7 @@ EOF
     [ "$stop" != "-" ] || stop=""
     [ "$stop_at" != "-" ] || stop_at=""
     [ "$phase" != "-" ] || phase=""
+    [ "$handover_at" != "-" ] || handover_at=""
     json_quote "$state"; o="$o,\"autopilot\":{\"state\":$_JSON"
     # The mode the gates read: anything but `unattended` is attended.
     _task_autopilot_mode_v mode "$id"
@@ -5113,7 +5259,8 @@ EOF
     json_str_or_null "$stage_at"; o="$o,\"stage_at\":$_JSON"
     json_str_or_null "$stop"; o="$o,\"stop_reason\":$_JSON"
     json_str_or_null "$stop_at"; o="$o,\"stop_at\":$_JSON"
-    json_str_or_null "$phase"; o="$o,\"phase\":$_JSON}"
+    json_str_or_null "$phase"; o="$o,\"phase\":$_JSON"
+    json_str_or_null "$handover_at"; o="$o,\"handover_at\":$_JSON}"
   else
     o="$o,\"autopilot\":null"
   fi
@@ -5173,7 +5320,7 @@ EOF
 #
 # The rows, in their order; the ids are a contract. The pause request rows ask
 # the guards `jig queue request|cancel` asks (common.sh), which read the queue.
-_TASK_ACTIONS="start pause resume request-pause cancel-pause-request approve-gate answer-stop set-class ship close abandon archive unarchive reopen"
+_TASK_ACTIONS="start pause resume request-pause cancel-pause-request approve-gate answer-stop handover set-class ship close abandon archive unarchive reopen"
 
 # _task_actions <id> <pr-state> — one line per row of the table:
 # `<action><TAB><true|false><TAB><command><TAB><reason>`, the reason empty
@@ -5211,6 +5358,7 @@ _task_actions_v() {
           by=human
           command="$command --by human"
         fi ;;
+      handover) command="jig task autopilot $id handover --by human --answer <text>" ;;
       set-class) command="jig task set $id class <Tn>" ;;
       ship) command="jig task ship $id --message-file <file>" ;;
       close) command="jig task set $id status consolidated" ;;
@@ -5255,6 +5403,7 @@ _task_actions_v() {
           [ "$gate" != approved ] || reason="task gate: $id's design is approved; nothing waits at its gate"
         fi ;;
       *:answer-stop) _task_actions_ask_v reason "$id" "$action" _task_autopilot_resume_refusal "$id" "$by" ;;
+      *:handover) _task_actions_ask_v reason "$id" "$action" _task_autopilot_handover_refusal "$id" ;;
       *:ship)
         if [ "$pr_state" = merged ]; then
           reason="task ship: $id's pull request is merged"
@@ -5995,7 +6144,7 @@ _task_ship_unverified_notice() {
 # for <id>, and the key it came from. A task whose autopilot run is `on`, or
 # `stopped` in an unattended run (whose repairs ran out: it ships its draft
 # from there), ships at the run's level, jig_autopilot_git; every other ship
-# at `agent.git`. An attended run that stopped is waiting for its person, who
+# at `agent.git` — a run a person took over (`handover`, which ends it) too. An attended run that stopped is waiting for its person, who
 # may well finish the task by hand: that ship is theirs, at their level. Read when it ships, not recorded at `start`: a person
 # who lowers either key halfway through a run is obeyed at once. Exit 1 when
 # the level is invalid, like jig_agent_git.

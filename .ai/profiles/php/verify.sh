@@ -19,6 +19,11 @@
 # composer.json or composer.lock changed, and skips with a reason otherwise;
 # in a full run it always runs.
 #
+# phpunit/pest answer to the check name `tests` (`checks: [tests]`): when a
+# profile in the same run declares `covers: [php:tests]` and runs that suite
+# itself, jig verify hands the check over and jp_covered prints the skip. This
+# profile names its check and nothing about who covers it.
+#
 # The test rule is not "anything that is not .php needs no test". What decides
 # is whether a path can change the result of the test run, which runs PHP: a
 # front-end source is neither bundled nor served by it, while the build that
@@ -167,7 +172,11 @@ if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
     test_bin=$(_php_tool pest)
     test_check=pest
   fi
-  if [ -z "$test_bin" ]; then
+  # With neither runner, the check's lines name it phpunit.
+  [ -n "$test_bin" ] || test_check=phpunit
+  if jp_covered tests "$test_check"; then
+    :
+  elif [ -z "$test_bin" ]; then
     jp_plan phpunit skip "$PHP_WHERE"
   else
     jp_select _php_builtin
@@ -222,8 +231,11 @@ if [ -z "$test_bin" ]; then
   test_bin=$(_php_tool pest)
   test_check=pest
 fi
+[ -n "$test_bin" ] || test_check=phpunit
 
-if [ -z "$test_bin" ]; then
+if jp_covered tests "$test_check"; then
+  :
+elif [ -z "$test_bin" ]; then
   jp_skip "phpunit" "$PHP_WHERE"
 else
   v=$(jp_version "$test_bin" --version)

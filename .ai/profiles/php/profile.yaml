@@ -3,6 +3,8 @@ name: php
 description: PHP projects using Composer.
 detect: [composer.json]
 scope: [changed, map, explain, environment]
+# Checks another profile can take over by name (`covers: [php:tests]`).
+checks: [tests]
 carry: [vendor]
 lock: [composer.lock]
 install: composer install

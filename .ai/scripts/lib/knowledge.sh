@@ -19,6 +19,7 @@ KM_USAGE="usage: jig knowledge check [--quiet]
        jig knowledge stale [--strict]
        jig knowledge reviewed <id>... [--date YYYY-MM-DD] [--revision <n>] [--json]
        jig knowledge sources [--diff <id>] [--json]
+       jig knowledge read <id> --json
        jig knowledge adr-convention
        jig knowledge changed --base <ref> | --task <id> [--to-review]"
 
@@ -30,7 +31,7 @@ cmd_knowledge() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
   case "$sub" in
-    check | new | paths | stale | reviewed | accept | reject | proposed | inventory | summary | stages | changed | sources | adr-convention) ;;
+    check | new | paths | stale | reviewed | accept | reject | proposed | inventory | summary | stages | changed | sources | read | adr-convention) ;;
     *) jig_die "$KM_USAGE" ;;
   esac
 
@@ -39,7 +40,7 @@ cmd_knowledge() {
   # an envelope too. Looked for before anything else runs, `jig_require_init`
   # included: not being initialised is a refusal with a code.
   case "$sub" in
-    proposed | sources)
+    proposed | sources | read)
       local arg
       for arg in "$@"; do
         if [ "$arg" = --json ]; then
@@ -51,6 +52,9 @@ cmd_knowledge() {
       done
       ;;
   esac
+
+  # The text form of a read is not offered: the document is a file a person opens.
+  [ "$sub" != read ] || jig_die "usage: jig knowledge read <id> --json"
 
   # A decision a program sends, or a person checked against a revision, is committed
   # on a branch of its own in Jig's own tree; the plain text form writes the working
@@ -159,10 +163,11 @@ km_warn() {
 
 # --- link checking -------------------------------------------------------------
 
-# km_check_links <file> <relpath> — scan the body (after frontmatter) for
-# `](relative/path)` targets and fail on any that resolve to a missing path.
+# km_check_links <file> <relpath> [<skip>] — scan the body (after frontmatter) for
+# `](relative/path)` targets and fail on any that resolve to a missing path. <skip> is
+# one target not to follow: the link to a source a retired stub no longer hands anyone.
 km_check_links() {
-  local file="$1" relpath="$2" start doc_dir target dir base resolved_dir
+  local file="$1" relpath="$2" skip="${3:-}" start doc_dir target dir base resolved_dir
   start=$(fm_body_start "$file")
   doc_dir=$(dirname "$file")
 
@@ -171,6 +176,7 @@ km_check_links() {
   # subshell and any km_fail counter increments would be lost on exit.
   while IFS= read -r target; do
     [ -n "$target" ] || continue
+    [ "$target" != "$skip" ] || continue
     case "$target" in
       http://* | https://* | mailto:* | '#'* | /*) continue ;;
     esac
@@ -227,12 +233,22 @@ km_check_scalar_yaml() {
 # km_check_doc <file> <relpath> <require_fm> <ids_file> <ids_all_file> <adr_nums_file>
 km_check_doc() {
   local file="$1" relpath="$2" require_fm="$3" ids_file="$4" ids_all_file="$5" adr_nums_file="$6"
-  local is_global has_fm
+  local is_global has_fm skip="" status src
   is_global=0
   jig_knowledge_is_global "$file" && is_global=1
 
   has_fm=1
   fm_has "$file" || has_fm=0
+
+  # A retired stub — neither proposed nor resolvable — hands nobody its source, and the
+  # source may have gone since: its link is not followed (km_check_source).
+  if [ "$has_fm" -eq 1 ]; then
+    src=$(jig_knowledge_source "$file")
+    status=$(fm_get "$file" status)
+    if [ -n "$src" ] && [ "$status" != proposed ] && ! jig_knowledge_status_resolvable "$status"; then
+      skip=$(km_source_link_target "$src")
+    fi
+  fi
 
   if [ "$is_global" -eq 0 ]; then
     if [ "$has_fm" -eq 0 ]; then
@@ -247,7 +263,7 @@ km_check_doc() {
     fi
   fi
 
-  km_check_links "$file" "$relpath"
+  km_check_links "$file" "$relpath" "$skip"
 }
 
 # km_check_doc_frontmatter — id/type/status/adr/supersedes/domains/paths checks.
@@ -418,8 +434,13 @@ km_check_source() {
     *) km_fail "$relpath" "source: links adr, convention or feature documents, not: ${type:-none}" ;;
   esac
   problem=$(km_source_problem "$src")
+  # A stub that is neither proposed nor resolvable — a rejected proposal, a dropped
+  # link — hands nobody its source, which may have gone since: only the shape of the
+  # path is checked (adr-20261106-a-changed-link-is-dropped-by-reject).
   if [ -n "$problem" ]; then
     km_fail "$relpath" "invalid source '$src': $problem"
+  elif [ "$status" != proposed ] && ! jig_knowledge_status_resolvable "$status"; then
+    :
   elif [ -n "${KM_TRACKED_FILE:-}" ] && ! km_source_tracked "$src" "$KM_TRACKED_FILE"; then
     km_fail "$relpath" "source is missing, a symlink, or not tracked by git with this exact case: $src"
   fi
@@ -521,6 +542,27 @@ km_require_proposed() {
   printf '%s\n' "$doc"
 }
 
+# km_require_rejectable <id> — die unless `reject` takes <id>: a proposal, or an
+# accepted stub whose source needs a decision — `changed`, `unrecorded` or `missing`
+# (km_source_state). Rejecting that stub is dropping its link
+# (adr-20261106-a-changed-link-is-dropped-by-reject). Anything else stays refused, so
+# reject cannot retire knowledge that nobody is being asked about.
+km_require_rejectable() {
+  local id="$1" doc status src state
+  doc=$(km_doc_by_id "$id") || exit 1
+  status=$(fm_get "$doc" status)
+  [ "$status" != proposed ] || return 0
+  src=$(jig_knowledge_source "$doc")
+  if [ -n "$src" ] && jig_knowledge_status_resolvable "$status"; then
+    state=$(km_source_state "$doc")
+    case "$state" in
+      changed | unrecorded | missing) return 0 ;;
+    esac
+    jig_fail not-proposed "knowledge: not a proposed document, nor a linked source that needs a decision: $id (status: $status, source: $state)"
+  fi
+  jig_fail not-proposed "knowledge: not a proposed document: $id (status: ${status:-none})"
+}
+
 # km_dedupe_ids <id>... — the given ids with repeats removed, first occurrence
 # order preserved, one per line.
 #
@@ -606,7 +648,8 @@ EOF
   printf 'knowledge accept: %d accepted\n' "$count"
 }
 
-# km_reject <id>... — mark one or more proposed documents `rejected`. Never
+# km_reject <id>... — mark one or more proposed documents `rejected`, or drop the
+# link of an accepted stub whose source changed (km_require_rejectable). Never
 # deletes or moves a file: the user has decided reject means the document
 # stays, on the record, at its real path — only its status changes, and
 # `rejected` is unresolvable like every other historical status.
@@ -617,7 +660,7 @@ km_reject_check() {
 
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    km_require_proposed "$id" >/dev/null
+    km_require_rejectable "$id"
   done <<EOF
 $ids
 EOF
@@ -628,17 +671,22 @@ km_reject() {
   km_reject_check "$@"
   ids=$(km_dedupe_ids "$@")
 
-  local packs=0 type
+  local packs=0 type was
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     doc=$(km_doc_by_id "$id")
     type=$(fm_get "$doc" type)
+    was=$(fm_get "$doc" status)
     case "$type" in
       domain | glossary | rule) packs=$((packs + 1)) ;;
     esac
     fm_set "$doc" status rejected \
       || jig_die "knowledge reject: could not write: $id"
-    printf 'rejected   %s  (status: rejected)\n' "$(km_rel "$doc")"
+    if [ "$was" = proposed ]; then
+      printf 'rejected   %s  (status: rejected)\n' "$(km_rel "$doc")"
+    else
+      printf 'rejected   %s  (status: rejected; link to %s dropped)\n' "$(km_rel "$doc")" "$(jig_knowledge_source "$doc")"
+    fi
     count=$((count + 1))
   done <<EOF
 $ids
@@ -1162,6 +1210,22 @@ km_domain_file() {
   printf '%s/%s\n' "$dir" "$base"
 }
 
+# km_doc_find <id> — path of the document declaring <id>, or non-zero and nothing:
+# for a caller that asks whether a document is here at all, where km_doc_by_id
+# refuses a miss.
+km_doc_find() {
+  local want="$1" doc
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    fm_has "$doc" || continue
+    if [ "$(fm_get "$doc" id)" = "$want" ]; then
+      printf '%s\n' "$doc"
+      return 0
+    fi
+  done < <(km_docs)
+  return 1
+}
+
 # km_doc_by_id <id> — path of the document declaring <id>. Duplicate ids are
 # a `knowledge check` failure, so the first match is the only match.
 #
@@ -1603,20 +1667,26 @@ km_source_linked_by() {
   return 0
 }
 
-# km_source_link_body <file> <path> — replace the template's {{SOURCE_LINK}}
-# with a relative markdown link from .ai/knowledge/sources/ to <path>, the link
-# `knowledge check` already verifies. The path reaches awk through the
-# environment, never as a substitution: a replacement reads `&` as syntax
-# (convention-shell).
-km_source_link_body() {
-  local file="$1" src="$2" prefix="" seg rest
+# km_source_link_target <path> — the relative link from .ai/knowledge/sources/ to <path>.
+km_source_link_target() {
+  local src="$1" prefix="" seg rest
   rest="$JIG_AI_DIR/knowledge/sources"
   while [ -n "$rest" ]; do
     seg=${rest%%/*}
     [ -z "$seg" ] || prefix="../$prefix"
     case "$rest" in */*) rest=${rest#*/} ;; *) rest="" ;; esac
   done
-  KM_SOURCE_LINK="[$src]($prefix$src)" awk '
+  printf '%s\n' "$prefix$src"
+}
+
+# km_source_link_body <file> <path> — replace the template's {{SOURCE_LINK}}
+# with a relative markdown link from .ai/knowledge/sources/ to <path>, the link
+# `knowledge check` already verifies. The path reaches awk through the
+# environment, never as a substitution: a replacement reads `&` as syntax
+# (convention-shell).
+km_source_link_body() {
+  local file="$1" src="$2"
+  KM_SOURCE_LINK="[$src]($(km_source_link_target "$src"))" awk '
     {
       i = index($0, "{{SOURCE_LINK}}")
       if (i) $0 = substr($0, 1, i - 1) ENVIRON["KM_SOURCE_LINK"] substr($0, i + 15)
@@ -2217,8 +2287,9 @@ _KM_DECIDE_JSON=""
 # _km_decide_main <accept|reject|reviewed> <id>... [--date <d>] [--revision <n>] [--json]
 # — the decision committed on `knowledge/decisions`, in Jig's own tree (lib/owntree.sh).
 # Judged by the documents on that branch and not the ones in any checkout, so one already
-# decided and waiting is `not-proposed`; and `km_accept`, `km_reject` and `km_reviewed`
-# run as they are, with JIG_PROJECT pointed at the tree.
+# decided and waiting is `not-proposed`, and one only in this checkout is `not-on-base` or
+# `not-on-branch` (_km_refuse_what_is_only_here); `km_accept`, `km_reject` and
+# `km_reviewed` run as they are, with JIG_PROJECT pointed at the tree.
 _km_decide_main() {
   local sub="$1" ids=() date="" rev="" rev_given="" arg
   shift
@@ -2246,6 +2317,8 @@ _km_decide_main() {
     esac
   fi
   jig_require_init
+  km_init
+  _km_here_facts "${ids[@]}"
   # shellcheck source=lib/owntree.sh
   . "$JIG_LIB/owntree.sh"
   ot_begin "knowledge $sub" knowledge "$rev"
@@ -2284,6 +2357,7 @@ _km_decide_in_tree() {
   local sub="$1" date="$2" JIG_PROJECT="$OT_TREE" id doc word sep="" rec path
   shift 2
   km_init
+  _km_refuse_what_is_only_here "$sub"
   case "$sub" in
     accept) km_accept_check "$@"; word=accepted ;;
     reject) km_reject_check "$@"; word=rejected ;;
@@ -2307,6 +2381,179 @@ _km_decide_in_tree() {
   esac
 }
 
+# _km_here_facts <id>... — what this checkout shows of each id, before the write judges
+# it in its tree: _KM_HERE_IDS, and for each the document's path (empty when no document
+# here has the id), its source, its recorded source_hash and, for an accepted stub, the
+# state of its source. The write tells "not there yet" from a typo with them.
+_KM_HERE_IDS=()
+_KM_HERE_PATHS=()
+_KM_HERE_SRCS=()
+_KM_HERE_HASHES=()
+_KM_HERE_STATES=()
+_km_here_facts() {
+  local id doc src state
+  _KM_HERE_IDS=()
+  _KM_HERE_PATHS=()
+  _KM_HERE_SRCS=()
+  _KM_HERE_HASHES=()
+  _KM_HERE_STATES=()
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    _KM_HERE_IDS+=("$id")
+    if ! doc=$(km_doc_find "$id"); then
+      _KM_HERE_PATHS+=("")
+      _KM_HERE_SRCS+=("")
+      _KM_HERE_HASHES+=("")
+      _KM_HERE_STATES+=("")
+      continue
+    fi
+    src=$(jig_knowledge_source "$doc")
+    state=""
+    if [ -n "$src" ] && jig_knowledge_status_resolvable "$(fm_get "$doc" status)"; then
+      state=$(km_source_state "$doc")
+    fi
+    _KM_HERE_PATHS+=("$(km_rel "$doc")")
+    _KM_HERE_SRCS+=("$src")
+    _KM_HERE_HASHES+=("$(fm_get "$doc" source_hash)")
+    _KM_HERE_STATES+=("$state")
+  done < <(km_dedupe_ids "$@")
+}
+
+# _km_refuse_what_is_only_here <sub> — refuse, before the claim and with nothing written,
+# a decision on what this checkout shows and the tree does not carry. The question is the
+# read's (_km_decidable_reasons), asked of the same rows with the same _km_ref_holds, at the
+# commit the tree stands on: the document's path, and for a `reject` of a stub whose source
+# changed or went here, that change. `not-on-branch` when the base has it and the tree, on a
+# write branch cut before it got there, does not; `not-on-base` otherwise: only in this
+# checkout, or only in commits origin does not have. What the tree does carry is judged by
+# the checks there: a decision already waiting is `not-proposed`, an id no document has is
+# `not-found`.
+_km_refuse_what_is_only_here() {
+  local sub="$1" i=0 n=0 rows tip id a b t
+  t=$(printf '\t')
+  rows=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-rows.XXXXXX")
+  jig_cleanup_add "$rows"
+  jig_cleanup_add "$rows.ids"
+  jig_cleanup_add "$rows.tree"
+  jig_cleanup_add "$rows.base"
+  : > "$rows"
+  : > "$rows.ids"
+  while [ "$i" -lt "${#_KM_HERE_IDS[@]}" ]; do
+    if [ -n "${_KM_HERE_PATHS[$i]}" ]; then
+      case "$sub:${_KM_HERE_STATES[$i]}" in
+        reject:changed | reject:missing)
+          printf '%s%s%s%s%s\n' "${_KM_HERE_PATHS[$i]}" "$t" "${_KM_HERE_SRCS[$i]}" "$t" "${_KM_HERE_HASHES[$i]}" >> "$rows" ;;
+        *) printf '%s%s%s\n' "${_KM_HERE_PATHS[$i]}" "$t" "$t" >> "$rows" ;;
+      esac
+      printf '%s\n' "${_KM_HERE_IDS[$i]}" >> "$rows.ids"
+      n=$((n + 1))
+    fi
+    i=$((i + 1))
+  done
+  if [ "$n" -eq 0 ]; then
+    rm -f "$rows" "$rows.ids"
+    return 0
+  fi
+  # A branch that has to catch up shows its files at _OT_FF_TO already (ot_open).
+  tip=${_OT_FF_TO:-HEAD}
+  _km_ref_holds "$tip" "$rows" > "$rows.tree"
+  _km_ref_holds "$OT_BASE_REF" "$rows" > "$rows.base"
+  exec 4< "$rows.tree"
+  exec 5< "$rows.base"
+  local refused="" code=""
+  while IFS= read -r id; do
+    IFS= read -r a <&4 || a=0
+    IFS= read -r b <&5 || b=0
+    [ "$a" != 1 ] || continue
+    refused=$id
+    if [ "$b" = 1 ]; then code=not-on-branch; else code=not-on-base; fi
+    break
+  done < "$rows.ids"
+  exec 4<&- 5<&-
+  rm -f "$rows" "$rows.ids" "$rows.tree" "$rows.base"
+  [ -n "$refused" ] || return 0
+  if [ "$code" = not-on-branch ]; then
+    jig_fail not-on-branch "knowledge $sub: $refused, as this checkout has it, reached $OT_BASE after $OT_BRANCH was cut, and the decision is judged on that branch; decide it once the decisions waiting there have landed"
+  fi
+  jig_fail not-on-base "knowledge $sub: $refused, as this checkout has it, is not on $OT_BASE as $(_km_ref_name "$OT_BASE_REF") has it, and the decision is judged there; commit and push it, then decide"
+}
+
+# _km_ref_name <ref> — a ref as a person names it: `origin/main`, `main`.
+_km_ref_name() {
+  case "$1" in
+    refs/remotes/*) printf '%s\n' "${1#refs/remotes/}" ;;
+    refs/heads/*) printf '%s\n' "${1#refs/heads/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# _km_ref_holds <ref> <table> — for each row of <table>, "<path><TAB><source><TAB><hash>",
+# one line: 1 when the commit <ref> names has the document at <path> and, when the row
+# names a source, that source there is not the text <hash> approved (it changed, or it is
+# gone) — the write judging at <ref> would see what the row describes — and 0 otherwise.
+# Every row is 0 when <ref> names no commit. One `git ls-tree` for the whole table: the
+# knowledge directory and the sources named, never a process per document.
+_km_ref_holds() {
+  local ref="$1" table="$2" sha listing src srcs=()
+  sha=""
+  [ -z "$ref" ] || sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null) || sha=""
+  listing=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-listing.XXXXXX")
+  jig_cleanup_add "$listing"
+  : > "$listing"
+  if [ -n "$sha" ]; then
+    while IFS="$(printf '\t')" read -r _ src _; do
+      [ -z "$src" ] || srcs+=("$src")
+    done < "$table"
+    git -C "$JIG_PROJECT" -c core.quotepath=off ls-tree -r --full-tree "$sha" -- "$JIG_AI_DIR/knowledge" ${srcs[@]+"${srcs[@]}"} > "$listing" 2>/dev/null \
+      || : > "$listing"
+  fi
+  # The listing may be empty, so the files are told apart by name, not by NR == FNR.
+  KM_LISTING="$listing" awk -F '\t' '
+    FILENAME == ENVIRON["KM_LISTING"] { split($1, f, " "); blob[$2] = f[3]; next }
+    {
+      held = ($1 in blob)
+      if (held && $2 != "") held = !($2 in blob) || blob[$2] != $3
+      print (held ? 1 : 0)
+    }' "$listing" "$table"
+  rm -f "$listing"
+}
+
+# _km_decidable_reasons <table> — for each row of <table> (as _km_ref_holds takes it), one
+# line: empty when a decision sent now would be judged on what the row describes, else
+# the code it would be refused with, `not-on-branch` or `not-on-base`. Judged where the
+# write judges, as of the last fetch: the tip of the decisions waiting when some wait
+# (_km_waiting_top has run), the base as jig_base_ref reads it otherwise. No network.
+_km_decidable_reasons() {
+  local table="$1" base_ref tip_file base_file a b
+  base_ref=$(jig_base_ref "$(cfg git.base_branch main)")
+  base_file=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-base.XXXXXX")
+  jig_cleanup_add "$base_file"
+  _km_ref_holds "$base_ref" "$table" > "$base_file"
+  if [ -z "$_KM_WAITING_TIP" ]; then
+    while IFS= read -r a; do
+      if [ "$a" = 1 ]; then printf '\n'; else printf 'not-on-base\n'; fi
+    done < "$base_file"
+    rm -f "$base_file"
+    return 0
+  fi
+  tip_file=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-tip.XXXXXX")
+  jig_cleanup_add "$tip_file"
+  _km_ref_holds "$_KM_WAITING_TIP" "$table" > "$tip_file"
+  exec 4< "$base_file"
+  while IFS= read -r a; do
+    IFS= read -r b <&4 || b=0
+    if [ "$a" = 1 ]; then
+      printf '\n'
+    elif [ "$b" = 1 ]; then
+      printf 'not-on-branch\n'
+    else
+      printf 'not-on-base\n'
+    fi
+  done < "$tip_file"
+  exec 4<&-
+  rm -f "$base_file" "$tip_file"
+}
+
 # json_decide_row <id> <decision> <path> — _KM_ROW <- one decision of an answer; empty
 # in the text form, which has no JSON library to build it with.
 _KM_ROW=""
@@ -2319,17 +2566,26 @@ json_decide_row() {
 
 # --- linked sources ----------------------------------------------------------
 
+# _km_status_state <status> — _KM_STATUS_STATE <- the state word a stub with this
+# status has in every read of its source: empty for a status context resolves (the
+# source's own state decides), else the status itself, `unknown` for none.
+_km_status_state() {
+  _KM_STATUS_STATE=""
+  jig_knowledge_status_resolvable "$1" || _KM_STATUS_STATE=${1:-unknown}
+}
+
 # km_source_states — "<state><TAB><doc><TAB><source>" for every stub, in
 # document order. For a resolvable stub the state is `ok` when its source
 # hashes to `source_hash`, `changed` when it does not, `unrecorded` when no
 # hash was ever recorded — nothing approved the current text, so it counts as
 # changed — and `missing` when the source is not there. Any other stub is
-# `proposed` or its own status. One git process hashes every present source.
+# `proposed` or its own status (_km_status_state, which `sources --diff --json`
+# asks too). One git process hashes every present source.
 #
 # The one definition of "changed", because three commands report it: `jig
 # status` counts, `knowledge stale` lists and `knowledge sources` shows.
 km_source_states() {
-  local doc src status rows paths hashes t
+  local doc src rows paths hashes t
   t=$(printf '\t')
   rows=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-sources.XXXXXX")
   jig_cleanup_add "$rows"
@@ -2341,9 +2597,9 @@ km_source_states() {
     fm_has "$doc" || continue
     src=$(jig_knowledge_source "$doc")
     [ -n "$src" ] || continue
-    status=$(fm_get "$doc" status)
-    if ! jig_knowledge_status_resolvable "$status"; then
-      printf '%s%s%s%s%s\n' "${status:-unknown}" "$t" "$doc" "$t" "$src" >> "$rows"
+    _km_status_state "$(fm_get "$doc" status)"
+    if [ -n "$_KM_STATUS_STATE" ]; then
+      printf '%s%s%s%s%s\n' "$_KM_STATUS_STATE" "$t" "$doc" "$t" "$src" >> "$rows"
     elif ! jig_knowledge_read_path "$doc" >/dev/null; then
       printf 'missing%s%s%s%s\n' "$t" "$doc" "$t" "$src" >> "$rows"
     else
@@ -2380,6 +2636,26 @@ km_source_states() {
 # `changed` and `unrecorded`. A bare number, for `jig status`.
 km_changed_sources_count() {
   km_source_states | awk -F '\t' '$1 == "changed" || $1 == "unrecorded" { n++ } END { print n + 0 }'
+}
+
+# km_source_state <stub> — the state km_source_states gives one accepted stub's
+# source, for a command that asks about one document: `missing`, `unrecorded`, `ok`
+# or `changed`, on stdout. The same words from the same facts; the listing hashes
+# every source in one process, this hashes one.
+km_source_state() {
+  local doc="$1" recorded
+  if ! jig_knowledge_read_path "$doc" >/dev/null; then
+    printf 'missing\n'
+    return 0
+  fi
+  recorded=$(fm_get "$doc" source_hash)
+  if [ -z "$recorded" ]; then
+    printf 'unrecorded\n'
+  elif [ "$(jig_hash "$JIG_PROJECT/$(jig_knowledge_source "$doc")")" = "$recorded" ]; then
+    printf 'ok\n'
+  else
+    printf 'changed\n'
+  fi
 }
 
 # km_sources [--diff <id>] — every stub with the state of its source, or the
@@ -2436,20 +2712,11 @@ _km_diff_facts() {
   [ -n "$KM_DIFF_SRC" ] || jig_fail not-found "knowledge sources: $id links no source"
   KM_DIFF_HASH=""
   KM_DIFF_STORED=0
-  if ! jig_knowledge_read_path "$KM_DIFF_DOC" >/dev/null; then
-    KM_DIFF_STATE=missing
-    return 0
-  fi
+  KM_DIFF_STATE=$(km_source_state "$KM_DIFF_DOC")
+  [ "$KM_DIFF_STATE" != missing ] || return 0
   KM_DIFF_HASH=$(fm_get "$KM_DIFF_DOC" source_hash)
-  if [ -z "$KM_DIFF_HASH" ]; then
-    KM_DIFF_STATE=unrecorded
-  elif [ "$(jig_hash "$JIG_PROJECT/$KM_DIFF_SRC")" = "$KM_DIFF_HASH" ]; then
-    KM_DIFF_STATE=ok
-  else
-    KM_DIFF_STATE=changed
-    if git -C "$JIG_PROJECT" cat-file -e "$KM_DIFF_HASH^{blob}" 2>/dev/null; then
-      KM_DIFF_STORED=1
-    fi
+  if [ "$KM_DIFF_STATE" = changed ] && git -C "$JIG_PROJECT" cat-file -e "$KM_DIFF_HASH^{blob}" 2>/dev/null; then
+    KM_DIFF_STORED=1
   fi
 }
 
@@ -2489,8 +2756,8 @@ km_sources_diff() {
 
 # --- the reads as JSON (schemas/json.md) ---------------------------------------
 
-# _km_json_main <proposed|sources> [args...] — the producer json_run runs for
-# `knowledge proposed|sources --json`; `--json` itself is dropped here.
+# _km_json_main <proposed|sources|read> [args...] — the producer json_run runs for
+# `knowledge proposed|sources|read --json`; `--json` itself is dropped here.
 _km_json_main() {
   local sub="$1" arg args=()
   shift
@@ -2513,6 +2780,11 @@ _km_json_main() {
         jig_fail usage "usage: jig knowledge sources [--diff <id>] [--json]"
       fi
       ;;
+    read)
+      [ ${#args[@]} -eq 1 ] || jig_fail usage "usage: jig knowledge read <id> --json"
+      case "${args[0]}" in '' | -*) jig_fail usage "usage: jig knowledge read <id> --json" ;; esac
+      _km_read_json "${args[0]}"
+      ;;
   esac
 }
 
@@ -2520,31 +2792,36 @@ _km_json_main() {
 # UTF-8, _KM_LOSSY <- true when there were any. json_quote lets such bytes
 # through as they are, and one of them makes the whole line invalid JSON: a
 # source file is anything a person committed. Strict UTF-8 is checked and
-# repaired by iconv; where there is none, every byte outside ASCII goes, which
-# is the lossy end of the same thing.
+# repaired by iconv; where there is none, every byte outside ASCII becomes `?`,
+# one per byte, which is the lossy end of the same thing.
 _km_utf8_clean() {
   local ascii src
   _KM_CLEAN=$1
   _KM_LOSSY=false
   if command -v iconv >/dev/null 2>&1; then
-    # Bytes F5 to FF lead no character, and some iconv builds (macOS) accept
-    # them, so they go first. F4 can lead a character above U+10FFFF, which
-    # such a build accepts too: text that still has one takes the ASCII-only
-    # road below, lossy but valid.
+    # Some iconv builds (macOS) accept what is not UTF-8 to a JSON parser: bytes
+    # F5 to FF, which lead no character, and F4 followed by 90 to BF, which leads
+    # one above U+10FFFF. Those go first; the continuation bytes they leave alone
+    # are iconv's to drop. F4 followed by 80 to 8F is U+100000 to U+10FFFF, valid
+    # and kept.
     src=$(printf '%sx' "$1" | LC_ALL=C tr -d '\365-\377')
     src=${src%x}
-    if [ "$src" = "$1" ] && [ -z "$(printf '%s' "$1" | LC_ALL=C tr -cd '\364')" ] \
-      && printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+    if [ -n "$(printf '%s' "$src" | LC_ALL=C tr -cd '\364')" ]; then
+      _km_drop_above_unicode "$src"
+      src=$_KM_CLEAN
+      _KM_CLEAN=$1
+    fi
+    if [ "$src" = "$1" ] && printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
       return 0
     fi
-    if [ -z "$(printf '%s' "$src" | LC_ALL=C tr -cd '\364')" ]; then
-      # The sentinel keeps the trailing newlines $(...) would strip, and ends a
-      # truncated sequence the way a following byte would.
-      _KM_CLEAN=$(printf '%sx' "$src" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true)
-      _KM_CLEAN=${_KM_CLEAN%x}
-      _KM_LOSSY=true
-      return 0
-    fi
+    # The sentinel keeps the trailing newlines $(...) would strip, and ends a
+    # truncated sequence the way following bytes would: three of them, since a
+    # four-byte lead left with fewer behind it takes them down with it (macOS
+    # iconv drops an incomplete last character whole).
+    _KM_CLEAN=$(printf '%sxxx' "$src" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true)
+    _KM_CLEAN=${_KM_CLEAN%xxx}
+    _KM_LOSSY=true
+    return 0
   fi
   # Printable ASCII, tab, carriage return and newline stay.
   ascii=$(printf '\t\r -~')
@@ -2556,11 +2833,71 @@ _km_utf8_clean() {
   _KM_LOSSY=true
 }
 
+# _km_drop_above_unicode <s> — _KM_CLEAN <- <s> without each F4 byte and the byte
+# from 90 to BF that follows it. Matched by the shell, byte by byte under the C locale: sed and awk
+# would drop the carriage return of a CRLF line under Git Bash (conventions/shell.md). The text is
+# split on F4 by word splitting, not stripped with ${s//pattern/}: on bash 3.2 that substitution
+# costs the text's length once per match, and a source file can be long and hold many of them.
+# Splitting is done in memory, with no read, here-document or $(...) a CR could be lost in on
+# Git Bash; globbing is off for it, and the `x` keeps a trailing F4's empty field.
+_km_drop_above_unicode() {
+  local LC_ALL=C IFS=$'\364' out part first=1 noglob=
+  local -a parts acc
+  case $1 in *$'\364'*) ;; *) _KM_CLEAN=$1; return 0 ;; esac
+  case $- in *f*) noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2206 # the split on IFS is the point; globbing is off
+  parts=(${1}x)
+  [ -n "$noglob" ] || set +f
+  # The pieces are joined once at the end: appending each to one string would
+  # copy all of it again per F4.
+  for part in "${parts[@]}"; do
+    if [ -n "$first" ]; then acc[0]=$part; first=; continue; fi
+    case $part in
+      [$'\220'-$'\277']*) acc[${#acc[@]}]=${part#?} ;;
+      *) acc[${#acc[@]}]=$'\364'$part ;;
+    esac
+  done
+  IFS=
+  out="${acc[*]}"
+  _KM_CLEAN=${out%x}
+}
+
 # _km_json_print <json> — the producer's one value, free of bytes that are not
 # UTF-8 (the structure is ASCII; only a value's text can hold them).
 _km_json_print() {
   _km_utf8_clean "$1"
   printf '%s\n' "$_KM_CLEAN"
+}
+
+# _km_json_records <record>... — _JSON <- the records joined by commas, each one
+# free of bytes that are not UTF-8. A record ends in `"lossy":false}`, and one that
+# held such bytes ends in `"lossy":true}` instead: a name without them can be
+# another file's, so the record says so. One check of them all first, so a read
+# with nothing to drop costs one pass, not one per record.
+_km_json_records() {
+  local rec out="" sep=""
+  _km_utf8_clean "$*"
+  if [ "$_KM_LOSSY" = false ]; then
+    for rec in "$@"; do out="$out$sep$rec"; sep=,; done
+    _JSON=$out
+    return 0
+  fi
+  for rec in "$@"; do
+    _km_utf8_clean "$rec"
+    rec=$_KM_CLEAN
+    [ "$_KM_LOSSY" = false ] || rec="${rec%\"lossy\":false\}}\"lossy\":true}"
+    out="$out$sep$rec"
+    sep=,
+  done
+  _JSON=$out
+}
+
+# _km_json_name <s> — _JSON <- <s> as a JSON string without the bytes that are not
+# UTF-8; _KM_LOSSY <- true when there were any. For a name an answer flags itself.
+_km_json_name() {
+  _km_utf8_clean "$1"
+  json_quote "$_KM_CLEAN"
 }
 
 # _km_json_list <newline-separated items> — _JSON <- a JSON array of strings.
@@ -2659,17 +2996,40 @@ _km_waiting_top() {
   _KM_WAITING_TIP=$OT_W_TIP
 }
 
+# _km_decidable_json <reason> — _JSON <- `,"decidable":…,"reason":…` for a reason line of
+# _km_decidable_reasons: empty is decidable.
+_km_decidable_json() {
+  if [ -z "$1" ]; then
+    _JSON=',"decidable":true,"reason":null'
+  else
+    json_quote "$1"; _JSON=",\"decidable\":false,\"reason\":$_JSON"
+  fi
+}
+
 # _km_proposed_json — the data of `knowledge proposed --json`: every document
 # with status `proposed`, in the order the text form lists them, from the same
 # km_is_proposed. A stub also names its source; `source` is null for the rest.
 # `waiting` says what a decision on its way decided: the document here still says
-# `proposed`, and rightly, until the branch lands.
+# `proposed`, and rightly, until the branch lands. `decidable` and `reason` say whether a
+# decision sent now would find the document where it is judged (_km_decidable_reasons).
 _km_proposed_json() {
-  local doc out="" sep="" rec
+  local doc rec docs=() recs=() table reasons reason
   _km_waiting_top
+  table=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-table.XXXXXX")
+  jig_cleanup_add "$table"
+  reasons="$table.reasons"
+  jig_cleanup_add "$reasons"
+  : > "$table"
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
     km_is_proposed "$doc" || continue
+    docs+=("$doc")
+    printf '%s\t\t\n' "$(km_rel "$doc")" >> "$table"
+  done < <(km_docs)
+  _km_decidable_reasons "$table" > "$reasons"
+  exec 4< "$reasons"
+  for doc in ${docs[@]+"${docs[@]}"}; do
+    IFS= read -r reason <&4 || reason=not-on-base
     json_quote "$(fm_get "$doc" id)"; rec="{\"id\":$_JSON"
     json_quote "$(fm_get "$doc" type)"; rec="$rec,\"type\":$_JSON"
     _km_json_list "$(fm_list "$doc" domains)"; rec="$rec,\"domains\":$_JSON"
@@ -2678,22 +3038,46 @@ _km_proposed_json() {
     json_str_or_null "$(fm_get "$doc" summary)"; rec="$rec,\"summary\":$_JSON"
     json_str_or_null "$(jig_knowledge_source "$doc")"; rec="$rec,\"source\":$_JSON"
     _km_waiting_decision "$(km_rel "$doc")" proposed "$(fm_get "$doc" source_hash)"
-    rec="$rec,\"waiting\":$_KM_WAITING}"
-    out="$out$sep$rec"
-    sep=,
-  done < <(km_docs)
-  _km_json_print "{\"proposals\":[$out],\"waiting\":$_KM_WAITING_JSON}"
+    rec="$rec,\"waiting\":$_KM_WAITING"
+    _km_decidable_json "$reason"
+    recs+=("$rec$_JSON,\"lossy\":false}")
+  done
+  exec 4<&-
+  rm -f "$table" "$reasons"
+  _km_json_records ${recs[@]+"${recs[@]}"}
+  _km_json_print "{\"proposals\":[$_JSON],\"waiting\":$_KM_WAITING_JSON}"
 }
 
 # _km_sources_json — the data of `knowledge sources --json`: every stub with
 # the state km_source_states gives it, the one definition of "changed", and the
-# counts the text form's last line gives.
+# counts the text form's last line gives; `decidable` and `reason` as on a proposal.
 _km_sources_json() {
-  local state doc src size n=0 changed=0 unrecorded=0 missing=0 t out="" sep="" rec
+  local state doc src size n=0 changed=0 unrecorded=0 missing=0 t rec recs=()
+  local states table reasons reason
   _km_waiting_top
   t=$(printf '\t')
+  states=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-states.XXXXXX")
+  jig_cleanup_add "$states"
+  table="$states.table"
+  reasons="$states.reasons"
+  jig_cleanup_add "$table"
+  jig_cleanup_add "$reasons"
+  km_source_states > "$states"
+  : > "$table"
+  # A source that changed, or went, is decided on its change: the stub has to be where
+  # the write judges, with its source there not the approved text any more.
   while IFS="$t" read -r state doc src; do
     [ -n "$doc" ] || continue
+    case "$state" in
+      changed | missing) printf '%s\t%s\t%s\n' "$(km_rel "$doc")" "$src" "$(fm_get "$doc" source_hash)" >> "$table" ;;
+      *) printf '%s\t\t\n' "$(km_rel "$doc")" >> "$table" ;;
+    esac
+  done < "$states"
+  _km_decidable_reasons "$table" > "$reasons"
+  exec 4< "$reasons"
+  while IFS="$t" read -r state doc src; do
+    [ -n "$doc" ] || continue
+    IFS= read -r reason <&4 || reason=not-on-base
     n=$((n + 1))
     case "$state" in
       changed) changed=$((changed + 1)) ;;
@@ -2711,21 +3095,29 @@ _km_sources_json() {
     json_quote "$src"; rec="$rec,\"source\":$_JSON"
     json_int_or_null "$size"; rec="$rec,\"bytes\":$_JSON"
     _km_waiting_decision "$(km_rel "$doc")" "$(fm_get "$doc" status)" "$(fm_get "$doc" source_hash)"
-    rec="$rec,\"waiting\":$_KM_WAITING}"
-    out="$out$sep$rec"
-    sep=,
-  done < <(km_source_states)
-  _km_json_print "{\"sources\":[$out],\"counts\":{\"linked\":$n,\"changed\":$changed,\"unrecorded\":$unrecorded,\"missing\":$missing},\"waiting\":$_KM_WAITING_JSON}"
+    rec="$rec,\"waiting\":$_KM_WAITING"
+    _km_decidable_json "$reason"
+    recs+=("$rec$_JSON,\"lossy\":false}")
+  done < "$states"
+  exec 4<&-
+  rm -f "$states" "$table" "$reasons"
+  _km_json_records ${recs[@]+"${recs[@]}"}
+  _km_json_print "{\"sources\":[$_JSON],\"counts\":{\"linked\":$n,\"changed\":$changed,\"unrecorded\":$unrecorded,\"missing\":$missing},\"waiting\":$_KM_WAITING_JSON}"
 }
 
 # _km_sources_diff_json <id> — the data of `knowledge sources --diff <id>
 # --json`, from the facts the text form prints from. `diff` is the unified diff
 # for a `changed` source whose approved text git still has, null otherwise: the
 # source is then reviewed whole. A missing source is an answer here, state
-# `missing`, where the text form refuses.
+# `missing`, where the text form refuses. A stub that is not accepted reads its
+# status, as in `sources --json` (km_source_states), so one stub has one state in
+# both reads; its diff is still the source's. `lossy` covers the linked file's
+# name as well as the diff.
 _km_sources_diff_json() {
-  local id="$1" text="" lossy=false out
+  local id="$1" text="" lossy=false out state
   _km_diff_facts "$id"
+  _km_status_state "$(fm_get "$KM_DIFF_DOC" status)"
+  state=${_KM_STATUS_STATE:-$KM_DIFF_STATE}
   if [ "$KM_DIFF_STATE" = changed ] && [ "$KM_DIFF_STORED" -eq 1 ]; then
     # The sentinel keeps the trailing newlines $(...) would strip.
     text=$(_km_diff_text && printf x)
@@ -2735,8 +3127,9 @@ _km_sources_diff_json() {
     lossy=$_KM_LOSSY
   fi
   json_quote "$id"; out="{\"id\":$_JSON"
-  json_quote "$KM_DIFF_SRC"; out="$out,\"source\":$_JSON"
-  json_quote "$KM_DIFF_STATE"; out="$out,\"state\":$_JSON"
+  _km_json_name "$KM_DIFF_SRC"; out="$out,\"source\":$_JSON"
+  [ "$_KM_LOSSY" = false ] || lossy=true
+  json_quote "$state"; out="$out,\"state\":$_JSON"
   json_str_or_null "$KM_DIFF_HASH"; out="$out,\"approved_hash\":$_JSON"
   if [ -n "$text" ]; then _km_json_quote_text "$text"; else _JSON=null; fi
   out="$out,\"diff\":$_JSON,\"lossy\":$lossy}"
@@ -2765,4 +3158,55 @@ km_stages() {
     fm_list_add "$doc" stages "$stage" || return 1
   fi
   printf 'stages     %s\n' "$(km_rel "$doc")"
+}
+
+# _km_json_text <file> — _JSON <- the file's whole text as a JSON string, _KM_LOSSY
+# <- true when bytes that are not UTF-8 were dropped from it. The text is read with
+# a sentinel, so the trailing newlines $(...) would strip stay, and is escaped by
+# _km_json_quote_text's one pass, which ends every line it sees with a newline:
+# a file that does not end in one gets it back off.
+_km_json_text() {
+  local text
+  text=$(cat "$1" && printf x) || jig_die "knowledge read: cannot read $1"
+  text=${text%x}
+  _km_utf8_clean "$text"
+  text=$_KM_CLEAN
+  if [ -n "$text" ] && [ "${text%$'\n'}" = "$text" ]; then
+    _km_json_quote_text "$text
+"
+    _JSON="${_JSON%\\n\"}\""
+  else
+    _km_json_quote_text "$text"
+  fi
+}
+
+# _km_read_json <id> — the data of `knowledge read <id> --json`: the document's
+# whole file, frontmatter included, whatever its status, and for a stub the file it
+# links as it is now (null when that is not a readable file inside the repository,
+# as jig_knowledge_read_path decides for every resolution). The text a person is
+# asked to decide, read as a file reads: nothing is written and no revision moves.
+_km_read_json() {
+  local id="$1" doc src size out source_json=null name_lossy
+  doc=$(km_doc_by_id "$id")
+  size=$(wc -c < "$doc" | tr -d ' ')
+  json_quote "$id"; out="{\"id\":$_JSON"
+  json_str_or_null "$(fm_get "$doc" status)"; out="$out,\"status\":$_JSON"
+  _km_json_name "$(km_rel "$doc")"; out="$out,\"path\":$_JSON"
+  name_lossy=$_KM_LOSSY
+  json_int_or_null "$size"; out="$out,\"bytes\":$_JSON"
+  _km_json_text "$doc"
+  [ "$name_lossy" = false ] || _KM_LOSSY=true
+  out="$out,\"content\":$_JSON,\"lossy\":$_KM_LOSSY"
+  src=$(jig_knowledge_source "$doc")
+  if [ -n "$src" ] && jig_knowledge_read_path "$doc" >/dev/null && [ -r "$JIG_PROJECT/$src" ]; then
+    size=$(wc -c < "$JIG_PROJECT/$src" | tr -d ' ')
+    source_json="{\"path\":"
+    _km_json_name "$src"; source_json="$source_json$_JSON"
+    name_lossy=$_KM_LOSSY
+    json_int_or_null "$size"; source_json="$source_json,\"bytes\":$_JSON"
+    _km_json_text "$JIG_PROJECT/$src"
+    [ "$name_lossy" = false ] || _KM_LOSSY=true
+    source_json="$source_json,\"content\":$_JSON,\"lossy\":$_KM_LOSSY}"
+  fi
+  _km_json_print "$out,\"source\":$source_json}"
 }

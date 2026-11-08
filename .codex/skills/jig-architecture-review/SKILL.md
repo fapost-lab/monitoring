@@ -24,7 +24,9 @@ printf '%s\n' "$files" | .ai/scripts/jig context guard --task <id> --stage archi
 
 Keep the paths in a shell variable, not in a file, and inspect all change layers via the same
 [scope reference](../jig-review/references/change-scope.md) used by code review. Read and
-acknowledge pending knowledge before the guard. Check the acceptance map for omitted
+acknowledge pending knowledge (`--stage architecture-review`) before the guard; a pass that
+says `none acknowledged at architecture-review` rests on the implementer's claims, as
+[jig-review](../jig-review/SKILL.md) §1 says. Check the acceptance map for omitted
 requirements too. Use a separate `jig context --task <id> --all` inspection when historical
 or rejected decisions matter; diagnostic history is not binding accepted knowledge.
 

@@ -24,8 +24,11 @@ Review against those, plus correctness. Style opinions with no rule behind them 
 
 Resolve against the *actual* diff, not the task's original file list — the change reaches
 files nobody planned. If the guard reports pending documents, read and acknowledge them
-before reviewing: a review that has not read the rules it is reviewing against is a
-formality.
+(`jig context acknowledge --task <id> --stage review --files -`) before reviewing: a review
+that has not read the rules it is reviewing against is a formality. A passing guard says at
+which stages the acknowledgements it took were made; `none acknowledged at review` means it
+passed on the implementer's claims, not yours — read what binds the diff yourself. Never
+acknowledge what you did not read; withdraw such a claim with `--revoke`.
 
 Rules also live outside what `jig context` resolves: `AGENTS.md`, `CLAUDE.md`,
 `CONTRIBUTING.md`, `.ai/guidelines/`, and linter and formatter configuration. A file git does not

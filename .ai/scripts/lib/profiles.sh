@@ -92,6 +92,39 @@ profiles_supports() {
   return 1
 }
 
+# profiles_names_check <profile-dir> <check> — true when the profile lists
+# <check> under `checks`: its verify.sh answers to that role name through
+# jp_covered, so a profile declaring `covers: [<name>:<check>]` can take the
+# check over. Declared like `scope`, never inferred: a verify.sh written
+# before the key existed does not stand its check down, and absence says so.
+profiles_names_check() {
+  local item
+  while IFS= read -r item; do
+    [ "$item" = "$2" ] && return 0
+  done < <(_profiles_list_lines "$1" checks)
+  return 1
+}
+
+# profiles_applies <profile-dir> — true when the profile's own stack is in
+# the project: `detect` is `always`, absent (a project's profile, activated
+# by name), or one of its globs matches. A profile covers another's check only
+# where it applies — laravel's `artisan test` without an `artisan` runs
+# nothing, and the check it would have taken over must stay where it was.
+profiles_applies() {
+  local glob raw
+  raw=$(profile_get "$1" detect)
+  case "$raw" in
+    ''|always) return 0 ;;
+    \[*\]) ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r glob; do
+    [ -n "$glob" ] || continue
+    _profiles_glob_matches "$glob" && return 0
+  done < <(_profiles_list_lines "$1" detect)
+  return 1
+}
+
 # --- validation ----------------------------------------------------------------
 # A profile or adapter name can arrive from --profile/--profiles/--adapters
 # or from .ai/config.yaml (profiles_active, cfg_list). Every consumer that

@@ -94,6 +94,11 @@ jig_config_clone_root() {
   printf '%s\n' "$root"
 }
 
+# The read-snapshot switch belongs to common.sh, which sets it to 0. The session
+# hook sources this file alone under `set -u`, so it needs a default here; `:=`
+# keeps the value when common.sh has already set it.
+: "${_JIG_TS_ON:=0}"
+
 # jig_config_clone_root_v <var> — jig_config_clone_root's answer into <var>.
 # Inside a read snapshot (jig_read_snapshot_begin) it is worked out once per
 # process; a main checkout costs no process at all, a worktree one subshell.

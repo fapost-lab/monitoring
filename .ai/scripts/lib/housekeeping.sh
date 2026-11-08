@@ -101,6 +101,14 @@ cmd_housekeeping() {
   [ "$dry" = 1 ] || _hk_forge_cache_write
   _hk_base_reflog_init "$tasks_dir"
 
+  # Finished tasks leave the queue before any workspace is purged: a wait on a
+  # closed task is read as met while its state is still here to say so
+  # (adr-20261107-a-finished-task-leaves-the-queue). Through `jig queue`, the
+  # queue's one writer; a dry run only says what would go. Before this run's
+  # marker, so a real run and a dry run both read the merges the last run saw,
+  # as `jig queue next` does.
+  _hk_queue_prune "$dry"
+
   # A run boundary in the log. Without it the log is an undifferentiated
   # append-only history, and any reader asking "what does the latest run say"
   # has to guess with a line count — which is how `jig status` came to report
@@ -113,7 +121,7 @@ cmd_housekeeping() {
   fi
 
   local needs_consolidation=0 wrong_base=0 archive_refused=0 found=0 keep_branches="" archive_err
-  local reason state_file tid st paused age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire
+  local reason state_file tid st paused archived_from archived_reason age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire
 
   # Worktrees tasks were started in, from git's own list, read once per run.
   # A task's worktree goes when the task is closed and its branch landed on its
@@ -166,8 +174,16 @@ EOF
         released=$(_hk_released "$branch" "$base_commit" "$task_base")
       fi
 
+      archived_from=""
+      archived_reason=""
+      if [ "$st" = archived ]; then
+        archived_from=$(task_state_get "$tid" archived_from)
+        archived_reason=$(task_state_get "$tid" archived_reason)
+      fi
+
       decision=$(housekeeping_decide \
-        "$st" "$remote" "$paused" "$age" "$abandoned_ttl_days" "$stale_after_days" "$released")
+        "$st" "$remote" "$paused" "$age" "$abandoned_ttl_days" "$stale_after_days" "$released" \
+        "$archived_from" "$archived_reason")
       action=${decision%% *}
       flags=${decision#* }
       [ "$flags" = "$decision" ] && flags=""
@@ -337,15 +353,36 @@ $task_base
   return 0
 }
 
+# _hk_queue_prune <dry> — `jig queue prune` (`--dry-run` on a dry run), its
+# lines printed when it took anything out; a refusal is warned about and never
+# fails the run. Nothing is asked of a clone with no queue.
+_hk_queue_prune() {
+  local out rc=0 args=""
+  [ -f "$(jig_queue_file)" ] || return 0
+  [ "$1" != 1 ] || args=--dry-run
+  out=$(JIG_INTERNAL_REDRAW=1 "$JIG_SELF" queue prune ${args:+"$args"} 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    jig_warn "housekeeping: the queue was not pruned: ${out#jig: error: }"
+    return 0
+  fi
+  case "$out" in
+    'queue: no finished task to take out') ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+  return 0
+}
+
 # --- policy ------------------------------------------------------------------
 
 # housekeeping_decide <status> <remote> <paused> <age_days> <abandoned_ttl_days>
-#                     <stale_after_days> [released]
+#                     <stale_after_days> [released] [archived_from] [archived_reason]
 # Print "<action> [flags]" where action is purge|preserve|archive and flags is a
 # comma-separated subset of needs-consolidation, abandoned?, base-unreleased,
 # STALE_CANDIDATE. `released` (default true) is false for a task merged into a
 # base that has not reached the default branch yet — a phase of an open epic:
 # closed and merged, it is kept rather than purged (ADR-0040).
+# `archived_from` and `archived_reason` are an archived task's state keys of
+# those names; they decide whether its merge still asks for consolidation.
 #
 # `archive` is for work nobody finished: an abandoned task past its TTL, or an
 # active/ready one untouched past stale_after with no flag and no pull request.
@@ -353,13 +390,20 @@ $task_base
 # caller may still refuse a stale archive where a worktree holds the task's
 # work; the decision stays pure and says only what age and state allow.
 #
-# A pure function of six strings: no filesystem, no git, no config. That is
+# A pure function of its strings: no filesystem, no git, no config. That is
 # what makes the domains/housekeeping policy table exhaustively testable, and it is the reason
 # the destructive decision is separated from the destructive act.
 housekeeping_decide() {
   local status="$1" remote="$2" paused="$3" age="$4" abandoned_ttl="$5" stale_after="$6"
-  local released="${7:-true}"
-  local action="preserve" flags=""
+  local released="${7:-true}" archived_from="${8:-}" archived_reason="${9:-}"
+  local action="preserve" flags="" settled=false
+
+  # An archived task whose fate a person already decided — abandoned before it
+  # was archived, or absorbed by another task — has nothing to consolidate,
+  # like an abandoned one.
+  if [ "$archived_from" = abandoned ] || [ "$archived_reason" = absorbed ]; then
+    settled=true
+  fi
 
   case "$status:$remote" in
     consolidated:merged)
@@ -375,11 +419,16 @@ housekeeping_decide() {
     # Already abandoned: "abandoned?" would ask a question that has been
     # answered.
     abandoned:closed) ;;
-    # Archived: its work was not finished when it was shelved, so a merge means
-    # it landed after all and a person has to consolidate it. A closed pull
-    # request is no question to ask of a task already set aside.
+    # Archived unfinished — stale, or by hand from active/ready — its merge
+    # means the work landed after all with nobody's knowledge decision, and a
+    # person has to consolidate it. Archived from `abandoned`, or `absorbed` by
+    # another task, the question was answered when it was set aside: like
+    # abandoned:merged, nothing to consolidate. Unknown keys keep the flag
+    # (adr-20261027-a-task-nobody-finished-is-archived-not-purged, amended
+    # 2026-11-06). A closed pull request is no question to ask of a task
+    # already set aside.
     archived:merged)
-      flags="needs-consolidation"
+      [ "$settled" = true ] || flags="needs-consolidation"
       ;;
     archived:closed) ;;
     *:closed)
@@ -395,6 +444,7 @@ housekeeping_decide() {
   if [ "$paused" = "true" ] && [ "$remote" = "merged" ]; then
     case "$status" in
       consolidated | abandoned) ;;
+      archived) [ "$settled" = true ] || flags="needs-consolidation" ;;
       *) flags="needs-consolidation" ;;
     esac
   fi
@@ -1337,7 +1387,7 @@ _hk_worktree_retire() {
   if [ -z "$reason" ] && [ "$ours" = 1 ] && [ "$dry" != 1 ]; then
     git -C "$JIG_PROJECT" worktree remove "$path" >/dev/null 2>&1 || reason="git-refused"
     if [ -z "$reason" ] && [ -e "$path" ]; then
-      _hk_worktree_leftover "$path" || reason="leftover"
+      jig_worktree_leftover "$path" || reason="leftover"
     fi
   fi
 
@@ -1504,24 +1554,6 @@ _hk_ignored_summary() {
     index($0, ai) == 1 { next }
     { n++; if (n <= 5) out = out (out == "" ? "" : ",") $0 }
     END { if (n > 5) out = out ",+" n - 5 "-more"; print out }'
-}
-
-# _hk_worktree_leftover <path> — clear what `git worktree remove` leaves behind
-# on Windows. There git removed the tracked files but left the directory, with
-# `.ai/…` and the junction that borrowed the tasks directory still in it
-# (measured on windows-latest, 2026-09-14). Removes links only, never what they point at —
-# `find` does not follow them — and then empty directories, deepest first;
-# `rmdir` cannot remove a directory that still holds anything. Non-zero when
-# anything else remains, which stays where it is. Called only after git
-# removed the worktree, on a path `_hk_worktree_retire` already proved is ours.
-_hk_worktree_leftover() {
-  local path="$1" entry
-  while IFS= read -r entry; do
-    [ -L "$entry" ] || continue
-    rm -f "$entry" 2>/dev/null || rmdir "$entry" 2>/dev/null || true
-  done < <(find "$path" -type l 2>/dev/null)
-  find "$path" -depth -type d -exec rmdir {} \; 2>/dev/null || true
-  [ ! -e "$path" ]
 }
 
 # _hk_worktree_locked <path> — true when git lists the worktree at <path> as
