@@ -22,7 +22,8 @@ nobody can answer "and if not" for is a decision in disguise; record it as one.
 
 ## Other shapes
 
-Offer two or three, each concrete enough to compare:
+Material for a widening round ([rounds](rounds.md)). Offer two or three, each concrete
+enough to compare:
 
 - another audience — who else has this problem, differently;
 - another scale — the smallest version worth having, the largest that still holds;

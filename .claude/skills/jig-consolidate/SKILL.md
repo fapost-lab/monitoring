@@ -158,7 +158,7 @@ which repository owns the concern — is knowledge like any other, recorded here
 
 When it prints `roadmap complete`, the spec is closed in this same change: its decisions are knowledge
 now. Run the command it names. It first lists what knowledge does not hold — unchecked items, fog,
-open questions, untested assumptions; ask the human about each one, move it where they say (another
+open questions, what was set aside, untested assumptions; ask the human about each one, move it where they say (another
 spec through `jig-idea`, or a task) or drop it, and run it again with `--leftovers-handled`. A spec on
 an epic is closed on the epic by `--finish`, not here.
 

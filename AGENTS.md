@@ -25,8 +25,9 @@ column is the way; the right-hand one is what it replaces.
 | Write one of the task's documents | `jig task artifact write <id> <kind> --from <file>` | your editing tools on a path under `.ai/workspace/` |
 | Show the work is done | `jig verify` | running the test commands yourself |
 | Reach a commit and a pull request | `jig task ship <id> --message-file <file>` | `git commit`, `gh pr create` |
+| Ask GitHub about this repository | `jig gh <args>` | plain `gh`: it answers as the account active on the whole machine, which may not be this project's |
 
-Keep this table short: eight rows get read; twenty stop being read, exactly as prose does. A
+Keep this table short: nine rows get read; twenty stop being read, exactly as prose does. A
 session to-do list (`TodoWrite` and the like) is deliberately absent — it is a draft for one
 session, not a unit of work, and nothing here replaces it.
 
@@ -69,6 +70,12 @@ links a task filed earlier, and a started task stays out of the epic.
 `jig-autopilot` runs one task's route without waiting between stages and stops only where a
 human is needed; the route, the gates and `agent.git` stay what they are.
 
+A person may hold several GitHub accounts in `gh`. Never run `gh auth switch`, and never ask
+the person to: the active account is the whole machine's, and another session may be working
+under it. `jig gh` and `jig task ship` ask as this clone's own account. When one of them
+refuses because several accounts may push here, ask the person once which login is this
+project's and record it with `jig config set --local github.account <login>`.
+
 `jig-setup` asks a person, one question at a time, how far their agent may go on its own and
 writes the answers to their gitignored `.ai/config.local.yaml` through
 `jig config set --local`; it never writes `.ai/config.yaml`.
@@ -76,6 +83,15 @@ writes the answers to their gitignored `.ai/config.local.yaml` through
 `jig-upgrade` brings a project's copy of Jig up to the version on the machine: `jig self-update`
 when a newer release is out, `jig upgrade`, and the steps the release asks for by hand; what would
 stop the upgrade is named to the person, never worked around.
+
+`jig-pr-review` reviews a colleague's pull request (GitHub) or merge request (GitLab) that is not
+a task: `jig pr fetch <url>` reads it in a detached worktree of this clone, the review follows
+`jig-review`'s method with the rules taken from the base and nothing of the head run,
+`jig pr comments check` shows the review word for word as it would be posted, and only after the
+person's yes to that version does `jig pr comments post` post it — one comment-only review on
+GitHub, one discussion per comment on GitLab; `jig pr cleanup` takes it all back. After the
+author's fixes, `jig pr followup` reads that review back from the forge, and the next post answers
+each of its threads "fixed" or "still open" (not yet checked on a live pull request).
 
 The queue (`jig queue`) holds each task's priority, order and dependencies, and `jig queue next`
 advises from it. A task gets its priority when it is filed; to set priorities or order the tasks,

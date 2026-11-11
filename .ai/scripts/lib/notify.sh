@@ -230,8 +230,11 @@ _notify_description() {
 # a UTF-8 locale being installed: under LC_ALL=C each byte is one position, and
 # a UTF-8 continuation byte (0x80–0xBF) never starts a character. A cut in the
 # middle of a character would hand Telegram invalid UTF-8, which it refuses.
-_notify_cut() {
-  local LC_ALL=C
+# A subshell with a plain assignment, never `local LC_ALL=C`: bash restores a
+# local locale on return, which crashes Homebrew's bash on macOS now and then;
+# a subshell's assignment dies with it, unrestored (conventions/shell.md).
+_notify_cut() (
+  LC_ALL=C
   local s="$1" max="$2" i=0 n=0 len b
   # A character is at most four bytes: nothing past that can be kept.
   s=${s:0:$((max * 4 + 4))}
@@ -255,7 +258,7 @@ _notify_cut() {
   else
     printf '%s\n' "$s"
   fi
-}
+)
 
 # _notify_outcome <outcome> [<token>] — <outcome> as one line with no tab,
 # the token cut out of it, kept to 200 characters: what `notify` records and

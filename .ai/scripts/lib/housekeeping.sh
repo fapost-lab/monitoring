@@ -730,7 +730,8 @@ _hk_forge_init() {
 
   case "$_HK_FORGE_KIND" in
     github)
-      _HK_FORGE_PRS=$(gh pr list --state all --limit 200 \
+      jig_gh_prepare housekeeping
+      _HK_FORGE_PRS=$(jig_gh pr list --state all --limit 200 \
         --json headRefName,baseRefName,state,headRefOid,url \
         --jq '.[] | "\(.headRefName)\t\(.baseRefName)\t\(.state)\t\(.headRefOid)\t\(.url)"' 2>/dev/null || printf '__failed__')
       ;;
@@ -777,7 +778,7 @@ _hk_forge_init() {
 _hk_forge_ci() {
   [ "$_HK_FORGE_KIND" = github ] || return 0
   # shellcheck disable=SC2016 # $c is the --jq expression's variable, not the shell's
-  gh pr list --state open --limit 200 \
+  jig_gh pr list --state open --limit 200 \
     --json headRefName,baseRefName,statusCheckRollup \
     --jq '.[] | [.statusCheckRollup // []
           | group_by((.workflowName // "") + "/" + (.name // .context // ""))[]
@@ -1145,8 +1146,10 @@ _hk_branch_forge_merged() {
 # landed and that nothing here still needs (adr-20261007-a-merged-branch-
 # leaves-with-its-work). <keep> lists the branches of the workspaces this run
 # leaves in place, one per line. A candidate is a local branch or an origin/
-# ref that jig_branch_is_jigs (common.sh) calls Jig's, is in <keep> under
-# neither name, and is checked out in no worktree. It has landed when the
+# ref that jig_branch_deletable (common.sh) calls Jig's — under a template
+# with nothing before `{id}`, by a task record in the workspace or in trash,
+# read afresh here since this run may have just moved workspaces there — is
+# in <keep> under neither name, and is checked out in no worktree. It has landed when the
 # forge reports its pull request merged (_hk_branch_forge_merged) — the only
 # way a squash merge shows — or when its tip is an ancestor of the default
 # branch. The deleting is jig_branch_leave's, with git's own `-d` first and,
@@ -1165,6 +1168,7 @@ _hk_branch_sweep() {
   local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 heads="" b tip sha merged landed have_local have_track rsha out origin_go=()
   cfg_bool git.delete_merged_branches true || return 0
   [ "$(jig_config_clone_root)" = "$JIG_PROJECT" ] || return 0
+  _JIG_RECORDED_READ=0
   def_ref=$(jig_base_ref "$_HK_DEFAULT_BASE")
   [ -n "$def_ref" ] || return 0
   # origin is shared: housekeeping writes to it only for a person whose own
@@ -1186,7 +1190,7 @@ _hk_branch_sweep() {
   fi
   while IFS= read -r b; do
     [ -n "$b" ] || continue
-    jig_branch_is_jigs "$b" || continue
+    jig_branch_deletable "$b" || continue
     ! jig_has_line "$b" "$keep" || continue
     ! jig_branch_checked_out "$b" || continue
     landed=0
@@ -1861,8 +1865,12 @@ _hk_log_trim() {
   pre=1
   case "$(head -n 1 "$log" 2>/dev/null)" in '--- run '*) pre=0 ;; esac
   tmp="$log.trim"
+  # The C locale goes through env, never as `LC_ALL=C awk` here: bash would
+  # restore its own locale after the command, which crashes Homebrew's bash on
+  # macOS now and then (conventions/shell.md).
+  # shellcheck disable=SC2016 # the program is awk's, run by env
   if JIG_HK_FIRST=$((runs + pre - $(_hk_log_keep_runs) + 1)) JIG_HK_OUT=$(_hk_log_keep_output) \
-    JIG_HK_PRE="$pre" LC_ALL=C awk '
+    JIG_HK_PRE="$pre" env LC_ALL=C awk '
     function flush() {
       if (over > 0) printf "housekeeping: log trimmed: %d more lines of output in this run dropped\n", over
       out = 0; over = 0

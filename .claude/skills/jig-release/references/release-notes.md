@@ -11,7 +11,7 @@ changes from git, not from memory:
 git log --first-parent --merges <last-tag>..HEAD
 ```
 
-A pull request's title and body are claims; its diff is what happened (`gh pr diff <n>` or
+A pull request's title and body are claims; its diff is what happened (`jig gh pr diff <n>` or
 `git show`). Every line below is checked against the diff.
 
 - **Claims.** Each changelog line says what a user notices, and the diff shows it. Leave out

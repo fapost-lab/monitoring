@@ -7,7 +7,7 @@ its decisions are knowledge, the first tasks start without an architecture, rule
 ## Read
 
 `spec.md` — Idea, Goal and problem, Decisions, Scope — and `architecture.md` and `stack.md`
-when the spec has them. Carry **decisions** only. The roadmap, open questions and untested
+when the spec has them. Carry **decisions** only. The roadmap, open questions, what was set aside and untested
 assumptions stay in the spec: they are plans, and the spec lives until its roadmap is done.
 
 ## Route

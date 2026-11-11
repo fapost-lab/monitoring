@@ -140,7 +140,7 @@ _init_place_if_absent() {
 # ownership of a file it did not install.
 _init_copy_framework_file() {
   local src="$1" dest="$2" rel
-  rel=$(jig_relpath "$dest" "$JIG_PROJECT")
+  jig_relpath_v rel "$dest" "$JIG_PROJECT"
   if [ -f "$dest" ]; then
     # `cmp -s` rather than comparing two `jig_hash` calls: the question is
     # "are these bytes identical", which needs no hash, and `git hash-object`
@@ -213,9 +213,19 @@ _init_install_skill_staged() {
 # _init_copy_framework_file.
 _init_place_symlink() {
   local target_abs="$1" link_abs="$2" dry_run="${3:-0}" rel target_rel current
-  rel=$(jig_relpath "$link_abs" "$JIG_PROJECT")
-  target_rel=$(jig_relpath_from "$(dirname "$link_abs")" "$target_abs")
+  # Asked for every link of the install on every `jig status` and `jig verify`
+  # (upgrade_pending), so the paths are worked out without a process
+  # (convention-shell, `<name>_v`).
+  jig_relpath_v rel "$link_abs" "$JIG_PROJECT"
+  jig_relpath_from_v target_rel "${link_abs%/*}" "$target_abs"
   if [ -L "$link_abs" ]; then
+    # A link that is a directory, and the very directory it should point at,
+    # is ours whatever its text reads: the test asks the file system and
+    # starts nothing. Any other link is read.
+    if [ -d "$link_abs" ] && [ "$link_abs" -ef "$target_abs" ]; then
+      kept_count=$((kept_count + 1))
+      return 0
+    fi
     current=$(readlink "$link_abs")
     # The text is the fast answer, not the only one: Cygwin reads a relative
     # link back through a different spelling of the same directory (an 8.3
@@ -526,7 +536,7 @@ cmd_init() {
     for skill_dir in "$source"/skills/*/; do
       [ -d "$skill_dir" ] || continue
       skill_dir="${skill_dir%/}"
-      sname=$(basename "$skill_dir")
+      sname=${skill_dir##*/}
       for a in $adapters_words; do
         sdir=$("adapter_${a}_skills_dir")
         mkdir -p "$JIG_PROJECT/$sdir"

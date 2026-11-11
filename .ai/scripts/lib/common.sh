@@ -1226,7 +1226,9 @@ esac
 # not end up there.
 # Bounded by hand for ADR-0002, as jig_ls_remote_tags is (conventions/shell.md).
 jig_net() {
-  local now left out err pid rc=0 ticks=0
+  local now left out err pid rc=0 ticks=0 name="$1"
+  # jig_gh is gh under this clone's account; a reader knows the program.
+  [ "$name" != jig_gh ] || name=gh
   if [ -z "$_JIG_NET_DEADLINE" ]; then
     "$@"
     return
@@ -1235,21 +1237,25 @@ jig_net() {
   left=$((_JIG_NET_DEADLINE - now))
   [ "$left" -le "$_JIG_NET_CALL" ] || left=$_JIG_NET_CALL
   if [ "$left" -le 0 ]; then
-    printf '%s: not started, no time left for the network under the lock\n' "$1" >&2
+    printf '%s: not started, no time left for the network under the lock\n' "$name" >&2
     return 124
   fi
   out=$(mktemp "${TMPDIR:-/tmp}/jig-net.XXXXXX") || return 1
   jig_cleanup_add "$out"
   err="$out.err"
   jig_cleanup_add "$err"
-  "$@" >"$out" 2>"$err" </dev/null &
+  if [ "$1" = jig_gh ]; then
+    _JIG_GH_IN_NET=1 "$@" >"$out" 2>"$err" </dev/null &
+  else
+    "$@" >"$out" 2>"$err" </dev/null &
+  fi
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$ticks" -ge $((left * 5)) ]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
       rm -f "$out" "$err"
-      printf '%s: no answer within %ss; cut off\n' "$1" "$left" >&2
+      printf '%s: no answer within %ss; cut off\n' "$name" "$left" >&2
       return 124
     fi
     sleep 0.2
@@ -1409,6 +1415,327 @@ _jig_ssh_alias_hostname() {
   [ -n "$host" ] || return 0
   command -v ssh >/dev/null 2>&1 || return 0
   ssh -G "$host" </dev/null 2>/dev/null | sed -n 's/^hostname //p' || true
+}
+
+# --- the GitHub account of this clone -----------------------------------------
+#
+# A person may hold several accounts in `gh`, and `gh` answers as the active
+# one, which is a setting of the whole machine: in a clone that belongs to the
+# other account every pull-request call failed, and the agent stopped to ask
+# for `gh auth switch`. Jig never switches (another session may be working
+# under the active account); it names the account of this clone and hands
+# that account's own token to each `gh` call, for that call only
+# (adr-20261110-a-clone-names-its-github-account). `jig_gh` is the one way a
+# script calls `gh` about the project's repository; `jig pr` keeps its own
+# choice of account, made per pull request (lib/pr.sh).
+
+# jig_gh_dotcom_kind <host> — exit 0 for a host gh reads GH_TOKEN/GITHUB_TOKEN
+# for: github.com and GitHub's tenancy hosts (*.ghe.com); any other host is a
+# GitHub Enterprise Server, read from GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN.
+jig_gh_dotcom_kind() {
+  case "$1" in
+    github.com | *.ghe.com) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# jig_gh_accounts <host> — "<accounts><TAB><active>": the logins `gh` holds for
+# <host> that are signed in, space-separated, and the active one. Read from
+# `gh auth status`, whose exit status is ignored: it fails as a whole when one
+# account is broken, and the others still count. An older gh that names one
+# account (`Logged in to <host> as <login>`) and no active line makes that one
+# active.
+jig_gh_accounts() {
+  local out
+  out=$(jig_net gh auth status --hostname "$1" 2>&1) || true
+  printf '%s\n' "$out" | awk '
+    /Logged in to / && !/Failed/ {
+      login = ""
+      for (i = 1; i < NF; i++) if ($i == "account" || $i == "as") { login = $(i + 1); break }
+      gsub(/[()]/, "", login)
+      if (login != "") { n++; names = names (names == "" ? "" : " ") login; last = login }
+      next
+    }
+    /Active account: true/ { if (last != "") active = last }
+    END {
+      if (active == "" && n == 1) active = last
+      printf "%s\t%s\n", names, active
+    }'
+}
+
+# jig_gh_stored_token <host> <login> — the token gh keeps for <login> on
+# <host>, asked with every token variable unset so that gh answers for the
+# stored account (`gh auth token --user`, gh 2.40 and later).
+jig_gh_stored_token() {
+  local t
+  # Not through jig_net: this reads gh's own store, not the network, and
+  # jig_net keeps a call's output in a file while it waits — a token would
+  # lie on disk there.
+  t=$(
+    unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+    gh auth token --hostname "$1" --user "$2" 2>/dev/null </dev/null
+  ) || return 1
+  t=$(printf '%s' "$t" | tr -d '\r\n')
+  [ -n "$t" ] || return 1
+  printf '%s\n' "$t"
+}
+
+# jig_gh_token_env <host> — the token variables set in this environment that
+# gh would use for <host> instead of any stored account.
+jig_gh_token_env() {
+  local names="" v
+  if jig_gh_dotcom_kind "$1"; then
+    for v in GH_TOKEN GITHUB_TOKEN; do
+      eval "[ -z \"\${$v:-}\" ]" || names="$names${names:+ }$v"
+    done
+  else
+    for v in GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+      eval "[ -z \"\${$v:-}\" ]" || names="$names${names:+ }$v"
+    done
+  fi
+  printf '%s\n' "$names"
+}
+
+# What jig_gh_resolve found. _JIG_GH_HOW says where the account came from:
+# `config` (github.account), `detected` (the one account that may push),
+# `only` (the one account gh holds), `env` (a token in the environment) or
+# `gh` (gh's own choice: nothing here names an account). _JIG_GH_TOKEN is
+# empty for `env` and `gh`, where gh is run as it is.
+_JIG_GH_STATE="" _JIG_GH_HOST="" _JIG_GH_SLUG="" _JIG_GH_ORIGIN=""
+_JIG_GH_LOGIN="" _JIG_GH_HOW="" _JIG_GH_TOKEN="" _JIG_GH_WHY=""
+
+# _jig_gh_origin — sets _JIG_GH_ORIGIN, _JIG_GH_HOST and _JIG_GH_SLUG
+# (`owner/repo`) from the origin URL: https, ssh:// or scp form, `.git` or
+# not. A host that does not name GitHub is taken for an SSH alias and resolved
+# (_jig_ssh_alias_hostname); `ssh.github.com`, GitHub's SSH endpoint on port
+# 443, is github.com. Exit 1 when origin is missing or names no repository.
+_jig_gh_origin() {
+  local url h path alias
+  url=$(git -C "$JIG_PROJECT" remote get-url origin 2>/dev/null) || return 1
+  [ -n "$url" ] || return 1
+  case "$url" in
+    *://*)
+      path=${url#*://}
+      h=${path%%/*}
+      path=${path#*/}
+      h=${h#*@}
+      h=${h%%:*}
+      ;;
+    *:*)
+      h=${url%%:*}
+      case "$h" in */*) return 1 ;; esac
+      h=${h#*@}
+      path=${url#*:}
+      ;;
+    *) return 1 ;;
+  esac
+  path=${path#/}
+  path=${path%/}
+  path=${path%.git}
+  case "$path" in
+    */*/* | /* | */ ) return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+  esac
+  h=$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')
+  if [ "$(_jig_forge_by_name "$h")" != github ]; then
+    alias=$(_jig_ssh_alias_hostname "$url")
+    [ -z "$alias" ] || h=$(printf '%s' "$alias" | tr '[:upper:]' '[:lower:]')
+  fi
+  [ "$h" != ssh.github.com ] || h=github.com
+  [ -n "$h" ] || return 1
+  _JIG_GH_ORIGIN="$url" _JIG_GH_HOST="$h" _JIG_GH_SLUG="$path"
+}
+
+# jig_gh_memo_file — where a detected account is remembered: one line,
+# `<origin url><TAB><login><TAB><how>`. Never a token.
+# One per clone, in the main checkout's runtime directory: a task worktree
+# asks GitHub as the same account its clone does, and finds it already known.
+jig_gh_memo_file() { printf '%s/%s/runtime/gh-account\n' "$(jig_config_clone_root)" "$JIG_AI_DIR"; }
+
+# _jig_gh_memo_write <login> <how>
+_jig_gh_memo_write() {
+  local f tmp
+  f=$(jig_gh_memo_file)
+  mkdir -p "${f%/*}" 2>/dev/null || return 0
+  tmp="$f.$$"
+  if printf '%s\t%s\t%s\n' "$_JIG_GH_ORIGIN" "$1" "$2" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# _jig_gh_may_push <token> — exit 0 when the account of <token> may write to
+# the origin repository: push, maintain or admin.
+_jig_gh_may_push() {
+  local out
+  out=$(
+    _jig_gh_token_export "$1"
+    jig_net gh api --hostname "$_JIG_GH_HOST" "repos/$_JIG_GH_SLUG" \
+      --jq '[.permissions.push, .permissions.maintain, .permissions.admin] | map(tostring) | join(" ")' 2>/dev/null
+  ) || return 1
+  case " $(printf '%s' "$out" | tr -d '\r') " in
+    *" true "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _jig_gh_token_export <token> — make <token> the one gh uses for
+# _JIG_GH_HOST in this shell: every token variable unset, the host's own set.
+# Only ever called in a subshell or in a job gh is about to replace.
+# shellcheck disable=SC2030,SC2031 # the change is meant for that shell only
+_jig_gh_token_export() {
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+  if jig_gh_dotcom_kind "$_JIG_GH_HOST"; then
+    GH_TOKEN="$1"
+    export GH_TOKEN
+  else
+    GH_ENTERPRISE_TOKEN="$1"
+    export GH_ENTERPRISE_TOKEN
+  fi
+}
+
+# jig_gh_resolve — name the account of this clone, once per process. The
+# first that answers:
+#   1. a token in the environment: gh is run as it is, as CI and a person's
+#      own shell set it up;
+#   2. `github.account` (local only): that account's stored token, and a
+#      refusal when gh holds no such account or gives no token for it — never
+#      a quiet fall back to the active one;
+#   3. the account remembered for this origin, while gh still gives its token;
+#   4. the one account gh holds;
+#   5. of several, the only one that may push to the origin repository, or
+#      the active one when several may; a refusal when several may and the
+#      active one is not among them. None that may push (a fork's upstream, a
+#      public repository) leaves gh to its own choice.
+# Exit 1 with _JIG_GH_WHY on a refusal; a caller that only reads may go on
+# with gh as it is.
+jig_gh_resolve() {
+  local want accounts="" active="" a t n=0 writers="" first_t="" memo_origin="" memo_login="" memo_how="" tab
+  case "$_JIG_GH_STATE" in
+    ready) return 0 ;;
+    refused) return 1 ;;
+  esac
+  _JIG_GH_STATE=ready _JIG_GH_LOGIN="" _JIG_GH_HOW=gh _JIG_GH_TOKEN="" _JIG_GH_WHY=""
+  _jig_gh_origin || return 0
+  if [ -n "$(jig_gh_token_env "$_JIG_GH_HOST")" ]; then
+    _JIG_GH_HOW="env"
+    return 0
+  fi
+  want=$(cfg github.account "")
+  if [ -n "$want" ]; then
+    if t=$(jig_gh_stored_token "$_JIG_GH_HOST" "$want"); then
+      _JIG_GH_LOGIN="$want" _JIG_GH_HOW=config _JIG_GH_TOKEN="$t"
+      return 0
+    fi
+    tab=$(printf '\t')
+    IFS="$tab" read -r accounts active <<EOF
+$(jig_gh_accounts "$_JIG_GH_HOST")
+EOF
+    _JIG_GH_STATE=refused
+    _JIG_GH_WHY="github.account is $want, and gh gives no token for it on $_JIG_GH_HOST (accounts gh holds: ${accounts:-none}; gh auth login --hostname $_JIG_GH_HOST, or jig config set --local github.account <login>; gh auth token --user needs gh 2.40 or later)"
+    return 1
+  fi
+  tab=$(printf '\t')
+  if [ -f "$(jig_gh_memo_file)" ]; then
+    IFS="$tab" read -r memo_origin memo_login memo_how < "$(jig_gh_memo_file)" || true
+    if [ "$memo_origin" = "$_JIG_GH_ORIGIN" ] && [ -n "$memo_login" ] \
+       && t=$(jig_gh_stored_token "$_JIG_GH_HOST" "$memo_login"); then
+      _JIG_GH_LOGIN="$memo_login" _JIG_GH_HOW="${memo_how:-detected}" _JIG_GH_TOKEN="$t"
+      return 0
+    fi
+  fi
+  IFS="$tab" read -r accounts active <<EOF
+$(jig_gh_accounts "$_JIG_GH_HOST")
+EOF
+  [ -n "$accounts" ] || return 0
+  set -f
+  # shellcheck disable=SC2086 # logins, split on purpose
+  set -- $accounts
+  set +f
+  if [ $# = 1 ]; then
+    t=$(jig_gh_stored_token "$_JIG_GH_HOST" "$1") || return 0
+    _JIG_GH_LOGIN="$1" _JIG_GH_HOW=only _JIG_GH_TOKEN="$t"
+    _jig_gh_memo_write "$1" only
+    return 0
+  fi
+  for a in "$@"; do
+    t=$(jig_gh_stored_token "$_JIG_GH_HOST" "$a") || continue
+    _jig_gh_may_push "$t" || continue
+    n=$((n + 1))
+    writers="$writers${writers:+ }$a"
+    [ -n "$first_t" ] || first_t="$t"
+    if [ "$a" = "$active" ]; then
+      _JIG_GH_LOGIN="$a" _JIG_GH_TOKEN="$t"
+    fi
+  done
+  if [ "$n" = 0 ]; then
+    return 0
+  elif [ "$n" = 1 ]; then
+    _JIG_GH_LOGIN="$writers" _JIG_GH_TOKEN="$first_t"
+  elif [ -z "$_JIG_GH_LOGIN" ]; then
+    _JIG_GH_STATE=refused
+    _JIG_GH_WHY="several gh accounts may push to $_JIG_GH_SLUG ($writers) and the active one (${active:-none}) is not among them; name this clone's: jig config set --local github.account <login>"
+    return 1
+  fi
+  _JIG_GH_HOW=detected
+  _jig_gh_memo_write "$_JIG_GH_LOGIN" detected
+  return 0
+}
+
+# jig_gh_require <who> — jig_gh_resolve, or die with why: for a command that
+# writes to GitHub and must not do it under an account nobody named. Called in
+# the command's own shell, before the first `$(jig_gh ...)`, so that the
+# answer is found once and a refusal is not lost in a subshell.
+jig_gh_require() {
+  jig_gh_resolve || jig_die "$1: $_JIG_GH_WHY"
+}
+
+# jig_ship_account <who> <level> — before a ship's push: when this ship will
+# open a pull request on GitHub (<level> pr or merge), name the account it is
+# opened as, or refuse with nothing sent
+# (adr-20260925-a-ship-refuses-before-it-sends). After the commit and the
+# "does this branch carry work" answer, not before: a ship that refuses for a
+# reason of its own must not have asked the forge anything, and the commit
+# stays on this machine, where running the ship again finds it. Lower levels
+# ask GitHub nothing and are not held up by its accounts.
+jig_ship_account() {
+  case "$2" in
+    pr | merge) ;;
+    *) return 0 ;;
+  esac
+  [ "$(jig_forge_kind 2>/dev/null)" = github ] || return 0
+  jig_gh_resolve || jig_die "$1: $_JIG_GH_WHY
+Nothing was sent; the commit is on this machine, and running this again goes on from it."
+}
+
+# jig_gh_prepare <who> — the same for a command that only reads: a refusal is
+# a warning, and gh is then run as it is.
+jig_gh_prepare() {
+  jig_gh_resolve || jig_warn "$1: $_JIG_GH_WHY; asking GitHub as gh's active account"
+}
+
+# jig_gh <args>... — `gh <args>` as the account of this clone. With a token
+# in hand, every token variable is unset in a subshell and the host's own
+# (GH_TOKEN for github.com and *.ghe.com, GH_ENTERPRISE_TOKEN for a GitHub
+# Enterprise Server) set to it, for this call only: a token is never an
+# argument, where ps would show it, and never written down; the active account
+# and gh's configuration stay as they are.
+jig_gh() {
+  jig_gh_resolve || true
+  # Under jig_net this function is the background job itself: gh must replace
+  # it, not run as its child, or the kill that cuts a silent call off would
+  # reach the wrapper and leave gh running — a `gh pr create` reported as cut
+  # off that opens the pull request anyway.
+  if [ -n "${_JIG_GH_IN_NET:-}" ]; then
+    [ -z "$_JIG_GH_TOKEN" ] || _jig_gh_token_export "$_JIG_GH_TOKEN"
+    exec gh "$@"
+  fi
+  (
+    [ -z "$_JIG_GH_TOKEN" ] || _jig_gh_token_export "$_JIG_GH_TOKEN"
+    exec gh "$@"
+  )
 }
 
 # jig_forge_kind — which forge CLI this checkout should use: cfg `forge`
@@ -1774,7 +2101,10 @@ jig_ship_pr() {
     body_file="$_JIG_SHIP_BODY_TMP"
   fi
   case "$kind" in
-    github) _jig_ship_pr_github "$who" "$head" "$base" "$title" "$body_file" "$draft" ;;
+    github)
+      jig_gh_require "$who"
+      _jig_ship_pr_github "$who" "$head" "$base" "$title" "$body_file" "$draft"
+      ;;
     gitlab) _jig_ship_pr_gitlab "$who" "$head" "$base" "$title" "$body_file" "$draft" ;;
   esac
 }
@@ -1785,7 +2115,7 @@ _jig_ship_pr_github() {
   local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" url out
   local extra=""
   [ "$draft" != 1 ] || extra="--draft"
-  url=$(jig_net gh pr list --head "$head" --state open --json url --jq '.[0].url' 2>/dev/null || printf '')
+  url=$(jig_net jig_gh pr list --head "$head" --state open --json url --jq '.[0].url' 2>/dev/null || printf '')
   case "$url" in '' | null) url="" ;; esac
   if [ -n "$url" ]; then
     JIG_SHIP_URL="$url"
@@ -1793,7 +2123,7 @@ _jig_ship_pr_github() {
     return 0
   fi
   # shellcheck disable=SC2086 # $extra is one flag or nothing
-  out=$(jig_net gh pr create --base "$base" --head "$head" --title "$title" --body-file "$body_file" $extra 2>&1) \
+  out=$(jig_net jig_gh pr create --base "$base" --head "$head" --title "$title" --body-file "$body_file" $extra 2>&1) \
     || jig_die "$who: gh pr create failed:
 $out"
   url=$(printf '%s\n' "$out" | tail -n 1)
@@ -1878,7 +2208,10 @@ jig_ship_merge() {
     return 0
   fi
   case "$kind" in
-    github) _jig_ship_merge_github "$url" "$sha" "$policy" "$timeout" ;;
+    github)
+      jig_gh_require "merge"
+      _jig_ship_merge_github "$url" "$sha" "$policy" "$timeout"
+      ;;
     gitlab) _jig_ship_merge_gitlab "$url" "$sha" "$policy" "$timeout" ;;
   esac
 }
@@ -1945,7 +2278,7 @@ _jig_ship_first_line() {
 # failed. An error reading them reads as no checks, never as passed.
 _jig_ship_checks_github() {
   local out
-  out=$(gh pr checks "$1" --json bucket --jq '.[].bucket' 2>/dev/null) || true
+  out=$(jig_gh pr checks "$1" --json bucket --jq '.[].bucket' 2>/dev/null) || true
   printf '%s\n' "$out" | awk '
     $1 == "pass" { p++ }
     $1 == "fail" || $1 == "cancel" { f++ }
@@ -1957,7 +2290,7 @@ _jig_ship_checks_github() {
 # shellcheck disable=SC2034 # JIG_SHIP_MERGED is read by the caller
 _jig_ship_merge_github() {
   local url="$1" sha="$2" policy="$3" timeout="$4" view draft="" head="" allowed m="" s="" r="" method state out
-  if ! view=$(gh pr view "$url" --json isDraft,headRefOid --jq '"\(.isDraft) \(.headRefOid)"' 2>/dev/null); then
+  if ! view=$(jig_gh pr view "$url" --json isDraft,headRefOid --jq '"\(.isDraft) \(.headRefOid)"' 2>/dev/null); then
     printf 'not merged: could not read the pull request\n'
     return 0
   fi
@@ -1972,7 +2305,7 @@ EOF
     printf 'not merged: the pull request is at %s, not at the shipped %s\n' "${head:-an unknown commit}" "$sha"
     return 0
   fi
-  allowed=$(gh repo view --json mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed \
+  allowed=$(jig_gh repo view --json mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed \
     --jq '"\(.mergeCommitAllowed) \(.squashMergeAllowed) \(.rebaseMergeAllowed)"' 2>/dev/null) || allowed=""
   read -r m s r <<EOF
 $allowed
@@ -1998,7 +2331,7 @@ EOF
     printf 'not merged: %s\n' "$(_jig_ship_ci_reason "$state" "$timeout")"
     return 0
   fi
-  if ! out=$(gh pr merge "$url" --match-head-commit "$sha" "--$method" 2>&1); then
+  if ! out=$(jig_gh pr merge "$url" --match-head-commit "$sha" "--$method" 2>&1); then
     printf 'not merged: the forge refused: %s\n' "$(_jig_ship_first_line "$out")"
     return 0
   fi
@@ -2122,7 +2455,10 @@ jig_pr_state() {
   [ -n "$url" ] || { printf 'unknown\n'; return 0; }
   kind=$(jig_forge_kind) || exit 1
   case "$kind" in
-    github) _jig_pr_state_github "$url" ;;
+    github)
+      jig_gh_prepare "pull request state"
+      _jig_pr_state_github "$url"
+      ;;
     gitlab) _jig_pr_state_gitlab "$url" ;;
     *) printf 'unknown\n' ;;
   esac
@@ -2130,7 +2466,7 @@ jig_pr_state() {
 
 _jig_pr_state_github() {
   local state
-  state=$(jig_net gh pr view "$1" --json state --jq .state 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  state=$(jig_net jig_gh pr view "$1" --json state --jq .state 2>/dev/null) || { printf 'unknown\n'; return 0; }
   case "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" in
     merged) printf 'merged\n' ;;
     open) printf 'open\n' ;;
@@ -2202,6 +2538,105 @@ jig_branch_is_jigs() {
   jig_valid_id "$mid"
 }
 
+# jig_branch_deletable <branch> — exit 0 when <branch> is Jig's to delete once
+# its work has landed: a name jig_branch_is_jigs calls Jig's, or, under a
+# `git.branch_template` with nothing before `{id}`, a branch a task record says
+# Jig made (jig_branch_recorded). Asked by the three sites that delete —
+# _hk_branch_sweep, jig_branch_leave, jig_ship_leave — and by nothing else:
+# jig_branch_is_jigs keeps its meaning for the readers that want upgrade
+# branches only (adr-20261007-a-merged-branch-leaves-with-its-work, amended
+# 2026-11-09).
+jig_branch_deletable() {
+  local template
+  jig_branch_is_jigs "$1" && return 0
+  # Never the base branch, whatever a record says.
+  [ "$1" != "$(cfg git.base_branch main)" ] || return 1
+  template=$(cfg git.branch_template "task/{id}")
+  case "$template" in
+    '{id}'*) ;;
+    *) return 1 ;;
+  esac
+  # Under git.branch_per_task: false Jig cuts no branch: `task start` records
+  # the one the person is on, and a task named after it — PROJ-123 started on
+  # the person's own PROJ-123 — would pass the name check. No record vouches
+  # for a branch there.
+  cfg_bool git.branch_per_task true || return 1
+  jig_branch_recorded "$1"
+}
+
+# The branches task records name as Jig's, one per line, read once per process
+# by jig_branch_recorded; _JIG_RECORDED_READ=0 asks for a fresh read, as the
+# sweep does after its run moved workspaces to trash.
+_JIG_RECORDED_BRANCHES=""
+_JIG_RECORDED_READ=0
+
+# jig_branch_recorded <branch> — exit 0 when a task's `state`, in the workspace
+# or in trash under any date, records <branch> as the task's branch, and
+# <branch> is the name `git.branch_template` gives that record's own id. Only
+# `task start` writes `branch:`, and it refuses a branch that already exists,
+# so the record names a branch Jig cut — except under `git.branch_per_task:
+# false`, where it records the branch the person was on, which is why
+# jig_branch_deletable does not ask here in that mode. The name check keeps out
+# a record of a branch other than the task's own. A trash directory may carry
+# a `-<n>` suffix (jig_trash_dest), so there its name is tried without it too.
+# A name that is not a valid id never counts (RULES.md). The state is read
+# with awk, not task.sh's reader: common.sh is loaded where task.sh is not.
+jig_branch_recorded() {
+  local b="$1" template suffix ai where dir branch id tail
+  [ -n "$b" ] || return 1
+  if [ "$_JIG_RECORDED_READ" != 1 ]; then
+    _JIG_RECORDED_BRANCHES=""
+    template=$(cfg git.branch_template "task/{id}")
+    suffix=""
+    case "$template" in
+      *'{id}'*) suffix=${template#*'{id}'} ;;
+    esac
+    ai="$JIG_PROJECT/$JIG_AI_DIR"
+    while IFS="$(printf '\t')" read -r where dir branch; do
+      [ -n "$dir" ] && [ -n "$branch" ] || continue
+      for id in "$dir" "-"; do
+        if [ "$id" = "-" ]; then
+          # The trash's collision suffix: `<id>-<n>`, digits only.
+          [ "$where" = trash ] || continue
+          tail=${dir##*-}
+          case "$tail" in
+            '' | *[!0-9]*) continue ;;
+          esac
+          [ "$tail" != "$dir" ] || continue
+          id=${dir%-*}
+        fi
+        jig_valid_id "$id" || continue
+        if [ "$branch" = "$id$suffix" ]; then
+          _JIG_RECORDED_BRANCHES="$_JIG_RECORDED_BRANCHES$branch
+"
+          break
+        fi
+      done
+    done < <(_jig_state_branches "$ai")
+    _JIG_RECORDED_READ=1
+  fi
+  jig_has_line "$b" "$_JIG_RECORDED_BRANCHES"
+}
+
+# _jig_state_branches <ai-dir> — one line per task state that records a
+# branch: `<workspace|trash><TAB><directory name><TAB><branch>`. A function of
+# its own so the process substitution that reads it holds a single call:
+# bash 3.2 re-parses the text of a process substitution when it runs it, and
+# trips over a case pattern or a quote in a comment there.
+_jig_state_branches() {
+  local ai="$1" f where
+  for f in "$ai"/workspace/tasks/*/state "$ai"/runtime/trash/*/*/state; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      "$ai"/runtime/trash/*) where=trash ;;
+      *) where=workspace ;;
+    esac
+    awk -v w="$where" -v d="$(basename "$(dirname "$f")")" '
+      /^branch:/ { v = $0; sub(/^branch:[ \t]*/, "", v); sub(/[ \t\r]+$/, "", v); print w "\t" d "\t" v; exit }
+    ' "$f" 2>/dev/null || true
+  done
+}
+
 # jig_branch_checked_out <branch> — exit 0 when <branch> is checked out in any
 # worktree of this clone, this checkout included; also when git cannot list
 # them: an unanswered question keeps the branch.
@@ -2243,7 +2678,7 @@ jig_branch_checked_out() {
 jig_branch_leave() {
   local who="$1" b="$2" sha="$3" merged="${4-$3}" out tip
   cfg_bool git.delete_merged_branches true || return 0
-  jig_branch_is_jigs "$b" || return 0
+  jig_branch_deletable "$b" || return 0
   if jig_branch_checked_out "$b"; then
     printf '%s: kept branch %s: it is checked out in a worktree\n' "$who" "$b"
     return 0
@@ -2335,7 +2770,7 @@ jig_ship_leave() {
   JIG_SHIP_BACK_ON=""
   [ "$JIG_SHIP_MERGED" = 1 ] || return 0
   cfg_bool git.delete_merged_branches true || return 0
-  jig_branch_is_jigs "$b" || return 0
+  jig_branch_deletable "$b" || return 0
   [ "$b" != "$base" ] || return 0
   cur=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
   if [ "$cur" = "$b" ]; then
@@ -3651,22 +4086,39 @@ jig_hash_list() {
 # computation, no filesystem access, so it also works for symlink targets that
 # do not exist yet.
 jig_relpath_from() {
-  awk -v from="$1" -v to="$2" '
-    BEGIN {
-      n1 = split(from, a, "/")
-      n2 = split(to, b, "/")
-      i = 1
-      while (i <= n1 && i <= n2 && a[i] == b[i]) i++
-      up = ""
-      for (j = i; j <= n1; j++) if (a[j] != "") up = up "../"
-      down = ""
-      for (j = i; j <= n2; j++) if (b[j] != "") down = down b[j] "/"
-      result = up down
-      sub(/\/$/, "", result)
-      if (result == "") result = "."
-      print result
-    }
-  '
+  local __rfp_out
+  jig_relpath_from_v __rfp_out "$1" "$2"
+  printf '%s\n' "$__rfp_out"
+}
+
+# jig_relpath_from_v <var> <from> <to> — jig_relpath_from's answer into <var>,
+# without a process: asked for every link of a link-mode install, on every
+# `jig status` (convention-shell, `<name>_v`). Both paths are walked one
+# `/`-separated component at a time: the shared leading ones are dropped, each
+# one left of <from> is a `..`, and what is left of <to> follows. An empty
+# component (a doubled or trailing `/`) is compared like any other and never
+# printed.
+jig_relpath_from_v() {
+  local __rf_a="$2" __rf_b="$3" __rf_x __rf_up="" __rf_down="" __rf_am=1 __rf_bm=1
+  [ -n "$__rf_a" ] || __rf_am=0
+  [ -n "$__rf_b" ] || __rf_bm=0
+  while [ "$__rf_am" = 1 ] && [ "$__rf_bm" = 1 ] && [ "${__rf_a%%/*}" = "${__rf_b%%/*}" ]; do
+    case "$__rf_a" in */*) __rf_a=${__rf_a#*/} ;; *) __rf_am=0 ;; esac
+    case "$__rf_b" in */*) __rf_b=${__rf_b#*/} ;; *) __rf_bm=0 ;; esac
+  done
+  while [ "$__rf_am" = 1 ]; do
+    [ -z "${__rf_a%%/*}" ] || __rf_up="$__rf_up../"
+    case "$__rf_a" in */*) __rf_a=${__rf_a#*/} ;; *) __rf_am=0 ;; esac
+  done
+  while [ "$__rf_bm" = 1 ]; do
+    __rf_x=${__rf_b%%/*}
+    [ -z "$__rf_x" ] || __rf_down="$__rf_down$__rf_x/"
+    case "$__rf_b" in */*) __rf_b=${__rf_b#*/} ;; *) __rf_bm=0 ;; esac
+  done
+  __rf_x="$__rf_up$__rf_down"
+  __rf_x=${__rf_x%/}
+  [ -n "$__rf_x" ] || __rf_x=.
+  printf -v "$1" '%s' "$__rf_x"
 }
 
 # jig_share_candidates <root> — the top-level directories of the checkout at
@@ -3715,10 +4167,18 @@ EOF
 
 # Path of <file> relative to <base>, both absolute. Pure string operation.
 jig_relpath() {
-  local base="${2%/}/" file="$1"
-  case "$file" in
-    "$base"*) printf '%s\n' "${file#"$base"}" ;;
-    *) printf '%s\n' "$file" ;;
+  local __rpp_out
+  jig_relpath_v __rpp_out "$1" "$2"
+  printf '%s\n' "$__rpp_out"
+}
+
+# jig_relpath_v <var> <file> <base> — jig_relpath's answer into <var>, without
+# a process: for a caller that asks it of every file it places.
+jig_relpath_v() {
+  local __rp_base="${3%/}/"
+  case "$2" in
+    "$__rp_base"*) printf -v "$1" '%s' "${2#"$__rp_base"}" ;;
+    *) printf -v "$1" '%s' "$2" ;;
   esac
 }
 
@@ -3795,7 +4255,10 @@ jig_git_change_rows() (
       printf '%s\t%s\n' "$path" "$layer" >> "$JIG_CHANGE_TMP/rows"
     done < "$JIG_CHANGE_TMP/paths"
   done
-  LC_ALL=C sort -u "$JIG_CHANGE_TMP/rows"
+  # Through env, never `LC_ALL=C sort` as a statement: bash would restore its
+  # own locale afterwards, which crashes Homebrew's bash on macOS in a forked
+  # shell such as this one (conventions/shell.md).
+  env LC_ALL=C sort -u "$JIG_CHANGE_TMP/rows"
 )
 
 # --- the verify run record, read ---------------------------------------------

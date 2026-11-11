@@ -157,6 +157,13 @@ their own file is answered by `config unset` too — say that the key then answe
     `notify hook (claude)` and the file as it would be, and write it only after their yes — Jig
     itself never edits that file. Codex has no such hook; say so instead.
 
+16. **GitHub account** (`github.account`) — only when `gh auth status` names more than one
+    account for the project's host. Run `.ai/scripts/jig gh api user --jq .login` first: it
+    prints the login Jig asks GitHub as from this clone — the one account that may push here —
+    or refuses because several may. "Which of your GitHub accounts is this project's?" With an
+    answer that is the login it printed, nothing needs writing; say so. Otherwise write the
+    login they name. Never run `gh auth switch`, and never ask them to.
+
 Two timings are left out of the questions: how long a record of work in a checkout counts as a
 live session (`checkout.busy_ttl`, 12h) and how long a running `jig verify` holds the clone
 (`verify.busy_ttl`, 30m). Set one only when the person brings it up — a test suite that runs

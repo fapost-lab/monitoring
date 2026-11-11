@@ -89,8 +89,10 @@ In an unattended run there are no stops: §5. Otherwise, on a stop, record it, t
 
 A reason says **what you need from the human**, and nothing about the state of the task. It is
 read on a phone: when the person set up Telegram messages, `stop`, `approve`, `decide` and `end`
-send their `--reason` there as it is. One short sentence — what is needed, what was chosen, how it
-ended — never a log line like `repair limit reached`.
+send their `--reason` there as it is. `approve` and `decide` reach the pull request too: write those
+in English. `stop` and `end` reach only the person: write those in their language. One short
+sentence — what is needed, what was chosen, how it ended — never a log line like
+`repair limit reached`.
 It is written once and never rechecked, while the task moves on: a reason that reported
 "no pull request" or "verify has not been run" was still saying it hours after both had
 happened. The state the page derives itself, fresh, in the cards around the stop.
@@ -107,7 +109,8 @@ After the human answers, quote their answer:
 ```
 
 It resets the repair count: the human gave the run a new direction. The answer goes into the
-report, so never resume without one. Continue from the stage you stopped in.
+report as given, so never resume without one; in the pull request it gets an English gloss
+(§4). Continue from the stage you stopped in.
 
 ## 4. End
 
@@ -119,11 +122,14 @@ as the run's level allows. Then:
 .ai/scripts/jig task autopilot <id> report
 ```
 
-Hand back the pull request link (or "ready for your commit") and the report, and put the report
-in the pull request body when you write it. Its **Changed linked sources — need your review** block,
-when there is one, goes into the body as it is: a file a stub links was edited, and only a human
-approves the new text (`jig-accept`). It never stops the run. Closing the task after the merge stays as
-`jig-consolidate` §6 says.
+Hand back the pull request link (or "ready for your commit") and the report. The pull request
+body is short and in English: what changed and why, the review result, the verify result, and the
+report's blocks as they are — never its stage and repair lines, never a task artifact. Its
+**Changed linked sources — need your review** block, when there is one, goes into the body as it
+is: a file a stub links was edited, and only a human approves the new text (`jig-accept`). It never
+stops the run. A person's answer quoted in **Resumed on an answer** or **Taken over by a person**
+stays in their words; when it is not in English, add an English gloss after it. Closing the task
+after the merge stays as `jig-consolidate` §6 says.
 
 ## 5. Unattended: ask nothing
 
@@ -133,19 +139,19 @@ and on their phone as it happens, when they set up Telegram messages: one short 
 
 | Stop | Instead |
 |---|---|
-| The gate of a T3/T4 task, or a re-classification into one | Write the design as usual, then `jig task gate <id> approved --by agent`, `jig task autopilot <id> approve --reason "<what was approved>"`, and in `task.md` (`jig task artifact append <id> task --from -`): "Human gate — approved by the agent (unattended)". Put `design.md` verbatim in the pull request under `## Design — approved by the agent, not a human` |
+| The gate of a T3/T4 task, or a re-classification into one | Write the design as usual, then `jig task gate <id> approved --by agent`, `jig task autopilot <id> approve --reason "<what was approved>"`, and in `task.md` (`jig task artifact append <id> task --from -`): "Human gate — approved by the agent (unattended)". The approve reason, in English, says what was approved and names the ADR or knowledge holding the detail; it is the design's only trace in the pull request, which never carries `design.md` |
 | A decision nobody made | The most cautious option that is easiest to undo. `jig task autopilot <id> decide --reason "<what you chose, and why>"` |
 | A destructive operation | Never. Find another way or leave that part out, and say so with `decide --reason` |
-| `repair` exited 3 | The run ends unfinished: stage what there is and run `jig task ship <id> --message-file <file> --draft`. The body starts with `Not finished: <why>`. A draft is never merged; the run stays `stopped`, and the status page shows it waiting. `resume` is refused after the repair limit, including with `--by human`; a person who takes the task on is the one other ending (below) |
+| `repair` exited 3 | The run ends unfinished: stage what there is and run `jig task ship <id> --message-file <file> --draft`. The body starts with `Not finished: <why>`, in English like the rest of it. A draft is never merged; the run stays `stopped`, and the status page shows it waiting. `resume` is refused after the repair limit, including with `--by human`; a person who takes the task on is the one other ending (below) |
 | The class turns out lower | Lower it with `jig task set <id> class <Tn> --reason "<why>"`, except out of T3/T4 below T3: the script refuses that unattended, so keep the route. `end` comes after the knowledge decision, never to start a fresh run |
 
 If a person independently answers a run that is already `stopped` in an unattended clone,
 quote their actual answer and run `jig task autopilot <id> resume --answer "<their answer>" --by human`.
 This recovery is allowed only before the two-repair limit; it preserves the repair count, so a
 repair-limit stop still ends in a draft. Never invent the answer to resume yourself. The run
-stays unattended: if the design changed, approve the current T3/T4 gate with `--by agent` and
-show the design and the quoted answer in the pull request. A person's answer to one decision
-is not their approval of the whole design.
+stays unattended: if the design changed, approve the current T3/T4 gate with `--by agent`; the
+quoted answer goes in the pull request as given, with its English gloss (§4).
+A person's answer to one decision is not their approval of the whole design.
 
 **A person takes the task over.** When a person says they will finish the task, or tells you or
 the coordinator to go on with it without autopilot, at the repair limit or at any other stop, quote
@@ -160,8 +166,8 @@ If the design changed, show it as [show the document](../jig-task/references/sho
 says: whole when the approval it had was the agent's (`gate_by: agent`), the changed sections only
 when the person approved it before; then record their approval with `jig task gate <id> approved`.
 Then re-review, `jig verify`, consolidate and ship as for any task, at their `agent.git`. The
-report's **Taken over by a person** block goes in the pull request. Never hand over on your own, or
-without their words: a run nobody takes over ends in its draft.
+report's **Taken over by a person** block goes in the pull request, with its English gloss (§4).
+Never hand over on your own, or without their words: a run nobody takes over ends in its draft.
 
 What never changes: a P0/P1 is never dismissed, the gates are never worked around, and nothing
 is merged but by `task ship`. Before shipping, put `jig task autopilot <id> report`'s

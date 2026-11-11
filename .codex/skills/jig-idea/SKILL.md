@@ -3,14 +3,18 @@ name: jig-idea
 description: Stress-test an idea with the user and keep the result as a durable specification with phases and a roadmap under `.ai/specs/<id>/`. Use when an idea's shape is not settled yet, when work is too big for one task (tens of tasks, phases), when designing a future project's architecture and stack before any code exists, or when the user says "I have an idea", "poke holes in this", "write a spec", "build a roadmap", "continue the spec".
 ---
 
-# jig-idea — test the idea, keep the plan
+# jig-idea — grow the idea, then keep the plan
 
 A **specification** is the plan for a large piece of work: the idea as the human said it,
 what survived questioning, the decisions, and a roadmap of phases and items. Tasks are filed
 from it later — the next day, months later, or in a different repository.
 
-This skill talks and writes the specification. It never starts a task, never changes code,
-and writes nothing outside `.ai/specs/<id>/`. `jig-task` stays the one entry into task routes
+This skill talks first and writes second. The conversation is there to make the idea larger
+and sharper than it arrived — a round that only confirms what the human already said has
+done half the work — and nothing is written, committed or pushed until the human says the
+idea is ready to be written down (§7). Until then the conversation is kept in a **draft**
+that git never sees (§4). It never starts a task, never changes code, and writes nothing
+outside `.ai/specs/<id>/` and that draft. `jig-task` stays the one entry into task routes
 (ADR-0009); this skill works before it.
 
 A specification is not knowledge. `.ai/specs/` sits outside `.ai/knowledge/`, so
@@ -18,13 +22,21 @@ A specification is not knowledge. `.ai/specs/` sits outside `.ai/knowledge/`, so
 on today's code must not read tomorrow's plan as a description of the system. A spec has no
 status; progress is read from its roadmap.
 
-## 1. Open the specification
+## 1. Open the conversation
 
 ```
 .ai/scripts/jig spec list
+.ai/scripts/jig spec draft list
 ```
 
-- **Existing spec.** Before reading or touching anything, put it back on a branch of its own:
+- **A draft of this idea is listed.** An earlier conversation stopped before the yes. Read
+  the file `draft list` names, tell the human where it stopped, and go on from there.
+- **New idea.** Create no spec yet: no branch, no file under `.ai/specs/`. `jig spec new`
+  runs in §7, after the human's yes. Pick a short kebab-case working id for the draft; the
+  human may change it when the spec is written. Look at `git status` now: uncommitted
+  tracked changes will make `spec new` refuse then, and the human would rather hear that
+  before the conversation than after it.
+- **Existing spec.** Before reading anything, put it back on a branch of its own:
 
   ```
   .ai/scripts/jig spec resume <id>
@@ -35,102 +47,163 @@ status; progress is read from its roadmap.
   origin if only that has it, or cutting a fresh one otherwise. A spec with an open epic is
   edited on the epic instead; `spec resume` says so and refuses, rather than cutting a
   `spec/<id>` nothing would ever ship — switch to the epic branch it names first. Only then
-  read every file in the directory, starting from its open questions and fog items — that is
-  where the last session stopped.
-- **New spec.** Choose a short kebab-case id with the user, then create it:
+  read every file in the directory, starting from its open questions, its fog items and
+  what it set aside — that is where the last session stopped. The files stay as they are
+  until §7.
 
-  ```
-  .ai/scripts/jig spec new <id>
-  ```
-
-  It refuses an invalid or taken id and a dirty tree (the same rule as `task start`), writes
-  `spec.md` and `roadmap.md` from the templates, and switches to a branch of its own,
-  `spec/<id>` — a spec lives there from its first minute, exactly as a task does once
-  started. Fill the files in, starting with the heading of `spec.md`, which names the spec
-  in `jig spec list`. Write the idea in the human's own words, not a retelling. Other files
-  (`architecture.md`, `stack.md`, `research.md`) are added when the conversation needs them.
-
-**When either refuses a dirty tree**, the uncommitted changes are somebody else's — never
-work around it: name what `git status` shows and ask the human to commit or stash it, the
-same as `jig-task` does for `task start`. **When `spec new` refuses "switch to `<default>`
-first"**, or `spec resume` does, move there yourself (nothing is staged or committed by
+**When `spec resume` or `spec new` refuses a dirty tree**, the uncommitted changes are
+somebody else's — never work around it: name what `git status` shows and ask the human to
+commit or stash it, the same as `jig-task` does for `task start`. **When either refuses
+"switch to `<default>` first"**, move there yourself (nothing is staged or committed by
 either command, so switching costs nothing) and run it again.
 
-A spec is written in the project's durable language (AGENTS.md): it is committed, on its own
-branch, and shipped like one — §9 says when.
-
-## 2. Learn what the project already knows
+## 2. Learn what is already known
 
 ```
 .ai/scripts/jig context resolve --no-task --catalog --files <paths> --domains <domains>
 ```
 
-Name the files and domains the idea touches. In a repository with no code yet, the global
-documents are what there is. Facts about the repository you find yourself; never ask the
-human something the code can answer.
+Name the files and domains the idea touches. Then read what else the project has planned:
+the other specs (`jig spec list`) and the filed tasks (`jig queue`) — an idea often answers,
+or collides with, something already there.
+
+In a repository with no code yet — an idea for a new product — the outside world is the
+material: before the first round, look up who already solves this, how, and what they
+leave out, where your runtime can search. With code, do that on deep, or when asked.
+
+Facts are yours to find, each with its source, in parallel subagents where your runtime has
+them; never ask the human something the code or a search can answer. What you find here is
+what your own proposals in §4 are made of.
 
 ## 3. Propose a depth
 
-One line: the level and why. The human may pick another.
+One line: the level and why. The human may pick another. The level is the size of one
+circle (§4):
 
-- **easy** — you take the reversible decisions yourself and list each as an assumption; you
-  ask only about the irreversible. Before writing, one question: accept or reject the
-  assumptions.
-- **normal** — one question per real decision.
-- **deep** — every decision with its trade-off visible, every pressure lens that fits, and
-  the independent failure hunt (§5).
+- **easy** — one round. You take the reversible decisions yourself and list each as an
+  assumption; you ask only about the irreversible.
+- **normal** — two rounds.
+- **deep** — three rounds, every decision with its trade-off visible, and the independent
+  failure hunt (§5).
 
-The level is a budget, not a verdict. When more is open than it allows, say so and offer to
-go deeper. Record the level in `spec.md`.
+The level is a budget, not a verdict: it bounds a circle, not the conversation, and the
+human may ask for another circle as often as they like (§7). Record the level in `spec.md`.
 
-## 4. Three phases, in order
+## 4. Circles and rounds
 
-1. **Understand.** The idea in one sentence, who is worse off without it, what success
-   looks like. Do not argue yet.
-2. **Put weight on it.** Hidden assumptions ("this holds only if X — and if not?"),
-   trade-offs, vague words, the cost of being wrong. Use the lenses in
-   [pressure](references/pressure.md); pick the ones that fit, do not name them aloud.
-3. **Offer other shapes.** Two or three alternatives — another audience, scale or form — or
-   a twist (invert it, constrain it, cut it down), each with your recommendation.
+A **round** is one message of yours and the human's answer to it. A **circle** is a bounded
+run of rounds that ends in a summary (§7). How a round is laid out, where widening looks
+and how the frontier is worked out is in [rounds](references/rounds.md).
 
-Do not skip ahead: an alternative offered before the idea is understood answers a question
-nobody asked.
+- **The first round of a circle widens.** Bring two or three thoughts of your own that the
+  human did not say, each with its reason. In the first circle the same round also asks
+  what you need in order to understand: the idea in one sentence, who is worse off without
+  it, what success looks like.
+- **The later rounds narrow.** Put weight on what is now on the table — hidden assumptions
+  ("this holds only if X — and if not?"), trade-offs, vague words, the cost of being wrong —
+  with the lenses in [pressure](references/pressure.md); pick the ones that fit, do not name
+  them aloud. Settle the decisions the widening opened.
+- **Every round asks the whole frontier:** each question that can be answered now. One that
+  hangs on an answer not given yet waits for the next round.
+- **A round that changed neither the idea's one sentence nor the list of decisions ends the
+  circle early.** There is nothing left in it to spend the budget on.
+- **After every answer, save the draft**, without asking — the whole of it, replaced:
 
-When the spec is for a new project, the shapes include its architecture: two or three
+  ```
+  .ai/scripts/jig spec draft write <id> --from <file>
+  ```
+
+  It holds what a session starting cold would need: the idea in one sentence, the decisions
+  and the rejected options with their reasons, your proposals and what became of each, the
+  open questions, the assumptions you took, the directions not opened, and which round of
+  which circle comes next. Write it in the human's language: it is theirs to read, and it
+  lives outside git — `jig spec draft list` prints where. For an existing spec the id is the
+  spec's, and the draft holds what this session settled and has not written yet.
+
+When the spec is for a new project, the widening includes its architecture: two or three
 approaches — a plain layered application, modules by domain, ports and adapters, or what the
 human names — with what each costs and pays back at this size and expected growth, and the
 lightest one always among them. Patterns combine (domain modules with ports at the edges);
-none is right by default. Record the choice and the rejected ones in `architecture.md`, the
-stack in `stack.md`: `jig-init` carries both into knowledge.
+none is right by default. The choice and the rejected ones go to `architecture.md`, the
+stack to `stack.md`: `jig-init` carries both into knowledge.
 
 ## 5. Independent failure hunt
 
 Always on deep, offered on normal. Give a fresh agent in a clean context — a subagent, if
 your runtime has them — the idea and the leading options, with the brief in
 [pressure](references/pressure.md). Without subagents, run the same pass yourself as a
-separate, announced step. What it finds goes into "Stress test"; the sharpest findings
-become decisions or open questions.
+separate, announced step. Run it before the circle's last round, so that round can ask
+about what it found. What it finds goes into "Stress test"; the sharpest findings become
+questions of that round.
 
 ## 6. Ask well
 
-- Every question carries your recommended answer and what follows from each option.
+- Every question carries your recommended answer and what follows from each option, worded
+  so that "yes" accepts the recommendation.
+- A proposal of yours is not a question in disguise: say what you would add and why, and
+  let the human take it, leave it or take it further.
 - Explain a term the first time it appears.
-- One decision per question. Batch only questions that are truly independent.
+- Read the round before sending it. If the human could answer all of it with yes or no and
+  neither of you would know anything new, it only confirms: rewrite it.
 - Two answers in a row of "I don't know" — ask one open question in the human's terms, then
   return to options (see the stuck protocol in [pressure](references/pressure.md)).
 
-## 7. Write it down as you go
+## 7. Close the circle, and write only after the yes
 
-What is decided goes into the spec files immediately — not at the end, where half of it is
-lost. Show every written or changed section verbatim, as
-[show the document](../jig-task/references/show-the-document.md) says. A rejected option is
-recorded with its reason: the next session must not reopen the argument. What is unresolved
-goes to "Open questions".
+A circle always ends with the same message, laid out as
+[rounds](references/rounds.md) shows: the idea in one sentence, everything you would write
+down — every assumption you took instead of asking included — and the directions you see
+and did not open. Then ask one thing: write it down, or another circle — and on which
+direction. Wait.
+Anything the human adds, corrects or widens opens a new round. You never start another
+circle on your own, and you never write on your own: a "yes" to a question inside a round
+is an answer to that question, not the yes to write.
+
+**After the yes**, and not before:
+
+- **New spec.** Choose a short kebab-case id with the human. If it is not the draft's id,
+  rename the draft first — `jig spec draft rename <draft-id> <id>` — so the ship finds it.
+  Then create the spec:
+
+  ```
+  .ai/scripts/jig spec new <id>
+  ```
+
+  It refuses an invalid or taken id and a dirty tree, writes `spec.md` and `roadmap.md`
+  from the templates, and switches to a branch of its own, `spec/<id>`. Fill the files in,
+  starting with the heading of `spec.md`, which names the spec in `jig spec list`. Write
+  the idea in the human's own words, not a retelling. Other files (`architecture.md`,
+  `stack.md`, `research.md`) are added when the conversation needed them.
+- **Existing spec.** Edit its files on the branch §1 switched to.
+
+Write everything the summary held. A rejected option is recorded with its reason: the next
+session must not reopen the argument. What is unresolved goes to "Open questions", an
+assumption you took to "Assumptions left untested". What the
+human liked and put off goes to "Set aside" with the reason; a direction from the summary that
+nobody opened goes there too, as `unexplored:` — the next session starts from that list.
+
+A spec is written in the project's durable language (AGENTS.md), whatever language the
+conversation was in. Show every written or changed section verbatim, as
+[show the document](../jig-task/references/show-the-document.md) says, then ship it (§9).
+A correction the human makes to what was shown is one more commit on the same pull request.
+
+**If the human stops before the yes**, the draft holds the conversation: say that the next
+session will go on from it, and name its id.
+
+**The draft goes on its own.** `jig spec ship` moves it to trash once the spec is committed
+and says `draft consumed`. Otherwise a draft stays until the human asks for it to go: only
+then run `jig spec draft drop <id>`. Never drop one because it looks old or finished, and do
+not offer to while its conversation is unfinished.
+
+When the ship stops before it commits — exit 3 at `agent.git: none`, or a spec on an epic,
+whose edits the epic's own ship carries — the draft stays although the spec is written. Say
+so, and name `jig spec draft drop <id>` for the human to run once the spec is committed.
 
 ## 8. Roadmap
 
-When the idea has held up, or when asked. Format: the `roadmap.md` that `jig spec new` wrote; its closing
-comment repeats these rules.
+When the idea has held up, or when asked. The cut is part of the conversation: draft it in
+a round, and write it with the rest after the yes (§7). Format: the `roadmap.md` that
+`jig spec new` writes; its closing comment repeats these rules.
 
 - A destination sentence first; without it there is nothing to check items against.
 - Items are finished slices that make the product noticeably better, never layers
@@ -143,10 +216,10 @@ comment repeats these rules.
   depends only on earlier waves.
 - No dates and no point estimates: order is the priority.
 - **Released once, at the end?** When no phase gives a user anything on its own, the spec gets
-  an epic branch (ADR-0040). Ask the human now how far the epic's final pull request raises the
-  version — `patch`, `minor` or `major`, by the project's own rule, with one sentence of reason —
-  while they are here to answer; then `jig spec epic <id> --release <level>` writes the `Epic:` and
-  `Release:` lines. A spec whose phases each ship on their own gets no line — ask when unsure.
+  an epic branch (ADR-0040). Ask the human in a round how far the epic's final pull request raises
+  the version — `patch`, `minor` or `major`, by the project's own rule, with one sentence of reason —
+  while they are here to answer. The command writes `roadmap.md`, so it runs after the yes (§7), once
+  the spec exists: `jig spec epic <id> --release <level>` writes the `Epic:` and `Release:` lines. A spec whose phases each ship on their own gets no line — ask when unsure.
 - **Shipping the declaration and the epic.** The line reaches the default branch with the spec:
   stage `.ai/specs/<id>/` and run `jig spec ship <id> --message-file <file>`; once that is merged,
   `jig spec epic <id>` cuts the branch and `jig spec ship <id>` pushes it. `spec ship` goes as far
@@ -157,25 +230,26 @@ comment repeats these rules.
 
 Look up the facts the cut depends on ("where does this live", "is this one part of the
 code") yourself, in parallel subagents where possible, each with its source. Decide the cut
-with the human: show the draft as prose and verbatim in the file, then let them merge, split
-and move items between waves.
+with the human: show the draft in a round, then let them merge, split and move items
+between waves.
 
 ## 9. End of the session
 
-The session ends when nothing is left open for the chosen depth, or when the human stops.
-Close with three lines: the idea after testing in one sentence, its weakest point, the next
-step. Leftovers stay in "Open questions"; the next session starts there.
+The session ends when the human says to write, or stops. Close with three lines: the idea
+after testing in one sentence, its weakest point, the next step.
 
-The spec has been on `spec/<id>` since step 1 (`spec new` or `spec resume`); ship what
-changed before stopping, so it does not sit uncommitted on a branch only this checkout knows
-about — the trap this skill exists to close:
+Ship once, as the last step, everything the session wrote:
 
 ```
 .ai/scripts/jig spec ship <id> --message-file <file>
 ```
 
-It commits, and goes as far as `agent.git` (in an unattended clone, `autopilot.git`) allows from there; a stop or exit 3 means the
-rest — push, the pull request — is the human's, and the next step says so. Once it is
+One commit, one push, one pull request: the yes of §7 covers it, and nothing is committed
+or pushed before that yes. It goes as far as `agent.git` (in an unattended clone,
+`autopilot.git`) allows; a stop or exit 3 means the rest — push, the pull request — is the
+human's, and the next step says so. A session that wrote nothing ships nothing. A request
+to file a phase's tasks (§10) is its own yes for the roadmap rewrite, and that session ships
+the same way. Once it is
 merged, the next session opens with `jig spec resume <id>` (§1), never straight back onto
 the branch left behind.
 
@@ -193,6 +267,10 @@ Check the result:
 ## 10. File a phase's tasks — only when asked
 
 "File the tasks for phase N": for each item of that phase with no task id and not `fog:`.
+Asked in the middle of a circle, it waits: close the circle and write what it settled (§7)
+first, so the roadmap is not rewritten ahead of the yes. The same when `jig spec draft list`
+shows a draft of this spec from an earlier session: the ship that follows the filing would
+take that draft with it, so say it is there and settle it first.
 
 1. Classify it with [the rubric](../jig-task/references/classification.md); say the class and
    the risk-test answer that decided it in one sentence.
@@ -235,7 +313,7 @@ item is checked later by `jig spec done`, called from consolidation — never by
   into the epic and run `jig spec epic <id> --finish` on it (or on a branch cut from it: the
   epic may be protected like the default branch, and nothing here pushes to it). It removes the spec — its decisions are
   knowledge by now — and first lists what knowledge does not hold: unchecked items, fog, open
-  questions, untested assumptions. Ask the human about each: move it to another spec or a task, or
+  questions, what was set aside, untested assumptions. Ask the human about each: move it to another spec or a task, or
   drop it; then run `--finish --leftovers-handled`. It prints the recorded `release:` level; raise
   the version by it (propose one, and let the human confirm, when it says `not recorded`), stage the
   removal with the bump and run `jig spec ship <id> --message-file <file>`: it commits, pushes the
@@ -248,7 +326,7 @@ item is checked later by `jig spec done`, called from consolidation — never by
 
 - **Finishing an epic unattended** (`autopilot.unattended: true`, nobody to ask): finish only
   when every roadmap item that is not `fog:` is checked — otherwise report "the epic is not
-  finished" and stop there. Drop fog, open questions and untested assumptions with
+  finished" and stop there. Drop fog, open questions, what was set aside and untested assumptions with
   `--leftovers-handled`, and quote each one verbatim in the pull request body under
   `## Dropped without you`. Raise the version by the recorded level, `minor` when none was
   recorded. At level `merge` (`autopilot.git`, else `agent.git`), `spec ship` merges with a merge commit once CI passed — unless

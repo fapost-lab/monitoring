@@ -15,10 +15,11 @@
 # finishes and reopens a spec's epic branch (ADR-0035, ADR-0040 as amended),
 # and `ship` carries a declaration, an epic or an epic's final pull request as
 # far as `agent.git` allows (adr-20260922-spec-work-ships-by-the-agent-git-level);
-# `list` only reads.
+# `list` only reads. `draft` keeps a `jig-idea` conversation on disk before
+# there is a spec, in the gitignored workspace ("idea drafts", at the end).
 # shellcheck shell=bash
 
-SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item file <id> <item> --task <task-id> | --new <task-id> [--goal <text>] (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
+SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec draft write <id> --from <file>|- | jig spec draft rename <id> <new-id> | jig spec draft list | jig spec draft drop <id> | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item file <id> <item> --task <task-id> | --new <task-id> [--goal <text>] (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
 
 cmd_spec() {
   local sub="${1:-}"
@@ -29,6 +30,9 @@ cmd_spec() {
     new) spec_new "$@"; jig_status_page_touch ;;
     resume) spec_resume "$@"; jig_status_page_touch ;;
     list) spec_list "$@" ;;
+    # Redrawn only when the command wrote (jig_record_changed marks it):
+    # `draft list` reads, and the page shows the count of drafts.
+    draft) spec_draft "$@"; jig_status_page_flush ;;
     plan) spec_plan "$@" ;;
     stop) spec_stop "$@" ;;
     done) spec_done "$@"; jig_status_page_touch ;;
@@ -39,7 +43,9 @@ cmd_spec() {
     close) spec_close "$@"; jig_status_page_touch ;;
     epic) spec_epic "$@"; jig_status_page_touch ;;
     # Ships through git only; the spec's files are as `epic` left them.
-    ship) spec_ship "$@" ;;
+    # A ship that committed a declaration moved the spec's draft to trash
+    # (_spec_draft_consume), and the page shows the count of drafts.
+    ship) spec_ship "$@"; jig_status_page_flush ;;
     help | -h | --help)
       printf '%s\n' "$SPEC_USAGE" >&2
       return 0
@@ -1816,12 +1822,28 @@ spec_ship_removed_src() {
     || jig_die "spec ship: cannot resolve $ref"
 }
 
-# spec_ship_steps <level> <branch> <base> <message-file> <title> <body-file> [<draft>] —
+# spec_ship_steps <level> <branch> <base> <message-file> <title> <body-file> [<draft>] [<idea>] —
 # commit, push <branch>, open its pull request into <base>, stopping where
-# <level> stops; the same steps and stop lines as `task ship`.
+# <level> stops; the same steps and stop lines as `task ship`. <draft> is the
+# pull request's, 1 to open it as a draft.
+#
+# <idea> is the spec id whose idea draft this commit consumes
+# (_spec_draft_consume), given by the one mode that commits a spec's content.
+# Right after the commit and before anything is pushed, and only when this
+# run made one — HEAD moved: the commit is the first moment the conversation
+# is in git, and a push or a pull request that fails after it must not leave a
+# draft the next run, which commits nothing, would never come back for. A run
+# that commits nothing proves nothing about what git holds, so it leaves the
+# draft alone.
 spec_ship_steps() {
   local level="$1" branch="$2" base="$3" message_file="$4" title="$5" body_file="$6" draft="${7:-0}"
+  local idea="${8:-}" before=""
+  [ -z "$idea" ] || before=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet HEAD 2>/dev/null) || before=""
   jig_ship_commit "spec ship" "$message_file"
+  if [ -n "$idea" ] \
+     && [ "$before" != "$(git -C "$JIG_PROJECT" rev-parse --verify --quiet HEAD 2>/dev/null || true)" ]; then
+    _spec_draft_consume "$idea"
+  fi
   # The same order as `task ship` (common.sh, "what a ship may send out"):
   # a declaration and a final pull request both carry commits, and both are
   # refused here rather than on the forge.
@@ -1830,6 +1852,7 @@ spec_ship_steps() {
     printf "stopped at commit: push is the human's\n"
     return 0
   fi
+  jig_ship_account "spec ship" "$level"
   jig_ship_push "spec ship" "$branch"
   if [ "$level" = push ]; then
     printf "stopped at push: the pull request is the human's\n"
@@ -1869,7 +1892,10 @@ $bad"
     branch=$(_spec_cut_own_branch "$id" "spec ship") || exit 1
     printf 'switched to %s\n' "$branch"
   fi
-  spec_ship_steps "$level" "$branch" "$default" "$message_file" "$title" "$body_file"
+  # The one mode that consumes the idea draft: `remove` and `final` commit a
+  # spec's removal, which puts nothing of a conversation into git, and `epic`
+  # commits nothing.
+  spec_ship_steps "$level" "$branch" "$default" "$message_file" "$title" "$body_file" 0 "$id"
   [ -z "$line" ] || jig_info "spec ship: once $branch is merged into $default, run \`jig spec epic $id\` to cut ${line% *}"
 }
 
@@ -2022,7 +2048,7 @@ spec_ship_final() {
   sha=$(git -C "$JIG_PROJECT" rev-parse HEAD)
   jig_ship_merge "spec ship" "$JIG_SHIP_URL" "$sha" merge-commit
   # The finish branch goes with the release; the epic is never Jig's to delete
-  # (jig_branch_is_jigs, adr-20261007-a-merged-branch-leaves-with-its-work).
+  # (jig_branch_deletable, adr-20261007-a-merged-branch-leaves-with-its-work).
   jig_ship_leave "spec ship" "$head" "$default" "$sha"
 }
 
@@ -2101,8 +2127,8 @@ spec_epic_unmerged_tasks() {
 
 # spec_leftovers <spec-dir> — what removing the spec would lose, one line each:
 # `item: <text>` for every unchecked roadmap item, fog included, and
-# `question: <text>` / `assumption: <text>` for every entry of the spec's
-# "Open questions" and "Assumptions left untested" sections. The template's own
+# `question: <text>` / `aside: <text>` / `assumption: <text>` for every entry of
+# the spec's "Open questions", "Set aside" and "Assumptions left untested" sections. The template's own
 # `<placeholder>` entries are not leftovers. Only the first line of a wrapped
 # entry is printed: enough to name it.
 spec_leftovers() {
@@ -2116,6 +2142,7 @@ spec_leftovers() {
   if [ -f "$dir/spec.md" ]; then
     awk '
       /^## / { kind = ""; if ($0 ~ /^## Open questions[[:space:]]*$/) kind = "question"
+               else if ($0 ~ /^## Set aside[[:space:]]*$/) kind = "aside"
                else if ($0 ~ /^## Assumptions left untested[[:space:]]*$/) kind = "assumption"; next }
       kind != "" && /^[-*][[:space:]]+/ {
         t = $0; sub(/^[-*][[:space:]]+/, "", t)
@@ -3408,7 +3435,7 @@ _spec_item_build_file() {
   local id="$1" item="$2" task="$3" norm="$4" new="$5" msg="$6" i
   _spec_map_find "$item"
   i=$_SPEC_I
-  [ -z "${M_TID[$i]}" ] || jig_fail already-exists "spec item file: $item already names task ${M_TID[$i]}"
+  [ -z "${M_TID[$i]}" ] || jig_fail already-filed "spec item file: $item already names task ${M_TID[$i]}"
   [ "${M_CHECKED[$i]}" != 1 ] || jig_fail not-linkable "spec item file: $item is checked; a done item files no task"
   if [ -n "$_SPEC_ITEM_NEW" ]; then
     _spec_new_task_check "$task"
@@ -3484,4 +3511,288 @@ _spec_item_link() {
   if ! spec_link_task "$_SPEC_LINK_TDIR/task.md" "$line"; then
     OT_NOTE="${OT_NOTE:+$OT_NOTE; }could not write the Spec: line of $2; run \`jig spec link $1 $2\` once the item has landed"
   fi
+}
+
+# --- idea drafts --------------------------------------------------------------
+#
+# While a `jig-idea` conversation runs, the agent keeps a draft of it on disk:
+# `.ai/workspace/ideas/<id>/draft.md`, in the person's language, so a session
+# that ends early loses one round and not the conversation. A draft is not a
+# spec: no branch, no commit, nothing under `.ai/specs/`, so the tree stays
+# clean and neither `task start` nor `spec new` sees it. `<id>` is the id the
+# spec will have, or has.
+#
+# A draft leaves in two ways only, both through trash (ADR-0006): the commit
+# that puts the spec's content into git consumes it (`spec ship`, see
+# _spec_draft_consume), and `spec draft drop` moves it there when the person
+# says so. Nothing else removes one — housekeeping walks `workspace/tasks`
+# and never comes here, and no age makes a draft go.
+
+# spec_draft_root — `.ai/workspace/ideas` of the clone's main checkout
+# (jig_config_clone_root), not of the checkout jig runs in: a task worktree
+# borrows `workspace/tasks` alone (_task_link_workspace), so a draft kept in
+# its own workspace would be invisible to the next session anywhere else and
+# gone with the tree. The queue file is found the same way (jig_queue_file).
+spec_draft_root() {
+  local root common
+  # Where a clone has no main checkout to find (`--separate-git-dir`, a bare
+  # repository's worktrees), each checkout is its own clone root, and a draft
+  # written in a task worktree would go with it when the worktree is removed.
+  # One place every checkout finds alike, as for the revision
+  # (jig_revision_dir).
+  if common=$(jig_config_odd_common); then
+    printf '%s/jig/ideas\n' "$common"
+    return 0
+  fi
+  jig_config_clone_root_v root
+  printf '%s/%s/workspace/ideas\n' "$root" "$JIG_AI_DIR"
+}
+
+# spec_draft_dir <id> — the directory of the draft <id>, or non-zero for an
+# invalid id: the one place a draft's path is built from a name, so the id is
+# checked wherever the path is (RULES.md, paths from a validated name), as
+# spec_task_dir does for a task. Whether the directory or draft.md is a link
+# is the writer's to judge (spec_draft_write).
+spec_draft_dir() {
+  spec_valid_id "$1" || return 1
+  printf '%s/%s\n' "$(spec_draft_root)" "$1"
+}
+
+# spec_draft_ids — the ids that have a draft, one per line, in directory
+# order. As spec_ids: a directory whose name is not a valid id is skipped,
+# and so is one without draft.md, which holds nothing to continue from.
+spec_draft_ids() {
+  local root d id
+  root=$(spec_draft_root)
+  [ -d "$root" ] || return 0
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    id=${d##*/}
+    spec_valid_id "$id" || continue
+    [ -f "$d/draft.md" ] || continue
+    printf '%s\n' "$id"
+  done
+}
+
+spec_draft_count() {
+  spec_draft_ids | grep -c . || true
+}
+
+# _spec_draft_shown <path> — the path as a command prints it: relative to this
+# checkout where the draft is inside it, absolute from a task worktree, where
+# a relative one would name a file that is not there.
+_spec_draft_shown() {
+  jig_relpath "$1" "$JIG_PROJECT"
+}
+
+_SPEC_DRAFT_USAGE="usage: jig spec draft write <id> --from <file>|- | jig spec draft rename <id> <new-id> | jig spec draft list | jig spec draft drop <id>"
+
+# spec_draft write|rename|list|drop — `jig spec draft`.
+spec_draft() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    write) spec_draft_write "$@" ;;
+    rename) spec_draft_rename "$@" ;;
+    list) spec_draft_list "$@" ;;
+    drop) spec_draft_drop "$@" ;;
+    '') jig_die "spec draft: missing subcommand ($_SPEC_DRAFT_USAGE)" ;;
+    *) jig_die "spec draft: unknown subcommand: $sub ($_SPEC_DRAFT_USAGE)" ;;
+  esac
+}
+
+# spec_draft_write <id> [--from <file>|-] — create the draft, or replace it
+# whole. The agent writes through this and not through its editing tools for
+# the reason `task artifact write` exists: from a task worktree the draft is
+# in another checkout, and only jig knows where. Content comes from
+# `--from <file>`, or stdin with `--from -` or no --from, as there.
+#
+# Written under a temporary name and renamed, so a write that fails leaves the
+# draft of the round before whole; an empty input is refused rather than
+# written, because a `write` fed by a command that failed would blank the only
+# copy of the conversation.
+spec_draft_write() {
+  [ $# -ge 1 ] || jig_die "spec draft write: missing draft id (usage: jig spec draft write <id> --from <file>|-)"
+  local id="$1" from="" seen=0 dir dest tmp made=0
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)
+        [ $# -ge 2 ] || jig_die "spec draft write: --from requires a value"
+        [ "$seen" -eq 0 ] || jig_die "spec draft write: duplicate --from"
+        seen=1
+        from="$2"
+        shift 2 ;;
+      *) jig_die "spec draft write: unexpected argument: $1" ;;
+    esac
+  done
+  # The same grammar as `spec new`, because the draft's id becomes the spec's.
+  spec_valid_id "$id" \
+    || jig_die "spec draft write: invalid draft id: $id (letters, digits, '.', '_', '-'; no leading dot or dash)"
+  jig_require_init
+  if [ -n "$from" ] && [ "$from" != "-" ]; then
+    [ -e "$from" ] || jig_die "spec draft write: --from: no such file: $from"
+    [ -f "$from" ] || jig_die "spec draft write: --from: not a regular file: $from"
+    [ -r "$from" ] || jig_die "spec draft write: --from: file not readable: $from"
+  fi
+  dir=$(spec_draft_dir "$id")
+  dest="$dir/draft.md"
+  # A link is refused rather than written through, as `task artifact` refuses
+  # one: the write would land wherever it points.
+  if [ -L "$dir" ] || [ -L "$dest" ]; then
+    jig_die "spec draft write: $(_spec_draft_shown "$dest") is reached through a link; remove the link first"
+  fi
+  [ -d "$dir" ] || made=1
+  mkdir -p "$dir" || jig_die "spec draft write: cannot create $(_spec_draft_shown "$dir")"
+  tmp="$dest.tmp.$$"
+  jig_cleanup_add "$tmp"
+  if [ -z "$from" ] || [ "$from" = "-" ]; then
+    cat > "$tmp" || { rm -f "$tmp"; jig_die "spec draft write: could not read the input"; }
+  else
+    cat "$from" > "$tmp" || { rm -f "$tmp"; jig_die "spec draft write: could not read $from"; }
+  fi
+  if [ ! -s "$tmp" ]; then
+    # The temporary file this run named, and the directory only when this run
+    # made it: `rmdir` refuses one that holds anything.
+    rm -f "$tmp"
+    [ "$made" -eq 0 ] || rmdir "$dir" 2>/dev/null || true
+    jig_die "spec draft write: refusing to write an empty draft: nothing on the input"
+  fi
+  mv "$tmp" "$dest" || jig_die "spec draft write: could not write $(_spec_draft_shown "$dest")"
+  # The page shows the count of drafts; the revision stays: no `--json` read
+  # reports a draft, and one write per round would make every concurrent
+  # `--revision` write stale for nothing (schemas/json.md, The revision).
+  jig_status_page_dirty
+  _spec_draft_shown "$dest"
+}
+
+# spec_draft_rename <id> <new-id> — the draft under the id the spec is written
+# with, when the person chose another one: `spec ship <new-id>` consumes the
+# draft named as the spec is, so a draft left under the old id would stay
+# behind. A draft already at <new-id> is another conversation and is never
+# merged into or replaced.
+spec_draft_rename() {
+  [ $# -ge 2 ] || jig_die "spec draft rename: missing argument (usage: jig spec draft rename <id> <new-id>)"
+  [ $# -eq 2 ] || jig_die "spec draft rename: unexpected argument: $3"
+  local id="$1" new="$2" from to
+  from=$(spec_draft_dir "$id") || jig_die "spec draft rename: invalid draft id: $id"
+  to=$(spec_draft_dir "$new") \
+    || jig_die "spec draft rename: invalid draft id: $new (letters, digits, '.', '_', '-'; no leading dot or dash)"
+  jig_require_init
+  [ -f "$from/draft.md" ] || jig_die "spec draft rename: no such draft: $id"
+  [ "$id" != "$new" ] || jig_die "spec draft rename: the draft is already named $new"
+  if [ -e "$to" ] || [ -L "$to" ]; then
+    jig_die "spec draft rename: a draft $new already exists"
+  fi
+  mv "$from" "$to" || jig_die "spec draft rename: could not rename $id to $new"
+  jig_status_page_dirty
+  printf 'renamed: %s -> %s\n' "$id" "$new"
+  _spec_draft_shown "$to/draft.md"
+}
+
+# spec_draft_list — one aligned line per draft: its id, where draft.md is,
+# how long ago it was written (the file's own mtime: a draft has no state
+# file to say it), and whether this checkout holds a spec of that id — a
+# draft beside its spec is either what a session decided and has not written
+# into it yet, or one `spec ship` could not consume because the commit was the
+# person's (`agent.git: none`).
+spec_draft_list() {
+  [ $# -eq 0 ] || jig_die "spec draft list: unexpected argument: $1"
+  jig_require_repo
+  local dir id file mtime at age spec rows=""
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    dir=$(spec_draft_dir "$id") || continue
+    file="$dir/draft.md"
+    age=""
+    if mtime=$(jig_file_mtime "$file") && at=$(jig_utc_from_epoch "$mtime"); then
+      age=$(jig_utc_ago "$at")
+    fi
+    case "$age" in
+      '') age="age unknown" ;;
+      "just now") age="updated just now" ;;
+      *) age="updated $age ago" ;;
+    esac
+    spec="no spec"
+    [ ! -d "$(spec_dir)/$id" ] || spec="spec exists"
+    rows="$rows$id	$(_spec_draft_shown "$file")	$age	$spec
+"
+  done <<IDS
+$(spec_draft_ids)
+IDS
+  if [ -z "$rows" ]; then
+    printf 'no drafts\n'
+    return 0
+  fi
+  printf '%s' "$rows" | awk -F '\t' '
+    { id[NR] = $1; p[NR] = $2; a[NR] = $3; s[NR] = $4
+      if (length($1) > wi) wi = length($1)
+      if (length($2) > wp) wp = length($2)
+      if (length($3) > wa) wa = length($3) }
+    # The widths are spliced into the format, as spec_list does.
+    END { fmt = "%-" wi "s   %-" wp "s   %-" wa "s   %s\n"
+          for (i = 1; i <= NR; i++) printf fmt, id[i], p[i], a[i], s[i] }
+  '
+}
+
+# The trash entry _spec_draft_trash moved a draft to; script-global because
+# the move records a change, which a command substitution would lose
+# (jig_status_page_dirty).
+_SPEC_DRAFT_DEST=""
+
+# _spec_draft_trash <id> — move the draft <id> to trash: the clone's main
+# checkout's, whose housekeeping empties it by `trash_ttl` (ADR-0006). Named
+# `idea-<id>` there, beside `spec-<id>`.
+#
+# An accepted limit: where a clone has no main checkout to find
+# (jig_config_odd_common), jig_config_clone_root is the checkout jig runs in,
+# so a draft dropped or consumed inside a task worktree goes to that worktree's
+# trash and leaves with the worktree before `trash_ttl` runs out. The draft had
+# already gone by then — its spec committed, or the person dropped it — and
+# only the window to take it back is shorter. A trash under the git common dir
+# would need housekeeping to delete there too, a new deletion root
+# (adr-20261110-an-idea-draft-waits-outside-git, Consequences). Never
+# dies: non-zero when the move could not be made, and the draft is where it
+# was. The draft exists; the callers checked.
+_spec_draft_trash() {
+  local id="$1" dir root dest
+  dir=$(spec_draft_dir "$id") || return 1
+  jig_config_clone_root_v root
+  dest=$(JIG_PROJECT="$root" jig_trash_dest "idea-$id")
+  mkdir -p "${dest%/*}" 2>/dev/null || return 1
+  mv "$dir" "$dest" 2>/dev/null || return 1
+  jig_status_page_dirty
+  _SPEC_DRAFT_DEST=$dest
+}
+
+# spec_draft_drop <id> — the draft to trash, on the person's word: the one way
+# a draft leaves without becoming a spec.
+spec_draft_drop() {
+  [ $# -ge 1 ] || jig_die "spec draft drop: missing draft id (usage: jig spec draft drop <id>)"
+  [ $# -eq 1 ] || jig_die "spec draft drop: unexpected argument: $2"
+  local id="$1" dir
+  dir=$(spec_draft_dir "$id") || jig_die "spec draft drop: invalid draft id: $id"
+  jig_require_init
+  [ -f "$dir/draft.md" ] || jig_die "spec draft drop: no such draft: $id"
+  _spec_draft_trash "$id" || jig_die "spec draft drop: could not move the draft $id to trash"
+  printf 'dropped: %s -> %s\n' "$id" "$(_spec_draft_shown "$_SPEC_DRAFT_DEST")"
+}
+
+# _spec_draft_consume <id> — the draft of the spec a commit has just put into
+# git goes to trash: from that commit on the conversation is in the spec, and
+# the step is jig's so that it does not rest on the agent remembering it.
+# Silent when there is no draft. Never fails the ship it is called from: a
+# draft that could not be moved is said in a warning and stays for
+# `spec draft drop`.
+_spec_draft_consume() {
+  local id="$1" dir
+  dir=$(spec_draft_dir "$id") || return 0
+  [ -f "$dir/draft.md" ] || return 0
+  if _spec_draft_trash "$id"; then
+    printf 'draft consumed: %s -> %s\n' "$id" "$(_spec_draft_shown "$_SPEC_DRAFT_DEST")"
+  else
+    jig_warn "spec ship: could not move the draft $id to trash; it is still listed by \`jig spec draft list\`, and \`jig spec draft drop $id\` removes it"
+  fi
+  return 0
 }

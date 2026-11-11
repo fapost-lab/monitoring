@@ -924,6 +924,13 @@ _ot_ship_steps() {
     return 0
   fi
   jig_ship_require_commits "$OT_WHO" "$OT_BRANCH" "$OT_BASE"
+  # The same pair for the GitHub account a pull request is opened as: an
+  # answer before the push, not a refusal after it (jig_ship_account).
+  if ! _ot_capture jig_ship_account "$OT_WHO" "$OT_LEVEL"; then
+    OT_NOTE=$_OT_CAP
+    return 0
+  fi
+  jig_ship_account "$OT_WHO" "$OT_LEVEL"
   if ! _ot_capture jig_ship_push "$OT_WHO" "$OT_BRANCH"; then
     OT_NOTE=$_OT_CAP
     return 0

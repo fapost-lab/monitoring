@@ -130,6 +130,16 @@ Usage: jig <command> [args]
   queue request|cancel <ref> pause [--reason <text>] [--revision <n>] [--json]
                                  ask a task to pause at its next stage boundary,
                                  or take the request back
+  pr fetch <url>                 a GitHub pull request or GitLab merge request into
+                                 refs/jig/pr/<n>/ and a detached worktree beside the
+                                 repository, for jig-pr-review
+  pr draft <n|url> [--from <f>]  check and keep the review draft; print it as it is shown
+  pr comments check <n|url>      place the draft on the forge's diff; print the review as it
+                                 would be posted, and its hash
+  pr comments post <n|url> --shown <hash>
+                                 post that review, refused unless it is the version shown;
+                                 read back what landed, post only what is missing
+  pr list | pr cleanup <n|url>   fetched pull requests; take one's worktree, refs and draft back
   writes [list] [--json]         edits Jig committed in its own tree that have not landed
   writes ship <target> [--json]  carry one as far as agent.git allows; at merge, merge it
                                  once CI passed (<target> is spec:<id> or knowledge)
@@ -147,6 +157,9 @@ Usage: jig <command> [args]
                                  answers for it, and what .ai/config.yaml omits;
                                  --json adds each key's value, source, kind and
                                  description, and never a secret's value
+  gh <args>...                   run gh as this clone's GitHub account: github.account, else
+                                 the one account that may push here; gh's active account is
+                                 never switched
   notify setup                   in your own terminal: ask for the Telegram bot token
                                  (hidden) and chat id, write them, send a test message
   notify test                    send one Telegram test message now, as autopilot would
@@ -175,7 +188,7 @@ main() {
         v=$(jig_source_version "$root" 2>/dev/null) || v=""
       fi
       printf 'jig %s\n' "${v:-$JIG_VERSION}" ;;
-    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|housekeeping|measure|doctor|config|notify)
+    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|pr|gh|housekeeping|measure|doctor|config|notify)
       if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
         jig_die "command '$cmd' is not available in jig $JIG_VERSION"
       fi
