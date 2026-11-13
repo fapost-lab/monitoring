@@ -1105,7 +1105,7 @@ _upgrade_open_branch() {
   while git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$name"; do
     if [ "$based" != "$label" ] \
       && ! git -C "$JIG_PROJECT" merge-base --is-ancestor "refs/heads/$name" "$start" 2>/dev/null; then
-      jig_die "upgrade: the upgrade to $to is already on branch $name, which has not been merged into $base yet. Merge it, or \`git checkout $name\` and run \`jig upgrade\` there to carry it on. Nothing was changed"
+      _upgrade_refuse_unmerged "$to" "$name" "$base"
     fi
     name="$_UPGRADE_BRANCH_PREFIX$to-$n"
     n=$((n + 1))
@@ -1115,6 +1115,53 @@ _upgrade_open_branch() {
   _UPGRADE_BRANCH="$name"
   _UPGRADE_CREATED=1
   _upgrade_out "upgrade: working on branch $name, cut from $base"
+}
+
+# _upgrade_branch_pr <base> <branch> — the forge's pull request from <branch>
+# into <base>, as `<state><TAB><url>` (state open|merged|closed): an open one
+# first, else the newest. Nothing when there is no forge, it did not answer,
+# or it knows no such pull request. One list call, in a subshell with its
+# stderr dropped: a bad `forge:` value or an unhappy CLI ends here as nothing,
+# never as an error of its own.
+_upgrade_branch_pr() {
+  (
+    forge=$(jig_forge_kind 2>/dev/null) || exit 0
+    [ "$forge" = github ] || [ "$forge" = gitlab ] || exit 0
+    prs=$(_upgrade_land_prs "$forge" "$1" "$2") || exit 0
+    printf '%s\n' "$prs" | awk -F '\t' -v b="$2" '
+      $1 == b && $4 != "" && $4 != "null" {
+        if ($2 == "open") { print $2 "\t" $4; found = 1; exit }
+        if (first == "") first = $2 "\t" $4
+      }
+      END { if (!found && first != "") print first }'
+  ) 2>/dev/null || true
+}
+
+# _upgrade_refuse_unmerged <to> <branch> <base> — refuse a second branch for
+# an upgrade still waiting on <branch>. The forge is asked only here, once:
+# an open pull request is the upgrade done and waiting for its merge, refused
+# as `not-merged` with its URL, so a reader can tell it from a failure; a
+# merged or a closed one is named with its state. Without an answer the
+# refusal is the one it always was.
+_upgrade_refuse_unmerged() {
+  local to="$1" name="$2" base="$3" tab pr st url head
+  tab=$(printf '\t')
+  head="upgrade: the upgrade to $to is already on branch $name, which has not been merged into $base yet"
+  pr=$(_upgrade_branch_pr "$base" "$name")
+  st=${pr%%"$tab"*}
+  url=${pr#*"$tab"}
+  case "$st" in
+    open)
+      jig_fail not-merged "$head; its pull request is open and waits for a merge: $url. Merge it, then run \`jig upgrade --land\` to bring it here; or \`git checkout $name\` and run \`jig upgrade\` there to carry it on. Nothing was changed"
+      ;;
+    merged)
+      jig_die "upgrade: the upgrade to $to is already on branch $name, and the forge has merged its pull request ($url), but it has not been brought into $base here yet: run \`jig upgrade --land\`. Nothing was changed"
+      ;;
+    closed)
+      jig_die "$head; its pull request was closed without a merge: $url. Reopen and merge it, or \`git checkout $name\` and run \`jig upgrade\` there to carry it on. Nothing was changed"
+      ;;
+  esac
+  jig_die "$head. Merge it, or \`git checkout $name\` and run \`jig upgrade\` there to carry it on. Nothing was changed"
 }
 
 # _upgrade_stage_change — stage what this run changed and nothing else. The
@@ -1748,15 +1795,18 @@ _UPGRADE_L_LEVEL=""
 _UPGRADE_L_DELETED=0
 _UPGRADE_L_DELETED_ORIGIN=0
 
-# _upgrade_land_prs <forge> <base> — the forge's pull requests from Jig's
-# upgrade branches into <base>, newest first, one line each:
+# _upgrade_land_prs <forge> <base> [<head>] — the forge's pull requests from
+# Jig's upgrade branches into <base>, newest first, one line each:
 #   <head><TAB><state><TAB><head-commit><TAB><url>
-# <state> open|merged|closed. Exit 1 when the forge did not answer.
+# <state> open|merged|closed. With <head>, only the pull requests from that
+# branch, asked of the forge itself so that a busy project's first page
+# cannot hide them. Exit 1 when the forge did not answer.
 _upgrade_land_prs() {
-  local forge="$1" base="$2" rows
+  local forge="$1" base="$2" head="${3:-}" rows
   case "$forge" in
     github)
       rows=$(jig_gh pr list --state all --base "$base" --limit 100 \
+        ${head:+--head "$head"} \
         --json headRefName,state,headRefOid,url \
         --jq '.[] | "\(.headRefName)\t\(.state)\t\(.headRefOid)\t\(.url)"' 2>/dev/null) || return 1
       ;;
@@ -1764,7 +1814,8 @@ _upgrade_land_prs() {
       # glab's own answer first, then the reading of it: a failing glab is a
       # forge that did not answer, never an empty list, and that should not
       # rest on `pipefail` judging a pipeline whose last stage is awk's.
-      rows=$(glab mr list --all --target-branch "$base" --output json 2>/dev/null) || return 1
+      rows=$(glab mr list --all --target-branch "$base" ${head:+--source-branch "$head"} \
+        --output json 2>/dev/null) || return 1
       rows=$(printf '%s\n' "$rows" | jig_glab_fields source_branch state sha web_url@/merge_requests/) || return 1
       ;;
     *) return 1 ;;

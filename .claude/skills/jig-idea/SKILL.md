@@ -215,11 +215,13 @@ a round, and write it with the rest after the yes (§7). Format: the `roadmap.md
 - Waves group items that can run at the same time, in separate worktrees (ADR-0029). Wave N
   depends only on earlier waves.
 - No dates and no point estimates: order is the priority.
-- **Released once, at the end?** When no phase gives a user anything on its own, the spec gets
-  an epic branch (ADR-0040). Ask the human in a round how far the epic's final pull request raises
-  the version — `patch`, `minor` or `major`, by the project's own rule, with one sentence of reason —
-  while they are here to answer. The command writes `roadmap.md`, so it runs after the yes (§7), once
-  the spec exists: `jig spec epic <id> --release <level>` writes the `Epic:` and `Release:` lines. A spec whose phases each ship on their own gets no line — ask when unsure.
+- **Merged once, at the end?** When no phase gives a user anything on its own, the spec gets
+  an epic branch (ADR-0040). The command writes `roadmap.md`, so it runs after the yes (§7), once
+  the spec exists: `jig spec epic <id>` writes the `Epic:` line. The epic's final pull request
+  merges the finished feature without raising the version; the release that ships it is made apart,
+  by `jig-release` (adr-20261112-release-notes-name-the-commit-they-describe). `--release <level>`
+  is for a release epic only, which `jig-release` declares. A spec whose phases each ship on their
+  own gets no line — ask when unsure.
 - **Shipping the declaration and the epic.** The line reaches the default branch with the spec:
   stage `.ai/specs/<id>/` and run `jig spec ship <id> --message-file <file>`; once that is merged,
   `jig spec epic <id>` cuts the branch and `jig spec ship <id>` pushes it. `spec ship` goes as far
@@ -314,13 +316,14 @@ item is checked later by `jig spec done`, called from consolidation — never by
   epic may be protected like the default branch, and nothing here pushes to it). It removes the spec — its decisions are
   knowledge by now — and first lists what knowledge does not hold: unchecked items, fog, open
   questions, what was set aside, untested assumptions. Ask the human about each: move it to another spec or a task, or
-  drop it; then run `--finish --leftovers-handled`. It prints the recorded `release:` level; raise
-  the version by it (propose one, and let the human confirm, when it says `not recorded`), stage the
-  removal with the bump and run `jig spec ship <id> --message-file <file>`: it commits, pushes the
+  drop it; then run `--finish --leftovers-handled`. It prints `release:` — `none` for a feature epic,
+  whose final pull request does not touch the version (`spec ship` refuses one that does), or the
+  level a release epic recorded, which you raise the version by. Stage the removal (and, on a
+  release epic, the bump) and run `jig spec ship <id> --message-file <file>`: it commits, pushes the
   epic's finish on a branch of its own, `finish/<id>` — the epic itself is not pushed — and opens the
   pull request into the default branch from it as far as `agent.git` (in an unattended clone, `autopilot.git`) allows. Reviewing
-  and merging that pull request is the human's — the merge is the release — except in an
-  unattended run, below. If review needs a fix,
+  and merging that pull request is the human's except in an unattended run, below. After a feature
+  epic merges, its release is `jig-release`'s. If review needs a fix,
   `jig spec epic <id> --reopen` on the epic brings the spec back from git; fix it as an ordinary
   task, finish again and ship again: the open pull request is reported, not duplicated.
 
@@ -328,11 +331,12 @@ item is checked later by `jig spec done`, called from consolidation — never by
   when every roadmap item that is not `fog:` is checked — otherwise report "the epic is not
   finished" and stop there. Drop fog, open questions, what was set aside and untested assumptions with
   `--leftovers-handled`, and quote each one verbatim in the pull request body under
-  `## Dropped without you`. Raise the version by the recorded level, `minor` when none was
-  recorded. At level `merge` (`autopilot.git`, else `agent.git`), `spec ship` merges with a merge commit once CI passed — unless
-  `release.merge` is `human` in this clone, which leaves every release to the person — and
-  opens a `major` release as a draft that needs a human instead; `not merged: <why>` leaves the
-  pull request open — say why.
+  `## Dropped without you`. On a release epic, raise the version by the recorded level; a feature
+  epic leaves it alone. At level `merge` (`autopilot.git`, else `agent.git`), `spec ship` merges with
+  a merge commit once CI passed — on a release epic unless `release.merge` is `human` in this
+  clone, which leaves every release to the person, or the notes do not reach the default branch's
+  tip; a `major` release opens as a draft that needs a human instead. `not merged: <why>` leaves
+  the pull request open — say why.
 
 - **Starting a new project from a spec**: copy `.ai/specs/<id>/` into that project, which needs
   Jig 0.3.0 or later. From then on its own Jig tracks the spec; nothing links the two copies.

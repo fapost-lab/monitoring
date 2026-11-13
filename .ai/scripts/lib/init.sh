@@ -766,6 +766,11 @@ cmd_init() {
       printf '%s\n' "$conflict_paths" | sed '/^$/d; s/^/  /'
     fi
   fi
+  local staging_names
+  staging_names=$(jig_staging_offer | tr '\n' ' ' | sed 's/ $//')
+  if [ -n "$staging_names" ]; then
+    _init_out "git flow: tasks now go straight to $(cfg git.base_branch main) (the direct flow). origin has a branch named $staging_names: in the staging flow a task lands there first and reaches $(cfg git.base_branch main) after testing. To turn it on, ask your agent to set up Jig (jig-setup)."
+  fi
   _init_out "next: run the jig-init skill to populate knowledge; see .ai/scripts/jig status"
   _init_out "next: to choose how far the agent may go on its own, ask it to set up Jig for you (jig-setup)"
 

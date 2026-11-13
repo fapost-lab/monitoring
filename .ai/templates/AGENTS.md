@@ -17,7 +17,7 @@ column is the way; the right-hand one is what it replaces.
 
 | When you need to | Use | Instead of |
 |---|---|---|
-| Take on work someone described | the `jig-task` skill | starting to edit code straight away |
+| Take on work someone described, or the next task | the `jig-task` skill; for the next task, `jig queue next` | starting to edit code straight away, or picking from the list yourself |
 | Decide how much process the work needs | the risk test in the `jig-task` skill | reading a class off one word in the route table |
 | File the work as a unit | `jig task new <id>`, then `jig queue set <id> --priority <0-5>` | the runtime's own background tasks (`spawn_task` in Claude Code): they open another session, not a task with a route, a workspace and consolidation |
 | Get a branch for the task, or a tree of its own | `jig task start <id>`, or `jig task start <id> --worktree` | `git checkout -b`, `git worktree add` |
@@ -64,8 +64,10 @@ epic branch (`jig spec epic`): its tasks are cut from the epic and their pull re
 into it.
 
 `jig-release` plans a release with a person: which filed tasks go in, in what order and at what
-version level. A release is a spec with an epic, so the same commands build it; `jig spec link`
-links a task filed earlier, and a started task stays out of the epic.
+version level. The release is its notes task, the last pull request, cut from the freshest default
+branch: it records the commit its notes describe (`jig task set <id> notes_through <sha>`), and
+`jig task ship` refuses the release while the default branch has moved past it. A release epic is
+built only when tasks must ship together; feature work never raises the version.
 
 `jig-autopilot` runs one task's route without waiting between stages and stops only where a
 human is needed; the route, the gates and `agent.git` stay what they are.
@@ -78,7 +80,7 @@ project's and record it with `jig config set --local github.account <login>`.
 
 `jig-setup` asks a person, one question at a time, how far their agent may go on its own and
 writes the answers to their gitignored `.ai/config.local.yaml` through
-`jig config set --local`; it never writes `.ai/config.yaml`.
+`jig config set --local`; the one thing it writes to `.ai/config.yaml` is the team's git flow, after a yes.
 
 `jig-upgrade` brings a project's copy of Jig up to the version on the machine: `jig self-update`
 when a newer release is out, `jig upgrade`, and the steps the release asks for by hand; what would

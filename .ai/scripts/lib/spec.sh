@@ -1483,10 +1483,15 @@ spec_epic_finish() {
   local release
   release=$(spec_release_check "spec epic" "$rel" < "$roadmap") || exit 1
   spec_close_dir "$id" "spec epic" "$handled"
-  # The level the version is raised by in this commit, as recorded when the
-  # epic was declared; the rule that picks one when none was is the caller's.
-  printf 'release: %s\n' "${release:-not recorded}"
-  jig_info "spec epic: $(spec_ship_hint finish "$id" "$branch" "$rel")"
+  # A Release: line makes the epic a release epic, whose final pull request
+  # raises the version at that level; without one it is a feature epic, which
+  # leaves the release to jig-release.
+  if [ -n "$release" ]; then
+    printf 'release: %s\n' "$release"
+  else
+    printf 'release: none — a feature epic; the release is made apart by jig-release\n'
+  fi
+  jig_info "spec epic: $(spec_ship_hint finish "$id" "$branch" "$rel" "$release")"
 }
 
 # spec_epic_reopen <id> — bring back the spec `--finish` removed, on its epic,
@@ -1623,11 +1628,13 @@ spec_ship_level() {
   fi
 }
 
-# spec_ship_hint declare|cut|finish <id> <branch> <rel> — the step after
-# `spec epic`, named by whose it is at this clone's agent.git level.
+# spec_ship_hint declare|cut|finish <id> <branch> <rel> [<release>] — the step
+# after `spec epic`, named by whose it is at this clone's agent.git level.
+# <release> is the level a release epic's Release: line records; a finish
+# without one is a feature epic, which stages the removal and raises nothing.
 # shellcheck disable=SC2016 # the backticks are literal: they quote a command
 spec_ship_hint() {
-  local step="$1" id="$2" branch="$3" rel="$4" level default does
+  local step="$1" id="$2" branch="$3" rel="$4" release="${5:-}" level default does with=""
   level=$(spec_ship_level)
   default=$(cfg git.base_branch main)
   case "$step" in
@@ -1656,10 +1663,12 @@ spec_ship_hint() {
         pr) does="it commits, pushes $branch and opens the pull request into $default" ;;
         merge) does="it commits, pushes $branch and opens the pull request into $default, and merges it once CI passed only in an unattended run" ;;
         *)
-          printf 'commit the removal with the version bump, then open the pull request from %s into %s\n' "$branch" "$default"
+          [ -z "$release" ] || with=" with the version bump"
+          printf 'commit the removal%s, then open the pull request from %s into %s\n' "$with" "$branch" "$default"
           return 0 ;;
       esac
-      printf 'stage the removal with the version bump and run `jig spec ship %s` (agent.git: %s — %s)\n' "$id" "$level" "$does"
+      [ -z "$release" ] || with=" with the version bump"
+      printf 'stage the removal%s and run `jig spec ship %s` (agent.git: %s — %s)\n' "$with" "$id" "$level" "$does"
       ;;
   esac
 }
@@ -1960,22 +1969,80 @@ spec_ship_epic() {
   jig_ship_push "spec ship" "$branch"
 }
 
+# _spec_ship_notes_last_check — JIG_SHIP_LAST_CHECK for a release epic: whether
+# its notes still reach the tip of the default branch (_SPEC_SHIP_NOTES_BASE).
+_SPEC_SHIP_NOTES_BASE=""
+_spec_ship_notes_last_check() {
+  spec_ship_notes_refusal "$_SPEC_SHIP_NOTES_BASE"
+}
+
+# spec_ship_notes_refusal <default> — jig_release_notes_refusal for a release
+# epic, followed by where the trailer goes. The check reads only commits the
+# epic already has, so a Release-Notes-Through: trailer written into spec
+# ship's own --message-file is never seen, and an agent told only "record the
+# trailer" puts it there and is refused again. Nothing is added to a refusal
+# that is not about the trailer (origin did not answer).
+spec_ship_notes_refusal() {
+  local gap
+  gap=$(jig_release_notes_refusal "spec ship" "$1")
+  [ -n "$gap" ] || return 0
+  printf '%s\n' "$gap"
+  case "$gap" in
+    "could not fetch "*) return 0 ;;
+  esac
+  printf "the trailer counts only on a commit the epic already has, never in spec ship's own --message-file: on the release notes task, run jig task set <task> notes_through <sha>, ship that task into the epic, then run spec ship again\n"
+}
+
 # The body file spec_ship_final writes for a draft; script-global because the
 # exit cleanup that removes it runs after the function returned
 # (conventions/shell.md).
 _SPEC_SHIP_BODY_TMP=""
 
-# spec_ship_final — the epic's final pull request. At `merge`, in an unattended
-# run (`autopilot.unattended`, the key itself: an epic finish belongs to no
-# task's run), the merge is the agent's too
+# spec_ship_final_raise <default> — `<file><TAB><old><TAB><new>` when the
+# change this ship sends raises the version the project declares, or nothing:
+# jig_release_raise for what HEAD already carries, and the same question for
+# a version file whose raise is only staged, which is how a finish brings it.
+spec_ship_final_raise() {
+  local default="$1" raise fork f new old o n
+  raise=$(jig_release_raise "$default")
+  if [ -n "$raise" ]; then
+    printf '%s\n' "$raise"
+    return 0
+  fi
+  fork=$(_jig_release_fork "$default")
+  [ -n "$fork" ] || return 0
+  for f in $JIG_VERSION_FILES; do
+    new=$(git -C "$JIG_PROJECT" show ":$f" 2>/dev/null | _jig_version_in "$f")
+    [ -n "$new" ] || continue
+    old=$(jig_git_show_path "$fork" "$f" 2>/dev/null | _jig_version_in "$f")
+    [ -n "$old" ] && [ "$old" != "$new" ] || continue
+    o=${old#v}
+    n=${new#v}
+    if jig_release_version "v$o" >/dev/null && jig_release_version "v$n" >/dev/null; then
+      jig_version_newer "$n" "$o" || continue
+    fi
+    printf '%s\t%s\t%s\n' "$f" "$old" "$new"
+    return 0
+  done
+  return 0
+}
+
+# spec_ship_final — the epic's final pull request. What it may carry depends on
+# the epic's kind, read from its removed roadmap: a feature epic (no `Release:`
+# line) raises no version — the release is made apart, by jig-release — and
+# is refused one; a release epic (a `Release:` line) raises it, and goes out
+# only while its release notes name, in a Release-Notes-Through: trailer, the
+# default branch's tip (adr-20261112-release-notes-name-the-commit-they-describe).
+# At `merge`, in an unattended run (`autopilot.unattended`, the key itself: an
+# epic finish belongs to no task's run), the merge is the agent's too
 # (adr-20260922-unattended-runs-ask-nothing-and-merge-on-green-ci), and only
-# after spec_ship_final_ready finds nothing left; the release level the
-# roadmap recorded decides first: `major` is never released without a human —
-# the pull request opens as a draft that says so — and no `Release:` line
-# reads as `minor`. Anywhere else the merge is the human's, as it was.
+# after spec_ship_final_ready finds nothing left; for a release epic the
+# release level the roadmap recorded decides first: `major` is never released
+# without a human — the pull request opens as a draft that says so — and
+# release.merge decides who merges. Anywhere else the merge is the human's.
 spec_ship_final() {
   local id="$1" level="$2" branch="$3" default="$4" message_file="$5" title="$6" body_file="$7" here="$8"
-  local rel start src release draft=0 unattended=0 head="$8" refused=""
+  local rel start src release draft=0 unattended=0 head="$8" refused="" raise gap
   rel="$JIG_AI_DIR/specs/$id"
   [ -n "$message_file" ] || jig_die "spec ship: the final pull request commits; --message-file is required"
   jig_fetch_branches "spec ship" "$default"
@@ -1988,21 +2055,30 @@ spec_ship_final() {
   fi
   jig_ship_check_staged "spec ship"
   [ -z "$(git -C "$JIG_PROJECT" ls-files --cached -- "$rel/" 2>/dev/null)" ] \
-    || jig_die "spec ship: the removal of $rel/ is not staged; stage it with the version bump first"
+    || jig_die "spec ship: the removal of $rel/ is not staged; stage it first (with the version bump, when the roadmap has a Release: line)"
 
   src=$(spec_ship_removed_src "$id") || exit 1
-  if [ "$level" = merge ] && jig_unattended; then
-    [ "$(jig_release_merge)" = agent ] || refused=human
+  release=$(jig_git_show_path "$src" "$rel/roadmap.md" 2>/dev/null \
+    | spec_release_check "spec ship" "$rel/roadmap.md") || exit 1
+  if [ -z "$release" ]; then
+    # A feature epic: finished work, no release. The release is made apart,
+    # from a fresh default branch, so the epic never picks a version weeks
+    # before it merges.
+    raise=$(spec_ship_final_raise "$default")
+    [ -z "$raise" ] || jig_die "spec ship: a feature epic does not raise the version; the release is made apart from it (jig-release). Take the version raise out of $branch, or declare the epic a release with a Release: line"
+  else
+    # A release epic raises the version: its notes must describe everything
+    # that is on the default branch now (a notes task merged into the epic
+    # carries the trailer in its commit).
+    gap=$(spec_ship_notes_refusal "$default")
+    [ -z "$gap" ] || jig_die "spec ship: not sent: the epic raises the version, and $gap"
+    if [ "$level" = merge ] && jig_unattended; then
+      [ "$(jig_release_merge)" = agent ] || refused=human
+    fi
   fi
   if [ "$level" = merge ] && jig_unattended && [ -z "$refused" ]; then
     unattended=1
-    release=$(jig_git_show_path "$src" "$rel/roadmap.md" 2>/dev/null \
-      | spec_release_check "spec ship" "$rel/roadmap.md") || exit 1
-    if [ -z "$release" ]; then
-      printf 'release: minor (no Release: line; the unattended default)\n'
-    else
-      printf 'release: %s\n' "$release"
-    fi
+    [ -z "$release" ] || printf 'release: %s\n' "$release"
     if [ "$release" = major ]; then
       draft=1
       _SPEC_SHIP_BODY_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-spec-body.XXXXXX")
@@ -2031,7 +2107,11 @@ spec_ship_final() {
     return 0
   fi
   if [ "$unattended" -eq 0 ]; then
-    printf "not merged: the epic's final merge is the release, and outside an unattended run it is the human's\n"
+    if [ -n "$release" ]; then
+      printf "not merged: the epic's final merge is the release, and outside an unattended run it is the human's\n"
+    else
+      printf "not merged: the epic's final merge is the human's outside an unattended run\n"
+    fi
     return 0
   fi
   if [ "$draft" -eq 1 ]; then
@@ -2043,6 +2123,13 @@ spec_ship_final() {
   if [ -n "$left" ]; then
     printf 'not merged: %s\n' "$left"
     return 0
+  fi
+  # The default branch may move while the pull request waits for CI: a release
+  # epic's notes are checked again after CI is green, right before the merge.
+  if [ -n "$release" ]; then
+    _SPEC_SHIP_NOTES_BASE=$default
+    # shellcheck disable=SC2034 # read by jig_ship_merge (common.sh)
+    JIG_SHIP_LAST_CHECK=_spec_ship_notes_last_check
   fi
   local sha
   sha=$(git -C "$JIG_PROJECT" rev-parse HEAD)

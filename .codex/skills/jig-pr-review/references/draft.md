@@ -14,6 +14,14 @@ language: <the comments' language, e.g. en>
 
 === summary
 <the review's body, markdown>
+=== levels
+P0 <word> — <what it asks of the author>
+P1 <word> — <…>
+P2 <word> — <…>
+P3 <word> — <…>
+=== comment P1 R42 src/app.go
+<a finding's title on the first line>
+<the rest of it>
 === comment R42 src/app.go
 <a comment on line 42 of the new side>
 === comment L17-20 src/old.go
@@ -31,6 +39,17 @@ language: <the comments' language, e.g. en>
   after it. `comment` and `personal` take a position and a path. `reply` (a follow-up's only)
   takes a thread number of `jig pr followup` and a verdict, `fixed` or `open`: every thread it
   lists gets exactly one.
+- **Levels** are optional and all or nothing. A `=== levels` block, right after the summary, names
+  the four severities of the review method (the fetch's `method:` file) in order, one a line:
+  `P<n> <word>[ — <meaning>]`, in the review's language (`P0 Blocker — before the merge`). With it,
+  every `comment` and `personal` names its level before the position (`=== comment P2 R42 …`);
+  without it, none does. The first line of such a comment is its title: one line of plain text, not
+  empty and not the start of a block (a fence, a heading, a quote, a rule, a table, indented code).
+- **What levels add** is jig's, at `jig pr comments check`: each level a colour (P0 🔴, P1 🟠,
+  P2 🟡, P3 🟢); the comments numbered by level, P0 first, then in the draft's order, each body
+  starting `🟢 **3.** `; and after the summary a legend of the four lines and, per level with
+  findings, its word and the numbered titles. A comment moved into the summary keeps its number;
+  `personal` blocks are never numbered. The words are the draft's — jig writes no prose of its own.
 - **Position**: `R<line>` on the new side (the head), `L<line>` on the old side (the merge base),
   `-<end>` for a range on the same side, ending after it starts.
 - **Path**: the rest of the line, relative to the repository, without `.` or `..`; a file of the

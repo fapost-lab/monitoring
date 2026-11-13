@@ -7,8 +7,8 @@ description: Ask a person, one question at a time in plain words, how far their 
 
 The person may not know `.ai/config.local.yaml` exists. You ask; `jig config set --local`
 checks and writes (ADR-0001). The file is theirs alone: it changes what **their** agent does
-in **this** clone, never a colleague's. Never write `.ai/config.yaml` — the team's file, edited
-by hand.
+in **this** clone, never a colleague's. Apart from §4, never write `.ai/config.yaml`: it is the
+team's file.
 
 ## Speak in blocks
 
@@ -72,11 +72,11 @@ their own file is answered by `config unset` too — say that the key then answe
    questions, `true` only for someone who cannot and would rather have the change delivered.
    Set `true` only on an explicit yes.
 5. **Releases** (`release.merge`) — only with `true` to question 4 and `merge` at either level.
-   Before asking, explain: an epic's final pull request is the release — every task of a spec
-   reaching the main branch at once; with `agent` (default) the run merges it once CI passed, a
-   `major` always left as a draft; with `human` it opens it and leaves that merge to them. A task
-   whose change raises the project's version is a release too and follows the same answer; other
-   task pull requests are not affected. "Should the agent merge a release by itself, or leave that
+   Before asking, explain: a release is the pull request that raises the project's version — the
+   release notes made last, or a release epic's final pull request; with `agent` (default) the run
+   merges it once CI passed and its notes cover everything on the main branch, a `major` always
+   left as a draft; with `human` it opens it and leaves that merge to them. Other pull requests,
+   a feature epic's final one included, are not affected. "Should the agent merge a release by itself, or leave that
    one to you?" Recommend `human` to someone whose main branch deploys or who wants to choose
    when a release goes out.
 6. **CI wait** (`agent.ci_timeout`) — only with `merge` at either level. "How many minutes should it wait for
@@ -169,7 +169,7 @@ live session (`checkout.busy_ttl`, 12h) and how long a running `jig verify` hold
 (`verify.busy_ttl`, 30m). Set one only when the person brings it up — a test suite that runs
 longer than half an hour is the usual reason to raise `verify.busy_ttl`.
 
-Ask about no other key. If `jig config set` refuses a key as not local, this version of Jig
+Ask about no other personal key. If `jig config set` refuses a key as not local, this version of Jig
 does not have it: drop the question.
 
 ## 3. Show the whole file, then write
@@ -188,3 +188,32 @@ with the person, never by editing the file yourself.
 If it warns that the file is not ignored by git, say so and offer `jig init`, which adds the
 line to `.gitignore`. End with `.ai/scripts/jig status`: its `config.local:` lines are what
 took effect.
+
+## 4. The team's git flow, when `jig doctor` offers it
+
+Only when `.ai/scripts/jig doctor` has a `git flow` line saying origin has a stage or staging branch.
+This answer is the team's, not the person's: say so. Describe both flows in plain words:
+
+```
+ask   Do tasks in this project get tested on the staging branch before the main branch?
+      direct    a task goes straight to the main branch (default)
+      staging   a task lands on the staging branch first, for testing, and reaches
+                the main branch after someone says it is ready
+```
+
+A branch of that name may be for something else, so recommend nothing unless they have told you
+how they work. On `staging`, show the two lines, naming their branch, as they would go into
+`.ai/config.yaml`, and say the change reaches the team as an ordinary diff in a pull request:
+
+```
+git.flow: staging
+git.staging_branch: <branch>
+```
+
+On `direct`, show the one line `git.flow: direct` instead: it records the answer, so the team is
+not asked again. On "skip", write nothing.
+
+After a yes this is a change to a tracked file, so it goes through the `jig-task` skill as any
+change. Start the task first, since `jig task start` refuses a tree with uncommitted changes. Then
+add the line or lines in that task's tree, and nothing else, run `.ai/scripts/jig doctor`, show
+its `git flow` line, and ship it to a pull request with `jig task ship`.

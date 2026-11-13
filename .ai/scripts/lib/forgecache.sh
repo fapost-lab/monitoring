@@ -6,13 +6,16 @@
 #
 #   .ai/runtime/forge-cache, one line per pull request, newest first as the
 #   forge listed them:
-#     <head><TAB><base><TAB><state><TAB><ci><TAB><fetched_at><TAB><head-commit><TAB><url>
+#     <head><TAB><base><TAB><state><TAB><ci><TAB><fetched_at><TAB><head-commit><TAB><url><TAB><mergeable>
 #   <state> open|merged|closed; <ci> green|red|pending|none, `-` when it was
 #   not asked (a pull request that is not open, a forge that does not list it);
 #   <fetched_at> UTC, when the forge said so; <head-commit> and <url> the pull
-#   request's head and address, `-` when the forge did not say. A line written
-#   before the last two columns existed ends at <fetched_at> and reads as if
-#   both were `-`. Lines starting with `#` are comments.
+#   request's head and address, `-` when the forge did not say; <mergeable>
+#   conflicting|mergeable for an open pull request the forge judged against
+#   its base, `-` otherwise (read by the staging drift report,
+#   jig_staging_drift). A line written before a column existed ends before it
+#   and reads as if each missing one were `-`. Lines starting with `#` are
+#   comments.
 #
 # The file lives in the runtime directory of the checkout that owns the task
 # workspaces: a worktree that borrows the owner's `tasks/` (ADR-0029) reads the
@@ -52,7 +55,7 @@ forgecache_write() {
   jig_cleanup_add "$tmp"
   mkdir -p "${file%/*}" 2>/dev/null || return 0
   {
-    printf '# jig forge cache: <head> <base> <state> <ci> <fetched_at> <head-commit> <url>, written by jig housekeeping\n'
+    printf '# jig forge cache: <head> <base> <state> <ci> <fetched_at> <head-commit> <url> <mergeable>, written by jig housekeeping\n'
     [ -z "$rows" ] || printf '%s\n' "$rows"
   } > "$tmp" 2>/dev/null || return 0
   mv "$tmp" "$file" 2>/dev/null || return 0

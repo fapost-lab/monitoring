@@ -73,6 +73,9 @@ Usage: jig <command> [args]
   task findings <id> [--blocking]  list findings; --blocking exits 1 while any block completion
   task ship <id> --message-file <f> [...]
                                  commit/push/open a pull request, up to agent.git's level
+  task promote <id> [--commit <sha>]
+                                 prepare for prod: a task tested on the staging branch
+                                 gets its pull request into the base branch
   task receipt <id> --stage review|architecture-review
                                  pin what was reviewed; --check reports drift, exit 1 if stale;
                                  --since-review prints what changed since, for a re-review
@@ -143,6 +146,8 @@ Usage: jig <command> [args]
   writes [list] [--json]         edits Jig committed in its own tree that have not landed
   writes ship <target> [--json]  carry one as far as agent.git allows; at merge, merge it
                                  once CI passed (<target> is spec:<id> or knowledge)
+  refresh [--json]               fetch origin and fast-forward the base branch, never
+                                 moving your checkout or touching your changes
   housekeeping [--dry-run] [--verbose]  reconcile workspaces with remote state
   config set <key> <value> [...] --local [--dry-run | --revision <n>] [--json]
                                  write your own settings to .ai/config.local.yaml;
@@ -188,7 +193,7 @@ main() {
         v=$(jig_source_version "$root" 2>/dev/null) || v=""
       fi
       printf 'jig %s\n' "${v:-$JIG_VERSION}" ;;
-    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|pr|gh|housekeeping|measure|doctor|config|notify)
+    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|refresh|pr|gh|housekeeping|measure|doctor|config|notify)
       if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
         jig_die "command '$cmd' is not available in jig $JIG_VERSION"
       fi

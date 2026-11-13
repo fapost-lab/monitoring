@@ -1,15 +1,24 @@
 # Release notes — what the notes task checks
 
 The notes task writes the project's release pages — changelog, upgrade guide, known issues,
-roadmap — for everything between the last release and the epic: the epic's tasks and whatever
-reached the default branch directly. Only the pages the project has: a page it does not keep —
-no known issues, no roadmap, no user documentation at all — is not created by the release. Say in
-the pull request which ones are missing; whether to start one is the person's call. List the
-changes from git, not from memory:
+roadmap — for everything between the last release and the default branch's tip: the tasks merged
+there, and on a release epic the epic's tasks too. Only the pages the project has: a page it does
+not keep — no known issues, no roadmap, no user documentation at all — is not created by the
+release. Say in the pull request which ones are missing; whether to start one is the person's
+call. List the changes from git, not from memory, against the default branch as origin has it now
+— the task's branch may have been cut before the latest merges:
 
 ```
-git log --first-parent --merges <last-tag>..HEAD
+git fetch origin <default>
+git log --first-parent --merges <last-tag>..origin/<default>
 ```
+
+On a release epic, add the epic's own merges (`git log --first-parent --merges origin/<default>..HEAD`).
+
+When the notes cover that range, record its end:
+`jig task set <id> notes_through $(git rev-parse origin/<default>)`. The release is refused while
+the default branch has commits after it; when it moves, fetch, describe what came in, and record
+the new tip.
 
 A pull request's title and body are claims; its diff is what happened (`jig gh pr diff <n>` or
 `git show`). Every line below is checked against the diff.

@@ -483,8 +483,15 @@ _jig_checkout_record_inner() {
 # task: were it taken, the record's write would raise the clone's revision
 # before the command's own claim of `--revision <n>`, and a close from a
 # session would always be refused as stale-revision.
+#
+# `task artifact read` is reading. `task artifact write|append <id> task` on a
+# task nobody started (no `branch:` in its state) is filing it: the goal goes
+# in with the task, by whoever found the work — often a session busy with
+# something else — and it would hold the task for checkout.busy_ttl against
+# everyone. Any other document, or the goal of a started task, is working it:
+# discovery before `task start` is how a T3 is worked first.
 _jig_checkout_works() {
-  local a
+  local a filing=0
   case "${1:-}" in
     task)
       case "${2:-}" in
@@ -494,6 +501,12 @@ _jig_checkout_works() {
       case "$*" in
         "task set "*" status consolidated" | "task set "*" status consolidated "*) return 1 ;;
       esac
+      if [ "$2" = artifact ]; then
+        case "${3:-}" in
+          read) return 1 ;;
+          write | append) [ "${5:-}" != task ] || filing=1 ;;
+        esac
+      fi
       shift 2
       ;;
     context) shift ;;
@@ -503,6 +516,10 @@ _jig_checkout_works() {
     case "$a" in -*) continue ;; esac
     jig_valid_id "$a" || continue
     [ -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$a/state" ] || continue
+    if [ "$filing" = 1 ] \
+      && ! grep -q '^branch: *[^ ]' "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$a/state" 2>/dev/null; then
+      return 1
+    fi
     printf '%s\n' "$a"
     return 0
   done
@@ -776,7 +793,7 @@ jig_checkout_busy() {
   return 0
 }
 
-# jig_checkout_occupants [<id to ignore>] — the records of jig_checkout_busy
+# jig_checkout_occupants [<id to ignore>] [<parked-ids>] — the records of jig_checkout_busy
 # that occupy this checkout's HEAD, in the same "<name> <seconds> <command>"
 # lines. The one rule for every command that moves HEAD here: `task start`
 # and `upgrade` both refuse on it, and neither keeps a filter of its own
@@ -790,16 +807,25 @@ jig_checkout_busy() {
 # a session id, a task that was only filed, a closed one, or one whose branch
 # went back to the base has no HEAD here to lose, whatever its age says.
 #
+# A task parked at the staging branch does not occupy it either: its work is
+# shipped, and it holds no current-task slot until `jig task resume` takes it
+# back (adr-20261112-a-task-waiting-at-staging-is-parked-and-resuming-it-is-its-status).
+# A dirty tree is still refused by `task start` itself. Which tasks are parked
+# is `jig task`'s answer, not this file's: the caller passes their ids in
+# <parked-ids> (task.sh's _task_parked_ids_here), newline-separated; a caller
+# that passes none, as `jig upgrade` does, counts a parked task's record too.
+#
 # State is read by the shell alone (_jig_checkout_read): this file never
 # sources task.sh, and a fork per record is the shape conventions/shell.md
 # forbids.
 jig_checkout_occupants() {
-  local ignore="${1:-}" head name age cmd state
+  local ignore="${1:-}" parked="${2:-}" head name age cmd state nl=$'\n'
   _jig_checkout_ready || return 0
   head=$(_jig_checkout_head)
   [ -n "$head" ] || return 0
   while read -r name age cmd; do
     [ -n "$name" ] || continue
+    case "$nl$parked$nl" in *"$nl$name$nl"*) continue ;; esac
     state="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$name/state"
     [ -f "$state" ] || continue
     _jig_checkout_read "$state" status || _JIG_CHECKOUT_READ=""

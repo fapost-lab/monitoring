@@ -253,6 +253,12 @@ git.branch_per_task|true|boolean|true,false|Whether starting a task creates and 
 git.branch_template|task/{id}|text||The name of a task's branch; {id} is the task id.
 git.worktree_root|../<project>.worktrees|text||Where task worktrees are made.
 git.delete_merged_branches|true|boolean|true,false|Whether a branch Jig made is deleted once its work has landed.
+git.flow|direct|choice|direct,staging|How a task travels: straight to the base branch, or through a staging branch first.
+git.staging_branch||text||The branch a task lands on before the base branch, in the staging flow.
+git.staging_land|pr|choice|pr,external|How a task lands on the staging branch: a pull request, or merged by CI.
+git.staging_review|ask|choice|ask,require,none|Whether an approval is needed before a task lands on the staging branch.
+git.promote_merge|human|choice|human,auto|Who merges the pull request into the base branch that prepare for prod opens.
+git.staging_stale_after|14d|duration||How long a task may wait on the staging branch with no promotion before jig status names it.
 worktree.carry|[]|list||Extra paths copied into a new task worktree.
 worktree.share|[]|list||Directories a new task worktree shares with this checkout.
 worktree.setup||text||A command run in a new task worktree after it is made.
@@ -749,6 +755,120 @@ _cfg_route_depth() {
   esac
 }
 
+# --- the git flow -------------------------------------------------------------
+# Which git flow the project picked, and its bricks: all project keys, because a
+# flow is the team's and not one person's. Each reader prints the value and
+# exits 0, or prints the value read and exits 1, like jig_agent_git.
+
+jig_git_flow() {
+  local value
+  value=$(cfg git.flow direct)
+  printf '%s\n' "$value"
+  case "$value" in direct | staging) return 0 ;; *) return 1 ;; esac
+}
+
+# jig_staging_branch — the staging branch's name, empty when none is named.
+jig_staging_branch() {
+  cfg git.staging_branch ""
+}
+
+jig_staging_land() {
+  local value
+  value=$(cfg git.staging_land pr)
+  printf '%s\n' "$value"
+  case "$value" in pr | external) return 0 ;; *) return 1 ;; esac
+}
+
+jig_staging_review() {
+  local value
+  value=$(cfg git.staging_review ask)
+  printf '%s\n' "$value"
+  case "$value" in ask | require | none) return 0 ;; *) return 1 ;; esac
+}
+
+jig_promote_merge() {
+  local value
+  value=$(cfg git.promote_merge human)
+  printf '%s\n' "$value"
+  case "$value" in human | auto) return 0 ;; *) return 1 ;; esac
+}
+
+# jig_staging_stale_after — how long a task may wait on the staging branch with
+# no promotion before the drift report names it, as given (`14d` by default);
+# exits 1 on a value that is not a duration (jig_duration_seconds' form).
+jig_staging_stale_after() {
+  local value
+  value=$(cfg git.staging_stale_after 14d)
+  printf '%s\n' "$value"
+  case "${value%[dhms]}" in
+    '' | *[!0-9]* | ?????????*) return 1 ;;
+  esac
+  return 0
+}
+
+# jig_git_flow_problems — one line per fault in the project's choice of flow,
+# nothing when it is sound. The bricks are looked at only in the staging flow:
+# the direct flow reads none of them.
+jig_git_flow_problems() {
+  local flow branch value
+  if ! flow=$(jig_git_flow); then
+    printf "git.flow: '%s' is not a flow: direct or staging\n" "$flow"
+    return 0
+  fi
+  [ "$flow" = staging ] || return 0
+  branch=$(jig_staging_branch)
+  if [ -z "$branch" ]; then
+    printf 'git.staging_branch: the staging flow needs the name of the staging branch\n'
+  elif ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+    printf "git.staging_branch: git rejects the name '%s'\n" "$branch"
+  elif case "$branch" in refs/* | origin/*) true ;; *) false ;; esac; then
+    printf "git.staging_branch: '%s' is a ref; write the branch's own name, as in git.base_branch\n" "$branch"
+  elif [ "$branch" = "$(cfg git.base_branch main)" ]; then
+    printf "git.staging_branch: '%s' is the base branch; the staging branch has to be another one\n" "$branch"
+  fi
+  if ! value=$(jig_staging_land); then
+    printf "git.staging_land: '%s' is not pr or external\n" "$value"
+  fi
+  if ! value=$(jig_staging_review); then
+    printf "git.staging_review: '%s' is not ask, require or none\n" "$value"
+  fi
+  if ! value=$(jig_promote_merge); then
+    printf "git.promote_merge: '%s' is not human or auto\n" "$value"
+  fi
+  return 0
+}
+
+# jig_staging_in_use — print the staging branch's name and exit 0 when the
+# project's flow is `staging` and jig_git_flow_problems finds nothing in it;
+# exit 1, printing nothing, otherwise. Every reader of a task's staging state
+# asks this first, so a project on the `direct` flow, or one whose choice
+# cannot work, sees nothing new anywhere (jig doctor names what is wrong).
+jig_staging_in_use() {
+  local flow
+  cfg_v flow git.flow direct
+  [ "$flow" = staging ] || return 1
+  [ -z "$(jig_git_flow_problems)" ] || return 1
+  jig_staging_branch
+}
+
+# jig_staging_offer — the branches named stage or staging that origin has as of
+# the last fetch, one per line, and nothing once the project has named a flow:
+# turning the flow on is a person's answer, and a branch of that name may be for
+# something else. Reads refs only, never the network.
+jig_staging_offer() {
+  local file b
+  file=$(jig_config_file)
+  if [ -f "$file" ] && _config_has_key "$file" git.flow; then
+    return 0
+  fi
+  for b in stage staging; do
+    if git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+      printf '%s\n' "$b"
+    fi
+  done
+  return 0
+}
+
 # _cfg_chat_id <value> — exit 0 when <value> is a Telegram chat id: digits,
 # with a leading `-` for a group, or a public `@name`. Shared by `jig config
 # set` and the sender (notify.sh), which checks a value written by hand before
@@ -835,7 +955,7 @@ jig_config_value_problem() {
       esac
       ;;
     housekeeping.trash_ttl | housekeeping.abandoned_ttl | housekeeping.stale_after \
-      | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout)
+      | git.staging_stale_after | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout)
       case "${value%[dhms]}" in
         '' | *[!0-9]* | ?????????*) printf 'not a duration (e.g. 7d, 12h, 30m, 90s)\n'; return 1 ;;
       esac

@@ -66,8 +66,15 @@ fm_has() {
 # first closing `---` delimiter. Prints nothing when there is no frontmatter.
 fm_block() {
   local __fmb_block
-  _fm_scan_v __fmb_block "$1" || [ -n "$__fmb_block" ] || return 0
+  fm_block_v __fmb_block "$1"
   [ -z "$__fmb_block" ] || printf '%s\n' "$__fmb_block"
+}
+
+# fm_block_v <var> <file> — fm_block into <var>, without a process: an unclosed
+# frontmatter is read up to the end of the file, a file with none leaves <var>
+# empty. Always exit 0; fm_read_v is the reader that refuses an unclosed one.
+fm_block_v() {
+  _fm_scan_v "$1" "$2" || :
 }
 
 # fm_read_v <var> <file> — the frontmatter into <var>; exit 1, with <var> empty,

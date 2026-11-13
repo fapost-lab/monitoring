@@ -180,13 +180,21 @@ It commits, pushes and opens the pull request into the task's base as far as thi
 `agent.git`, or `autopilot.git` for a task in an autopilot run — names the key on its
 `git level` line, and says where it stopped. At `merge` it then waits for CI and prints
 `merged <url>` or `not merged: <why>`; a pull request left open is an ordinary end — say why.
-Exit 3 means `none`: tell the human the change is ready for their review and commit. The step it stopped at is the human's; never finish
+Exit 3 means `none`: tell the human the change is ready for their review and commit.
+On the staging flow the pull request goes into the staging branch, and at `merge` it lands there:
+`landed <url> on <staging> …` or `not landed: <why>`, both ordinary ends. Exit 3 there is the
+person's decision — no approval yet (ask: land without review, `jig task land <id>
+--without-review`, or wait), or a push the staging branch refused. Exit 5 is a conflict: resolve
+every listed path in the temporary worktree it names, any file, run the tests that cover them
+there, `git add`, write how each conflict was resolved to a file outside the repository, and run
+`jig task land <id> --resolved --note-file <file>`; name the resolution in your report. The task
+stays `ready` and is not closed: it waits on staging for "prepare for prod". The step it stopped at is the human's; never finish
 it by hand with git. The first line of the message is the pull request's title, the rest its
 body: the task's goal and what verified it. When the task edited a file a stub links, the body carries
 the block `jig knowledge changed --task <id> --to-review` prints, as it is (an autopilot run's
 report holds the same block): only a human approves the new text, in `jig-accept`.
 
-Once a pull request exists, `task ship` hands every P2 and P3 still `open` to one triage task,
+Once a pull request exists — or at the push under `git.staging_land: external`, which opens none — `task ship` hands every P2 and P3 still `open` to one triage task,
 `<id>-findings`, filed not started and not queued, and says so; a second ship files no second
 one. Name it in your report: it is where a person decides what the review left, and it closes as
 §6 says for a triage task.

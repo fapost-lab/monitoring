@@ -175,4 +175,19 @@ cmd_self_update() {
   else
     _self_update_detached "$source" "$global"
   fi
+  _self_update_global_skill "$source" "$global"
+}
+
+# _self_update_global_skill <source> <global> — place jig-pr-review for the
+# person, with the code of the release just checked out, not the one that
+# was running: the update may have changed how it is placed
+# (adr-20261112-the-pr-review-skill-is-installed-per-user). A release without
+# that file places nothing.
+_self_update_global_skill() {
+  local source="$1" global="$2" version
+  [ -f "$source/scripts/lib/globalskill.sh" ] || return 0
+  version=$(jig_version_of "$global" 2>/dev/null) || version=unknown
+  # shellcheck source=globalskill.sh
+  . "$source/scripts/lib/globalskill.sh"
+  jig_global_skill_place "$source" "$version"
 }

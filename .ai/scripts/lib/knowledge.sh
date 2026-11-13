@@ -15,6 +15,7 @@ KM_USAGE="usage: jig knowledge check [--quiet]
        jig knowledge proposed [--json]
        jig knowledge accept <id>... [--revision <n>] [--json]
        jig knowledge reject <id>... [--revision <n>] [--json]
+       jig knowledge decide [--accept <id>]... [--reject <id>]... [--reviewed <id>]... [--date YYYY-MM-DD] [--revision <n>] [--json]
        jig knowledge inventory [--scope <dir>]
        jig knowledge stale [--strict]
        jig knowledge reviewed <id>... [--date YYYY-MM-DD] [--revision <n>] [--json]
@@ -31,7 +32,7 @@ cmd_knowledge() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
   case "$sub" in
-    check | new | paths | stale | reviewed | accept | reject | proposed | inventory | summary | stages | changed | sources | read | adr-convention) ;;
+    check | new | paths | stale | reviewed | accept | reject | decide | proposed | inventory | summary | stages | changed | sources | read | adr-convention) ;;
     *) jig_die "$KM_USAGE" ;;
   esac
 
@@ -60,9 +61,11 @@ cmd_knowledge() {
   # on a branch of its own in Jig's own tree; the plain text form writes the working
   # tree, as `jig-accept` and `jig-consolidate` mean it to
   # (adr-20261104-a-write-goes-in-jigs-own-tree).
+  # `decide` has no working-tree form: it is always a write in the tree.
   case "$sub" in
-    accept | reject | reviewed)
+    accept | reject | reviewed | decide)
       local darg as_tree=""
+      [ "$sub" != decide ] || as_tree=1
       for darg in "$@"; do
         case "$darg" in
           --json)
@@ -727,10 +730,12 @@ km_is_proposed() {
 # number on stdout. For `jig status`, which reports the count and leaves the
 # listing to `jig knowledge proposed`.
 km_proposed_count() {
-  local doc count=0
+  local doc count=0 landed
+  landed=$(_km_landed_paths)
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
     km_is_proposed "$doc" || continue
+    [ -z "$landed" ] || ! jig_has_line "$(km_rel "$doc")" "$landed" || continue
     count=$((count + 1))
   done < <(km_docs)
   printf '%s\n' "$count"
@@ -2288,15 +2293,28 @@ km_reviewed_check() {
 
 _KM_DECIDE_JSON=""
 
-# _km_decide_main <accept|reject|reviewed> <id>... [--date <d>] [--revision <n>] [--json]
-# — the decision committed on `knowledge/decisions`, in Jig's own tree (lib/owntree.sh).
-# Judged by the documents on that branch and not the ones in any checkout, so one already
-# decided and waiting is `not-proposed`, and one only in this checkout is `not-on-base` or
-# `not-on-branch` (_km_refuse_what_is_only_here); `km_accept`, `km_reject` and
-# `km_reviewed` run as they are, with JIG_PROJECT pointed at the tree.
+# _km_decide_main <accept|reject|reviewed|decide> <args>... — the decisions committed on
+# `knowledge/decisions`, in Jig's own tree (lib/owntree.sh), as one write: one fetch, one
+# claim, one commit, one push. `accept|reject|reviewed <id>... [--date <d>] [--revision <n>]
+# [--json]` decide their ids one way; `decide [--accept <id>]... [--reject <id>]...
+# [--reviewed <id>]... [--date <d>] [--revision <n>] [--json]` decides each id the way its
+# flag says, so a page can send what a person decided on several documents at the revision
+# they read (task knowledge-decide-batch). Judged by the documents on that branch and not
+# the ones in any checkout, so one already decided and waiting is `not-proposed`, and one
+# only in this checkout is `not-on-base` or `not-on-branch` (_km_refuse_what_is_only_here);
+# `km_accept`, `km_reject` and `km_reviewed` run as they are, with JIG_PROJECT pointed at
+# the tree. Any refusal refuses the whole call, before anything is written.
+#
+# _KM_DEC_KINDS and _KM_DEC_IDS — the decisions, in the order given: `accept`, `reject` or
+# `reviewed`, and the id. `decide` takes an id once; the one-way commands drop a repeat,
+# as they always did.
+_KM_DEC_KINDS=()
+_KM_DEC_IDS=()
 _km_decide_main() {
-  local sub="$1" ids=() date="" rev="" rev_given="" arg
+  local sub="$1" date="" rev="" rev_given="" arg kind i n
   shift
+  _KM_DEC_KINDS=()
+  _KM_DEC_IDS=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --json) shift ;;
@@ -2304,14 +2322,30 @@ _km_decide_main() {
         [ $# -ge 2 ] || jig_fail usage "knowledge $sub: --revision requires a value"
         rev=$2; rev_given=1; shift 2 ;;
       --date)
-        [ "$sub" = reviewed ] || jig_fail usage "knowledge $sub: unexpected argument: $1"
+        case "$sub" in reviewed | decide) ;; *) jig_fail usage "knowledge $sub: unexpected argument: $1" ;; esac
         [ $# -ge 2 ] || jig_fail usage "knowledge $sub: --date requires a value"
         date=$2; shift 2 ;;
+      --accept | --reject | --reviewed)
+        [ "$sub" = decide ] || jig_fail usage "knowledge $sub: unexpected argument: $1"
+        [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ] \
+          || jig_fail usage "knowledge decide: $1 requires a document id"
+        _km_decide_add "${1#--}" "$2"
+        shift 2 ;;
       -*) jig_fail usage "knowledge $sub: unexpected argument: $1" ;;
-      *) ids+=("$1"); shift ;;
+      *)
+        [ "$sub" != decide ] || jig_fail usage "knowledge decide: unexpected argument: $1 (name each id with --accept, --reject or --reviewed)"
+        _km_decide_add "$sub" "$1"
+        shift ;;
     esac
   done
-  [ "${#ids[@]}" -ge 1 ] || jig_fail usage "knowledge $sub: give at least one document id"
+  n=${#_KM_DEC_IDS[@]}
+  if [ "$n" -lt 1 ]; then
+    [ "$sub" != decide ] || jig_fail usage "knowledge decide: give at least one --accept, --reject or --reviewed <id>"
+    jig_fail usage "knowledge $sub: give at least one document id"
+  fi
+  if [ "$sub" = decide ] && [ -n "$date" ] && ! _km_decide_has reviewed; then
+    jig_fail usage "knowledge decide: --date dates a --reviewed decision, and none was given"
+  fi
   [ -z "$rev_given" ] || [ -n "$rev" ] || jig_fail usage "knowledge $sub: --revision is empty"
   [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "knowledge $sub: --revision is not a revision: $rev"
   if [ -n "$date" ]; then
@@ -2322,7 +2356,7 @@ _km_decide_main() {
   fi
   jig_require_init
   km_init
-  _km_here_facts "${ids[@]}"
+  _km_here_facts "${_KM_DEC_IDS[@]}"
   # shellcheck source=lib/owntree.sh
   . "$JIG_LIB/owntree.sh"
   ot_begin "knowledge $sub" knowledge "$rev"
@@ -2332,15 +2366,10 @@ _km_decide_main() {
   ot_open knowledge/decisions "$default"
   msg=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-msg.XXXXXX")
   jig_cleanup_add "$msg"
-  _km_decide_in_tree "$sub" "$date" "${ids[@]}"
-  arg=$(km_dedupe_ids "${ids[@]}" | sed '$!s/$/,/' | tr '\n' ' ' | sed 's/ $//')
-  case "$sub" in
-    accept) printf 'Accept knowledge: %s\n' "$arg" > "$msg" ;;
-    reject) printf 'Reject knowledge: %s\n' "$arg" > "$msg" ;;
-    reviewed) printf 'Mark knowledge reviewed: %s\n' "$arg" > "$msg" ;;
-  esac
+  _km_decide_in_tree "$sub" "$date"
+  _km_decide_message > "$msg"
   ot_commit "$msg" "$JIG_AI_DIR/knowledge"
-  ot_ship "Knowledge decisions" "Decisions on knowledge, made through Jig on a branch of its own: nobody's checkout moved. Each commit is one decision, and further decisions land here."
+  ot_ship "Knowledge decisions" "Decisions on knowledge, made through Jig on a branch of its own: nobody's checkout moved. Each commit is one call's decisions, and further decisions land here."
   rm -f "$msg"
   if [ -n "$_KM_DECIDE_JSON" ]; then
     local w
@@ -2348,41 +2377,136 @@ _km_decide_main() {
     w=$_JSON
     printf '{"decisions":[%s],"write":%s}\n' "$_KM_DECIDE_ROWS" "$w"
   else
-    printf 'knowledge %s:%s\n' "$sub" " $arg"
+    if [ "$sub" = decide ]; then
+      arg=""
+      for kind in accept reject reviewed; do
+        i=$(_km_decide_ids_of "$kind" | sed '$!s/$/,/' | tr '\n' ' ' | sed 's/ $//')
+        [ -z "$i" ] || arg="$arg${arg:+; }$kind $i"
+      done
+    else
+      arg=$(_km_decide_ids_of "$sub" | sed '$!s/$/,/' | tr '\n' ' ' | sed 's/ $//')
+    fi
+    printf 'knowledge %s: %s\n' "$sub" "$arg"
     ot_answer_text
   fi
 }
 
-# _km_decide_in_tree <sub> <date> <id>... — validate, claim, apply: the order a write
-# against a revision owes, and fm_set raises the revision, so nothing may be applied
-# before the claim. JIG_PROJECT is the tree for exactly this long.
+# _km_decide_add <kind> <id> — one decision more. `decide` refuses an id given twice,
+# the same way or two ways: a person decided one document once. The one-way commands
+# drop a repeat, as km_dedupe_ids always did for them.
+_km_decide_add() {
+  local i=0
+  while [ "$i" -lt "${#_KM_DEC_IDS[@]}" ]; do
+    if [ "${_KM_DEC_IDS[$i]}" = "$2" ]; then
+      [ "$sub" != decide ] || jig_fail usage "knowledge decide: $2 is given twice; decide each document once"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  _KM_DEC_KINDS+=("$1")
+  _KM_DEC_IDS+=("$2")
+}
+
+# _km_decide_has <kind> — some decision of the call is <kind>.
+_km_decide_has() {
+  local k
+  for k in ${_KM_DEC_KINDS[@]+"${_KM_DEC_KINDS[@]}"}; do
+    [ "$k" != "$1" ] || return 0
+  done
+  return 1
+}
+
+# _km_decide_ids_of <kind> — the ids decided <kind>, one per line, in the order given.
+_km_decide_ids_of() {
+  local i=0
+  while [ "$i" -lt "${#_KM_DEC_IDS[@]}" ]; do
+    [ "${_KM_DEC_KINDS[$i]}" != "$1" ] || printf '%s\n' "${_KM_DEC_IDS[$i]}"
+    i=$((i + 1))
+  done
+}
+
+# _km_decide_kind_of <id> — how the call decides <id>; empty when it does not name it.
+_km_decide_kind_of() {
+  local i=0
+  while [ "$i" -lt "${#_KM_DEC_IDS[@]}" ]; do
+    if [ "${_KM_DEC_IDS[$i]}" = "$1" ]; then
+      printf '%s\n' "${_KM_DEC_KINDS[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+}
+
+# _km_decide_message — the commit message. Decisions of one kind keep the subject they
+# always had; several kinds name the count, and a line per kind lists its ids.
+_km_decide_message() {
+  local kind ids n=0 kinds=0 only=""
+  for kind in accept reject reviewed; do
+    _km_decide_has "$kind" || continue
+    kinds=$((kinds + 1))
+    only=$kind
+  done
+  if [ "$kinds" -eq 1 ]; then
+    ids=$(_km_decide_ids_of "$only" | sed '$!s/$/,/' | tr '\n' ' ' | sed 's/ $//')
+    case "$only" in
+      accept) printf 'Accept knowledge: %s\n' "$ids" ;;
+      reject) printf 'Reject knowledge: %s\n' "$ids" ;;
+      reviewed) printf 'Mark knowledge reviewed: %s\n' "$ids" ;;
+    esac
+    return 0
+  fi
+  n=${#_KM_DEC_IDS[@]}
+  printf 'Decide knowledge: %s decisions\n\n' "$n"
+  for kind in accept reject reviewed; do
+    ids=$(_km_decide_ids_of "$kind" | sed '$!s/$/,/' | tr '\n' ' ' | sed 's/ $//')
+    [ -z "$ids" ] || printf '%s: %s\n' "$kind" "$ids"
+  done
+}
+
+# _km_decide_in_tree <sub> <date> — validate, claim, apply: the order a write against a
+# revision owes, and fm_set raises the revision, so nothing may be applied before the
+# claim. Every kind is checked before any is claimed: one refusal refuses the call.
+# JIG_PROJECT is the tree for exactly this long.
 _KM_DECIDE_ROWS=""
 _km_decide_in_tree() {
-  local sub="$1" date="$2" JIG_PROJECT="$OT_TREE" id doc word sep="" rec path
-  shift 2
+  local sub="$1" date="$2" JIG_PROJECT="$OT_TREE" id doc word sep="" path i=0 kind
+  local acc=() rej=() rev=()
   km_init
   _km_refuse_what_is_only_here "$sub"
-  case "$sub" in
-    accept) km_accept_check "$@"; word=accepted ;;
-    reject) km_reject_check "$@"; word=rejected ;;
-    reviewed) km_reviewed_check "$@"; word=reviewed ;;
-  esac
+  while [ "$i" -lt "${#_KM_DEC_IDS[@]}" ]; do
+    case "${_KM_DEC_KINDS[$i]}" in
+      accept) acc+=("${_KM_DEC_IDS[$i]}") ;;
+      reject) rej+=("${_KM_DEC_IDS[$i]}") ;;
+      reviewed) rev+=("${_KM_DEC_IDS[$i]}") ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "${#acc[@]}" -eq 0 ] || km_accept_check "${acc[@]}"
+  [ "${#rej[@]}" -eq 0 ] || km_reject_check "${rej[@]}"
+  [ "${#rev[@]}" -eq 0 ] || km_reviewed_check "${rev[@]}"
   _KM_DECIDE_ROWS=""
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
+  i=0
+  while [ "$i" -lt "${#_KM_DEC_IDS[@]}" ]; do
+    id=${_KM_DEC_IDS[$i]}
+    kind=${_KM_DEC_KINDS[$i]}
+    case "$kind" in
+      accept) word=accepted ;;
+      reject) word=rejected ;;
+      reviewed) word=reviewed ;;
+    esac
     doc=$(km_doc_by_id "$id") || exit 1
     path=$(km_rel "$doc")
     json_decide_row "$id" "$word" "$path"
     _KM_DECIDE_ROWS="$_KM_DECIDE_ROWS$sep$_KM_ROW"
     sep=,
-  done < <(km_dedupe_ids "$@")
+    i=$((i + 1))
+  done
   ot_claim
-  case "$sub" in
-    accept) km_accept "$@" >/dev/null ;;
-    reject) km_reject "$@" >/dev/null ;;
-    reviewed)
-      if [ -n "$date" ]; then km_reviewed "$@" --date "$date" >/dev/null; else km_reviewed "$@" >/dev/null; fi ;;
-  esac
+  [ "${#acc[@]}" -eq 0 ] || km_accept "${acc[@]}" >/dev/null
+  [ "${#rej[@]}" -eq 0 ] || km_reject "${rej[@]}" >/dev/null
+  if [ "${#rev[@]}" -gt 0 ]; then
+    if [ -n "$date" ]; then km_reviewed "${rev[@]}" --date "$date" >/dev/null; else km_reviewed "${rev[@]}" >/dev/null; fi
+  fi
 }
 
 # _km_here_facts <id>... — what this checkout shows of each id, before the write judges
@@ -2424,7 +2548,8 @@ _km_here_facts() {
 }
 
 # _km_refuse_what_is_only_here <sub> — refuse, before the claim and with nothing written,
-# a decision on what this checkout shows and the tree does not carry. The question is the
+# a decision on what this checkout shows and the tree does not carry. Each id is asked
+# about as the call decides it (_km_decide_kind_of), <sub> naming the command. The question is the
 # read's (_km_decidable_reasons), asked of the same rows with the same _km_ref_holds, at the
 # commit the tree stands on: the document's path, and for a `reject` of a stub whose source
 # changed or went here, that change. `not-on-branch` when the base has it and the tree, on a
@@ -2444,7 +2569,7 @@ _km_refuse_what_is_only_here() {
   : > "$rows.ids"
   while [ "$i" -lt "${#_KM_HERE_IDS[@]}" ]; do
     if [ -n "${_KM_HERE_PATHS[$i]}" ]; then
-      case "$sub:${_KM_HERE_STATES[$i]}" in
+      case "$(_km_decide_kind_of "${_KM_HERE_IDS[$i]}"):${_KM_HERE_STATES[$i]}" in
         reject:changed | reject:missing)
           printf '%s%s%s%s%s\n' "${_KM_HERE_PATHS[$i]}" "$t" "${_KM_HERE_SRCS[$i]}" "$t" "${_KM_HERE_HASHES[$i]}" >> "$rows" ;;
         *) printf '%s%s%s\n' "${_KM_HERE_PATHS[$i]}" "$t" "$t" >> "$rows" ;;
@@ -2522,12 +2647,71 @@ _km_ref_holds() {
   rm -f "$listing"
 }
 
+# _km_landed_paths — the knowledge documents, one repository-relative path a line, that
+# wait for a decision here and that origin's base already decided: a proposal the base
+# no longer holds as proposed, a stub the base holds as rejected, or one the base
+# approved at the text its source has there and here. This checkout is only behind: the
+# decision landed, and the read must not ask for it again
+# (adr-20261112-refresh-brings-the-clone-up-to-origin). The difference has to be the
+# base's: a document this checkout changed since it forked from the base (a branch that
+# proposes it again) is its own, and never listed. Only documents that differ from the
+# base are read, so a clone in step pays one `git diff`; the answer is kept for the rest
+# of the command, which asks it for each count and read. No network.
+_KM_LANDED=""
+_KM_LANDED_DONE=""
+_km_landed_paths() {
+  if [ -z "$_KM_LANDED_DONE" ]; then
+    _KM_LANDED=$(_km_landed_paths_read)
+    _KM_LANDED_DONE=1
+  fi
+  [ -z "$_KM_LANDED" ] || printf '%s\n' "$_KM_LANDED"
+}
+
+_km_landed_paths_read() {
+  local base_ref rel doc st hash bst bhash src bsrc mb
+  base_ref=$(jig_base_ref "$(cfg git.base_branch main)")
+  [ -n "$base_ref" ] || return 0
+  mb=$(git -C "$JIG_PROJECT" merge-base HEAD "$base_ref" 2>/dev/null) || return 0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    doc="$JIG_PROJECT/$rel"
+    [ -f "$doc" ] || continue
+    git -C "$JIG_PROJECT" diff --quiet "$mb" -- "$rel" 2>/dev/null || continue
+    st=$(fm_get "$doc" status)
+    bst=$(_km_waiting_field "$base_ref" "$rel" status)
+    [ -n "$bst" ] || continue
+    if [ "$st" = proposed ]; then
+      [ "$bst" = proposed ] || printf '%s\n' "$rel"
+      continue
+    fi
+    # Approved is any status but proposed and rejected (a stub reads `active`).
+    [ "$st" != rejected ] || continue
+    if [ "$bst" = rejected ]; then
+      printf '%s\n' "$rel"
+      continue
+    fi
+    [ "$bst" != proposed ] || continue
+    src=$(jig_knowledge_source "$doc")
+    [ -n "$src" ] || continue
+    hash=$(fm_get "$doc" source_hash)
+    bhash=$(_km_waiting_field "$base_ref" "$rel" source_hash)
+    [ -n "$bhash" ] && [ "$bhash" != "$hash" ] || continue
+    # Hashed as source_hash is, without git's filters, so CRLF checkouts agree.
+    bsrc=$(jig_git_show_path "$base_ref" "$src" 2>/dev/null | jig_hash_stdin 2>/dev/null) || bsrc=""
+    [ -n "$bsrc" ] && [ "$bsrc" = "$bhash" ] || continue
+    # The text here must be the one the base approved: a source changed here again is a
+    # change nobody decided, whatever the base holds.
+    [ -f "$JIG_PROJECT/$src" ] && [ "$(jig_hash "$JIG_PROJECT/$src")" = "$bhash" ] || continue
+    printf '%s\n' "$rel"
+  done < <(git -C "$JIG_PROJECT" -c core.quotepath=off diff --name-only --no-renames "$base_ref" -- "$JIG_AI_DIR/knowledge" 2>/dev/null)
+}
+
 # _km_decidable_reasons <table> — for each row of <table> (as _km_ref_holds takes it), one
 # line: empty when a decision sent now would be judged on what the row describes, else
 # the code it would be refused with, `not-on-branch` or `not-on-base`. Judged where the
 # write judges, as of the last fetch: the tip of the decisions waiting when some wait
 # (_km_waiting_top has run), the base as jig_base_ref reads it otherwise. No network.
-_km_decidable_reasons() {
+_km_decidable_reasons_at() {
   local table="$1" base_ref tip_file base_file a b
   base_ref=$(jig_base_ref "$(cfg git.base_branch main)")
   base_file=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-base.XXXXXX")
@@ -2556,6 +2740,32 @@ _km_decidable_reasons() {
   done < "$tip_file"
   exec 4<&-
   rm -f "$base_file" "$tip_file"
+}
+
+# _km_decidable_reasons <table> — the reasons of _km_decidable_reasons_at, with `landed`
+# for a row whose document origin's base already decided (_km_landed_paths): no decision
+# is owed there, whatever a write would make of it.
+_km_decidable_reasons() {
+  local table="$1" landed reasons path reason
+  landed=$(_km_landed_paths)
+  if [ -z "$landed" ]; then
+    _km_decidable_reasons_at "$table"
+    return 0
+  fi
+  reasons=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-reasons.XXXXXX")
+  jig_cleanup_add "$reasons"
+  _km_decidable_reasons_at "$table" > "$reasons"
+  exec 6< "$reasons"
+  while IFS="$(printf '\t')" read -r path _; do
+    IFS= read -r reason <&6 || reason=""
+    if jig_has_line "$path" "$landed"; then
+      printf 'landed\n'
+    else
+      printf '%s\n' "$reason"
+    fi
+  done < "$table"
+  exec 6<&-
+  rm -f "$reasons"
 }
 
 # json_decide_row <id> <decision> <path> — _KM_ROW <- one decision of an answer; empty
@@ -2643,7 +2853,16 @@ km_source_states() {
 # km_changed_sources_count — accepted stubs whose source text nobody approved:
 # `changed` and `unrecorded`. A bare number, for `jig status`.
 km_changed_sources_count() {
-  km_source_states | awk -F '\t' '$1 == "changed" || $1 == "unrecorded" { n++ } END { print n + 0 }'
+  local landed
+  landed=$(_km_landed_paths)
+  km_source_states | KM_LANDED="$landed" KM_ROOT="$JIG_PROJECT/" awk -F '\t' '
+    BEGIN { n = split(ENVIRON["KM_LANDED"], l, "\n"); for (i = 1; i <= n; i++) if (l[i] != "") skip[l[i]] = 1 }
+    $1 == "changed" || $1 == "unrecorded" {
+      rel = $2
+      if (index(rel, ENVIRON["KM_ROOT"]) == 1) rel = substr(rel, length(ENVIRON["KM_ROOT"]) + 1)
+      if (!(rel in skip)) n2++
+    }
+    END { print n2 + 0 }'
 }
 
 # km_source_state <stub> — the state km_source_states gives one accepted stub's
@@ -3067,7 +3286,7 @@ _km_proposed_json() {
 # the state km_source_states gives it, the one definition of "changed", and the
 # counts the text form's last line gives; `decidable` and `reason` as on a proposal.
 _km_sources_json() {
-  local state doc src size n=0 changed=0 unrecorded=0 missing=0 t rec recs=()
+  local state doc src size n=0 changed=0 unrecorded=0 missing=0 landed=0 t rec recs=()
   local states table reasons reason
   _km_waiting_top
   t=$(printf '\t')
@@ -3094,6 +3313,7 @@ _km_sources_json() {
     [ -n "$doc" ] || continue
     IFS= read -r reason <&4 || reason=not-on-base
     n=$((n + 1))
+    case "$reason:$state" in landed:changed | landed:unrecorded) landed=$((landed + 1)) ;; esac
     case "$state" in
       changed) changed=$((changed + 1)) ;;
       unrecorded) unrecorded=$((unrecorded + 1)) ;;
@@ -3117,7 +3337,7 @@ _km_sources_json() {
   exec 4<&-
   rm -f "$states" "$table" "$reasons"
   _km_json_records ${recs[@]+"${recs[@]}"}
-  _km_json_print "{\"sources\":[$_JSON],\"counts\":{\"linked\":$n,\"changed\":$changed,\"unrecorded\":$unrecorded,\"missing\":$missing},\"waiting\":$_KM_WAITING_JSON}"
+  _km_json_print "{\"sources\":[$_JSON],\"counts\":{\"linked\":$n,\"changed\":$changed,\"unrecorded\":$unrecorded,\"missing\":$missing,\"landed\":$landed},\"waiting\":$_KM_WAITING_JSON}"
 }
 
 # _km_sources_diff_json <id> — the data of `knowledge sources --diff <id>
