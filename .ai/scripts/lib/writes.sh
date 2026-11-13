@@ -72,20 +72,7 @@ _writes_where() {
 # not-found. Under the lock, from the record as read. Turned down, or dropped by origin,
 # its edits do not come back; landed, they need not: the next edit takes a new name.
 _writes_over() {
-  OT_BRANCH=$OT_R_BRANCH
-  OT_BASE=$OT_R_BASE
-  OT_COMMIT=$OT_R_COMMIT
-  OT_PUSHED=$OT_R_PUSHED
-  OT_PR=$OT_R_PR
-  OT_MERGED=$OT_R_MERGED
-  OT_ENDED=$OT_R_ENDED
-  OT_SENT=$OT_R_SENT
-  if [ "$_OT_J_WHY" = merged ]; then
-    OT_MERGED=1
-  else
-    OT_ENDED=$_OT_J_WHY
-  fi
-  ot_record_write "$1"
+  ot_record_over "$1"
   case "$_OT_J_WHY" in
     closed) jig_fail not-found "writes ship: the pull request of $1 was closed unmerged, and its edits do not come back; the next edit goes on a new name" ;;
     merged) jig_fail not-found "writes ship: the pull request of $1 merged with these edits, so nothing waits; the next edit goes on a new name" ;;

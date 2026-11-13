@@ -22,9 +22,9 @@ full code suite. Keep required regression coverage for behavioral changes.
 `jig verify` above is the evidence, run as the project configured it (`verify.full_run`
 in `.ai/config.yaml`, schemas/config.md). With the default `local` it runs everything.
 With `verify.full_run: ci` — the project's claim that CI runs every check on each pull
-request — it narrows itself to what changed since `git.base_branch` and prints a header
-naming the mode; that narrowed report is sufficient evidence here as long as it names the
-mode, because the full set is proven by CI on the pull request, and a red CI sends the
+request — it narrows itself to what changed since the current task's base (`git.base_branch`
+without a task) and prints a header naming the mode; that narrowed report is sufficient
+evidence here as long as it names the mode, because the full set is proven by CI on the pull request, and a red CI sends the
 task back to verify. A check that says `full set left to CI` is that, not a gap to fill: under
 `ci` never run the full set yourself — not `jig verify --full`, not the stack's runner without a
 filter (`php artisan test`, `phpunit`, `pytest`, `npm test`, `tests/run.sh`) — unless the person

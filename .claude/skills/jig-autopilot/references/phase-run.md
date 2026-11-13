@@ -118,7 +118,7 @@ became ready. For the head of the queue, from its worktree:
 
 Pass `--body-file` when the task agent wrote a `pr-body.md`; without it the body is the rest of the commit message.
 
-- level `pr` (the `task ship: git level` line) — the pull request is open. Wait for CI (`gh pr checks`) and only with it
+- level `pr` (the `task ship: git level` line) — the pull request is open. Wait for CI (`jig gh pr checks`) and only with it
   green tell the person it is ready. They merge, in any order; you see it by `git fetch`.
 - level `merge` — `ship` waits for CI and merges, or prints `not merged: <why>`; then see
   the table below.
@@ -196,7 +196,7 @@ rules verbatim:
 | The agent crashed | its process ended with no `stop` or `end` in the journal and no consolidated state | a new agent: "continue `<id>` from stage `<last stage>`". Repairs are not reset. A second crash on the same task is a stop (unattended: treat as an exhausted repair budget) |
 | A person paused the task | the agent reported exit 4 from `stage`; the task is `paused`, its run still `on` | nothing until they run `jig task resume <id>`; then a new agent: "continue `<id>` from stage `<the stage it did not enter>`". The wave waits for it like for a stop |
 | The agent hung | no new journal line for a long while, process still alive | attended: into the summary message. Unattended: stop the agent, then as for a crash |
-| CI is red | `gh pr checks`, or `not merged: a check failed` | an agent in that worktree: `repair --reason "CI red: …"` (the run is still `on`), fix, targeted tests, re-review, ship again. Exit 3 → a stop, or a draft when unattended |
+| CI is red | `jig gh pr checks`, or `not merged: a check failed` | an agent in that worktree: `repair --reason "CI red: …"` (the run is still `on`), fix, targeted tests, re-review, ship again. Exit 3 → a stop, or a draft when unattended |
 | A conflict updating the base | `git merge` stopped | an agent in that worktree resolves it keeping both intentions, runs the targeted tests, re-reviews and ships again. If the resolution needs a product decision: stop (unattended: `git merge --abort` and a draft naming the reason) |
 | CI or the forge is unreachable | `not merged: …` | attended: into the message. Unattended: the pull request stays open, the wave does not close, and the run ends with a report |
 | The epic diverged from origin | `jig task start` dies with "diverged" | `git merge origin/<epic>` into the local epic — never rebase — and carry on |

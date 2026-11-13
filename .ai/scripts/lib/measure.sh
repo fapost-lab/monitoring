@@ -198,7 +198,10 @@ _measure_collect_tasks() {
     cat "$_MEASURE_TMP/tasks.new" >> "$rows"
   fi
 
-  LC_ALL=C sort -o "$rows" "$rows"
+  # Through env: a locale assigned for one command in jig's own shell is
+  # restored by bash afterwards, which crashes Homebrew's bash on macOS now and
+  # then (conventions/shell.md).
+  env LC_ALL=C sort -o "$rows" "$rows"
 }
 
 # --- process -----------------------------------------------------------------

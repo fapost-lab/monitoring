@@ -648,7 +648,7 @@ _ctx_required_rows() {
 # stops only the tasks the rule applies to (ADR-0014 as amended).
 _ctx_read_path() {
   local doc="$1" readp rc=0
-  readp=$(jig_knowledge_read_path "$doc") || rc=$?
+  jig_knowledge_read_path_v readp "$doc" || rc=$?
   if [ "$rc" -ne 0 ]; then
     jig_die "context: $(jig_relpath "$doc" "$JIG_PROJECT") is selected but its source $readp is missing; fix the link or reject the stub"
   fi
@@ -669,15 +669,20 @@ _ctx_check_selected_sources() {
 # _ctx_read_rows <rows-file> — the required rows as the agent reads them: a
 # stub's row names its source, and its reason says which stub linked it. The
 # rows themselves keep document paths, which `requires` closure and the
-# catalog's de-duplication read frontmatter from.
+# catalog's de-duplication read frontmatter from. Each row is read without a
+# process: the block as fm_block reads it, its fields as fm_get gives them.
 _ctx_read_rows() {
-  local relpath reason doc t
+  local relpath reason doc t block src readp id
   t=$(printf '\t')
   while IFS="$t" read -r relpath reason; do
     [ -n "$relpath" ] || continue
     doc="$JIG_PROJECT/$relpath"
-    if [ -n "$(jig_knowledge_source "$doc")" ]; then
-      printf '%s%s%s; linked by %s\n' "$(jig_knowledge_read_path "$doc")" "$t" "$reason" "$(fm_get "$doc" id)"
+    jig_knowledge_source_v src "$doc"
+    if [ -n "$src" ]; then
+      jig_knowledge_read_path_v readp "$doc" || :
+      fm_block_v block "$doc"
+      fm_get_block_v id "$block" id
+      printf '%s%s%s; linked by %s\n' "$readp" "$t" "$reason" "$id"
     else
       printf '%s%s%s\n' "$relpath" "$t" "$reason"
     fi
@@ -783,7 +788,7 @@ EOF_DOMS
     [ -n "$summary" ] || summary="(no summary)"
     if [ -n "$(fm_get_block "$block" source)" ]; then
       read_rc=0
-      readp=$(jig_knowledge_read_path "$doc") || read_rc=$?
+      jig_knowledge_read_path_v readp "$doc" || read_rc=$?
       if [ "$read_rc" -eq 0 ]; then
         relpath=$readp
       else

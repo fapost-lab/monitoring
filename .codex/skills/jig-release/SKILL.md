@@ -1,15 +1,17 @@
 ---
 name: jig-release
-description: Plan the next release with the user and carry it out — pick which filed tasks go in and at what version level, build them on a release epic, write the release notes against the diffs, and ship the release. Use when the user says "plan a release", "plan the next release", "what goes into the next release", "cut a release".
+description: Plan the next release with the user and carry it out — pick which filed tasks go in and at what version level, order them in the queue, write the release notes against the diffs as the last pull request from the fresh default branch, and ship the release. Use when the user says "plan a release", "plan the next release", "what goes into the next release", "cut a release".
 ---
 
 # jig-release — plan a release, then make it
 
-A **release** here is a specification with an epic (ADR-0040): one phase whose items are the
-tasks going in, an `Epic:` line, and a `Release:` line with the version level. Nothing new is
-built for it — `jig spec`, a phase run and `jig spec ship` carry it
-(adr-20261002-a-release-is-a-spec-with-an-epic). This skill decides **what goes in**; the rest is
-the machinery `jig-idea` §8–§11 and `jig-autopilot` §6 already describe.
+A **release** is the pull request that raises the version, and nothing else raises it: feature work
+— a task, or an epic's final pull request — reaches the default branch without a version change.
+The release is the **notes task**: cut last from the freshest default branch, it describes
+everything since the last tag, raises the version and records which commit of the default branch
+its notes describe. `jig task ship` refuses a release whose notes do not reach the default
+branch's tip (adr-20261112-release-notes-name-the-commit-they-describe). This skill decides **what
+goes in** and when the notes start.
 
 How a version is raised, where the changelog lives and who merges a release are the project's own
 rules: read them first (`CONTRIBUTING.md`, a release section of the docs, `jig context`). Where
@@ -20,13 +22,14 @@ the project says nothing, ask once.
 ```
 .ai/scripts/jig task list --goals
 .ai/scripts/jig spec list
+.ai/scripts/jig queue
 git describe --tags --abbrev=0
 ```
 
-Live tasks with the first paragraph of their `## Goal`, open specs and epics, and the last
-release. A task whose goal is `(none)` has a gap in its brief: name it, do not invent one. Also
-read what reached the default branch since that tag (`git log <tag>..origin/<default>`): it is
-in the release whatever you pick.
+Live tasks with the first paragraph of their `## Goal`, open specs and epics, the queue, and the
+last release. A task whose goal is `(none)` has a gap in its brief: name it, do not invent one.
+Also read what reached the default branch since that tag (`git log <tag>..origin/<default>`): it
+is in the release whatever you pick.
 
 ## 2. Propose
 
@@ -35,61 +38,68 @@ says:
 
 - **What goes in, in order.** Unless the project's knowledge orders work its own way: first what
   **breaks work**, then what **lies about state**, then what **slows work down**; "an agent could
-  cheat here" goes last. Within a step, the order the owner gave. One line per task: id, goal,
-  class.
-- **What stays out, and why.** A **started** task is never in the epic's list — its branch was
-  cut from the default branch, and `jig spec link` refuses it. It still reaches the release if it
-  merges into the default branch before the epic is finished; say so.
-- **The level** — patch, minor or major by the project's rule, with one sentence of reason. It is
-  a proposal: the release notes check it against the diffs (§5).
+  cheat here" goes last. Within a step, the order the owner gave. One line per task or epic: id,
+  goal, class.
+- **What is already in.** What reached the default branch since the last tag, by merged pull
+  request: it goes out with this release and the notes describe it.
+- **The level** — patch, minor or major by the project's rule, over everything since the last tag,
+  with one sentence of reason. It is a proposal: the notes check it against the diffs (§5).
+- **The shape.** By default the tasks merge into the default branch one by one, as any task does,
+  and the notes task is the last pull request. A **release epic** only when the tasks must reach
+  the default branch together — none of them may be on it without the others; say why.
 - **The notes task** — the last item, filed as T2 so its claims are reviewed in a fresh context.
 
 ## 3. The gate
 
 The person approves, changes or rejects the document. Nothing is created before that. In an
-unattended run nobody can answer: go on, and put the document verbatim in the declaration's pull
-request (§4) under `## Release plan — approved by the agent, not a human`. No agent merges that
-pull request, so its merge is where a person agrees.
+unattended run nobody can answer: go on, and put the document verbatim in the notes task's pull
+request under `## Release plan — approved by the agent, not a human`. No agent merges a release
+outside an unattended run at `merge`, so a person still sees it before the tag.
 
 ## 4. Set it up
 
-1. `jig spec new release-<YYYY-MM-DD>` — the planning day, so the id never lies when the level
-   changes. `spec.md`: the approved document. `roadmap.md`: one phase, an item per task
-   (``- [ ] `<task-id>` — <goal>``), the notes task last; waves: the tasks, then the notes.
-2. File the notes task (`jig task new`, the `Spec:` line as `jig-idea` §10 writes it). It stays out
-   of the queue for now, which would advise it before the tasks it reads: §5 queues it.
-3. `jig spec epic <id> --release <level>`.
-4. For each task that was already filed: `jig spec link <id> <task-id>`. It reads the phase from
-   the roadmap and refuses a started or closed task — a refusal is a task that stays out (§2).
-   Then set its number, `.ai/scripts/jig queue set <task-id> --priority <p>`, again if it has one:
-   a task already in the queue stays on the top level until a write touches it.
-5. Ship the declaration and cut the epic as `jig-idea` §8 says: `jig spec ship`, a person merges
-   it, `jig spec epic <id>`, `jig spec ship <id>` again to push the epic.
+**By default (no epic):**
 
-## 5. Go through the list
+1. Give each task going in its priority and order in the queue (`jig queue set`, `jig queue move`).
+2. File the notes task (`jig task new release-notes-<YYYY-MM-DD> --class T2`), its goal naming the
+   level and the tasks. Make it wait for them: `jig queue depend <notes> --on <task> --reason
+   "the notes describe it"` for each. It is not started until §5.
 
-A phase run (`jig-autopilot` §6) when the run's level (`autopilot.git:` in `jig status`) is `pr`
-or more; otherwise each task through
-`jig-task`, cut from the epic by `jig task start`. The notes task starts after every other item
-is merged into the epic and the latest default branch was merged in, and gets its number then, the
-most urgent of the release's (its lowest), so that a task outside the release does not hold it: it writes the notes as
-[release notes](references/release-notes.md) says. It never edits the spec: when the diffs
-disagree with the planned level, it says so in its pull request.
+**A release epic** (only when the tasks must ship together): a spec with an epic, as before —
+`jig spec new release-<YYYY-MM-DD>` with one phase, an item per task and the notes task last;
+`jig spec epic <id> --release <level>` (the `Release:` line is what makes the epic a release); `jig
+spec link <id> <task-id>` for each filed task (a started or closed task is refused and stays out);
+ship the declaration and cut the epic as `jig-idea` §8 says.
 
-The level is the person's. A disagreement the notes task reported is put to them, and the
-`Release:` line is changed on the epic — by whoever keeps the spec there, the coordinator of a phase
-run — only with their yes. Unattended, keep the higher of the two levels: a release is never
+## 5. The notes
+
+When every task going in has merged — into the default branch, or into the release epic with the
+latest default branch merged into the epic — start the notes task from the freshest base and give
+it the most urgent number of the release (its lowest). It writes the notes as
+[release notes](references/release-notes.md) says, raises the version, and records the commit of
+the default branch its notes describe:
+
+```
+git fetch origin <default>
+.ai/scripts/jig task set <notes-task> notes_through <sha of origin/<default>>
+```
+
+`jig task ship` writes that into the commit as `Release-Notes-Through: <sha>` and refuses the
+release, before anything is sent, while the default branch has commits after it. Something
+merged in the meantime is not a failure: describe it, record the new tip, ship again.
+
+It never edits a spec: when the diffs disagree with the planned level, it says so in its pull
+request. The level is the person's; unattended, keep the higher of the two — a release is never
 made smaller than a person approved, and a `major` still waits for one.
 
 ## 6. Release
 
-Finish the epic as `jig-idea` §11 says: merge the latest default branch in, `--finish`, raise the
-version by the recorded level, `jig spec ship`. The epic is never pushed to for this: `spec ship`
-carries the finish on `finish/<id>`, cut from it, and opens the pull request from there, so an
-epic protected like the default branch needs no bypass. Who merges is unchanged: the person —
-except an unattended run at level `merge` (`autopilot.git`, else `agent.git`) with `release.merge: agent` (the default), which
-merges on green CI; `release.merge: human` leaves it to the person; a `major` release is always a
-draft for a person.
+The notes task's pull request is the release. Who merges it is unchanged: the person — except an
+unattended run at level `merge` (`autopilot.git`, else `agent.git`) with `release.merge: agent`
+(the default), which merges on green CI after checking the notes again; `release.merge: human`
+leaves it to the person; a `major` release is always a draft for a person. A release epic is
+finished as `jig-idea` §11 says, and its final pull request carries the notes task's commit, so the
+same check holds there.
 
 Then watch CI on the merge commit of the default branch until the release exists (a tag, a
 package — whatever the project's CI makes). Some checks run only there. Red is not a release:
@@ -97,8 +107,7 @@ file the fix as an ordinary task from the default branch, and release it as a pa
 
 ## A fix that cannot wait
 
-The default branch keeps moving between releases. A fix needed now is an ordinary task from the
-default branch plus a patch release from there, without the epic. The epic gets it when the
-default branch is merged into it, which finishing requires anyway. That task raises the version, so
-`jig task ship` merges it by the same rule as §6 — `release.merge`, an unattended run, never a
-`major` — and says so; a person merges it otherwise.
+A fix needed now is an ordinary task from the default branch, then a release of its own: a notes
+task over everything since the last tag. When unreleased work is already on the default branch,
+that release carries it too, and the level is read over all of it — a fix after a merged feature
+is a minor release, not a patch.

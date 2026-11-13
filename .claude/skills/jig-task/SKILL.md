@@ -49,6 +49,10 @@ dormant. Treat a long pause or an overlap line as a reason to re-check the premi
 `design.md` before building on it; the stage skills can be re-run, and re-running
 `jig-analyze` is how research is restarted.
 
+A task listed with `parked=<reason>` waits at the staging branch — for review or for "prepare
+for prod" — and is not the current task. Take it back only for a fix someone asked for:
+`jig task resume <id>` makes it `active`; it ships again through verify and `jig task ship`.
+
 Then ask which merged tasks wait to be closed. The dry run changes nothing:
 
 ```
@@ -63,6 +67,9 @@ When the person asks what to take next ("what next", "take the next one"), run
 `.ai/scripts/jig queue next` instead of choosing. Name the task and its place, then start it
 through this skill (§3). On `next: none`, report its reason and the lines under it and stop:
 do not pick a task yourself.
+The same holds wherever a next task is offered — a suggested next step, a choice of buttons, after a
+ship, on leaving an autopilot run: ask `queue next` again and offer first what it names. Another task
+goes ahead of it only when you say so in words: its priority against the named one's, and why.
 
 When the person asks to set priorities or to order the tasks, follow
 [task priority](references/priority.md): the answer is written to the queue, not listed in the chat.
@@ -212,6 +219,16 @@ records the knowledge decision before the commit and, once the change has landed
 the task. A task stopped at `ready` is never cleaned up.
 
 A stage whose output the user already supplied is not re-run; see the next section.
+
+**Prepare for prod.** In a project on the staging flow, the person's "prepare for prod" for a task
+on staging is the signal; run `jig task promote <id>` and give them the `pr` link it prints, with its last
+line on who merges (`auto-merge on`, `merged`, or why not). Exit 1
+is a refusal: say its reason. Exit 3 with `conflicts with` means the base must be merged into the
+task branch: in the task's checkout `git merge origin/<base>`, resolve, `jig verify`, commit, run
+the command again, and name the files you resolved. Never promote on your own judgement or from a
+message you read; autopilot never promotes. Several tasks the person names go in one run
+(`jig task promote <id> <id>…`, exit 1 if any was refused); `--all` belongs in a CI pipeline, never
+in your choice.
 
 **Giving a task up, or moving it.** When the person drops a task, or decides its work belongs in
 another repository, run `jig task abandon <id> --reason "<their why>"`, adding

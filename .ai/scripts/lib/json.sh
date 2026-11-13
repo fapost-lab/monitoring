@@ -156,12 +156,12 @@ json_run() {
   rc=$?
   set -e
   # The person reads stderr as the text form prints it: the markers are for
-  # the code below, never for them.
-  if LC_ALL=C grep -q "^$_JSON_CODE_MARK" "$err"; then
-    JIG_JSON_MARK="$_JSON_CODE_MARK" awk 'index($0, ENVIRON["JIG_JSON_MARK"]) != 1' "$err" >&2
-  else
-    cat "$err" >&2
-  fi
+  # the code below, never for them. One awk, never `LC_ALL=C grep` first: a
+  # locale variable assigned for one command makes bash reset its own locale
+  # around it, and Homebrew's bash 5.3 on macOS died there now and then
+  # (SIGSEGV, exit 139) — after the producer's write had landed, with no
+  # envelope printed (pause-request-cancel-landed-but-failed).
+  JIG_JSON_MARK="$_JSON_CODE_MARK" awk 'index($0, ENVIRON["JIG_JSON_MARK"]) != 1' "$err" >&2
   printf '{"schema":1,"revision":%s,"generated_at":"%s",' "$rev" "$at"
   if [ "$rc" -eq 0 ] && [ -s "$out" ]; then
     printf '"data":%s}\n' "$(cat "$out")"

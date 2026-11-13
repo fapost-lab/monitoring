@@ -17,11 +17,29 @@
 # list keys — see _profiles_list_lines to read those. Prints nothing when
 # the file or the key is absent.
 profile_get() {
-  local dir="$1" key="$2" file value
-  file="$dir/profile.yaml"
-  [ -f "$file" ] || return 0
-  value=$(sed -n "s/^${key}:[[:space:]]*//p" "$file" | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//' | head -n 1)
-  printf '%s\n' "$value"
+  local __pgp_value
+  profile_get_v __pgp_value "$1" "$2" || return 0
+  printf '%s\n' "$__pgp_value"
+}
+
+# profile_get_v <var> <profile-dir> <key> — profile_get's value into <var>;
+# exit 1, with <var> empty, when there is no profile.yaml. Builtins only:
+# `init` and `verify` ask several keys of every profile (convention-shell,
+# `<name>_v`). The first line that sets <key> answers; its value ends at a `#`
+# and carries no trailing whitespace.
+profile_get_v() {
+  local __pg_line __pg_re="^${3}:[[:space:]]*"
+  printf -v "$1" '%s' ""
+  [ -f "$2/profile.yaml" ] || return 1
+  while IFS= read -r __pg_line || [ -n "$__pg_line" ]; do
+    [[ $__pg_line =~ $__pg_re ]] || continue
+    __pg_line=${__pg_line#"${BASH_REMATCH[0]}"}
+    __pg_line=${__pg_line%%#*}
+    __pg_line=${__pg_line%"${__pg_line##*[![:space:]]}"}
+    printf -v "$1" '%s' "$__pg_line"
+    return 0
+  done < "$2/profile.yaml"
+  return 0
 }
 
 # _profiles_list_lines <profile-dir> <key> — items of an inline list
@@ -34,16 +52,32 @@ profile_get() {
 # `scripts/**/*.sh` against the real tree, silently replacing the literal
 # pattern with whatever files happen to match (or nothing at all).
 _profiles_list_lines() {
-  local dir="$1" key="$2" raw
-  raw=$(profile_get "$dir" "$key")
+  local raw item
+  profile_get_v raw "$1" "$2" || return 0
   case "$raw" in
-    \[*\])
-      raw=$(printf '%s' "$raw" | sed 's/^\[//; s/\]$//')
-      printf '%s\n' "$raw" | tr ',' '\n' \
-        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"\(.*\)"$/\1/' \
-        | sed '/^$/d'
-      ;;
+    \[*\]) ;;
+    *) return 0 ;;
   esac
+  raw=${raw#\[}
+  raw=${raw%\]}
+  # Each item between commas: trimmed, one pair of surrounding quotes off,
+  # and dropped when nothing is left.
+  while :; do
+    item=${raw%%,*}
+    item=${item#"${item%%[![:space:]]*}"}
+    item=${item%"${item##*[![:space:]]}"}
+    case "$item" in
+      \"*\")
+        item=${item#\"}
+        item=${item%\"}
+        ;;
+    esac
+    [ -z "$item" ] || printf '%s\n' "$item"
+    case "$raw" in
+      *,*) raw=${raw#*,} ;;
+      *) break ;;
+    esac
+  done
 }
 
 # _profiles_dedup <words> — space-separated words, first-occurrence order
@@ -76,7 +110,9 @@ _profiles_dedup() {
 # skip, rather than quietly becoming unverifiable
 # (adr-20260925-one-test-run-per-clone-and-a-dead-run-is-not-a-pass).
 profiles_is_fallback() {
-  [ "$(profile_get "$1" verifies)" = "nothing" ]
+  local __pif_value
+  profile_get_v __pif_value "$1" verifies || return 1
+  [ "$__pif_value" = "nothing" ]
 }
 
 # profiles_supports <profile-dir> <capability> — true when the profile's
@@ -112,7 +148,7 @@ profiles_names_check() {
 # nothing, and the check it would have taken over must stay where it was.
 profiles_applies() {
   local glob raw
-  raw=$(profile_get "$1" detect)
+  profile_get_v raw "$1" detect || true
   case "$raw" in
     ''|always) return 0 ;;
     \[*\]) ;;
@@ -207,8 +243,14 @@ profiles_installed_dir() {
 # `**` matches any depth, including zero directories; BSD/GNU `find -path`
 # both match `*` against `/` too (no FNM_PATHNAME), so collapsing `**/` and
 # `**` down to a single `*` is sufficient and correct.
-_profiles_glob_to_findpath() {
-  printf '%s' "$1" | sed 's#[*][*]/#*#g; s#[*][*]#*#g'
+#
+# _profiles_glob_to_findpath_v <var> <glob> — the pattern into <var>, without a
+# process: `init` asks it of every detect glob of every profile.
+_profiles_glob_to_findpath_v() {
+  local __pgf_out
+  _jig_replace_all_v __pgf_out "$2" '**/' '*'
+  _jig_replace_all_v __pgf_out "$__pgf_out" '**' '*'
+  printf -v "$1" '%s' "$__pgf_out"
 }
 
 # _profiles_glob_matches <glob> — exit 0 when <glob> matches at least one
@@ -218,7 +260,7 @@ _profiles_glob_to_findpath() {
 # vendored package is not what the project is written in.
 _profiles_glob_matches() {
   local glob="$1" pattern hit
-  pattern=$(_profiles_glob_to_findpath "$glob")
+  _profiles_glob_to_findpath_v pattern "$glob"
   hit=$(find "$JIG_PROJECT" \
     \( -path "$JIG_PROJECT/.git" -o -name node_modules -o -name vendor \
        -o -name .venv -o -name venv -o -name .dart_tool -o -name .ai \) -prune -o \
@@ -253,16 +295,17 @@ profiles_active() {
 # pulls in every profile it requires, even one whose own detect globs did
 # not match (e.g. laravel's artisan match pulls in php).
 profiles_detect() {
-  local root="${1:-}" p name matched glob result="generic" req changed
+  local root="${1:-}" p name matched glob result="generic" req changed detect
   [ -n "$root" ] || root=$(profiles_source_dir)
 
   if [ -n "$root" ] && [ -d "$root" ]; then
     for p in "$root"/*/; do
       [ -d "$p" ] || continue
       p="${p%/}"
-      name=$(basename "$p")
+      name=${p##*/}
       [ "$name" = "generic" ] && continue
-      case "$(profile_get "$p" detect)" in
+      profile_get_v detect "$p" detect || true
+      case "$detect" in
         always)
           result="$result $name"
           ;;

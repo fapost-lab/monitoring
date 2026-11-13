@@ -32,6 +32,11 @@ Depth: <easy | normal | deep> — <why this level>
 
 - <Question> — what depends on it.
 
+## Set aside
+
+- <Idea> — set aside because <reason>.
+- <unexplored: a direction seen in the conversation and not opened.>
+
 ## Assumptions left untested
 
 - <Assumption> — taken at <depth>; what would test it.

@@ -551,6 +551,38 @@ _doctor_check_config_keys() {
   fi
 }
 
+# Whether the project's choice of git flow can work (config.sh answers), and,
+# in the direct flow, what the choice leaves unsaid: a brick no reader looks at,
+# or a staging branch on origin nobody has decided about. Silent when the direct
+# flow has nothing to say, so that a project on it sees what it always saw.
+_doctor_check_git_flow() {
+  local problems line flow file key names
+  problems=$(jig_git_flow_problems)
+  if [ -n "$problems" ]; then
+    while IFS= read -r line; do
+      _doctor_fail "git flow" "$line" "correct it in $JIG_AI_DIR/config.yaml"
+    done < <(printf '%s\n' "$problems")
+    return 0
+  fi
+  flow=$(jig_git_flow)
+  if [ "$flow" = staging ]; then
+    _doctor_ok "git flow" "staging, through $(jig_staging_branch) (land: $(jig_staging_land), review: $(jig_staging_review), promote: $(jig_promote_merge))"
+    return 0
+  fi
+  file=$(jig_config_file)
+  for key in git.staging_branch git.staging_land git.staging_review git.promote_merge; do
+    if _config_has_key "$file" "$key"; then
+      _doctor_warn "git flow" "$key is set, and the direct flow does not read it" \
+        "set git.flow: staging, or remove the line"
+    fi
+  done
+  names=$(jig_staging_offer | tr '\n' ' ' | sed 's/ $//')
+  if [ -n "$names" ]; then
+    _doctor_warn "git flow" "direct; origin has a branch named $names, which the staging flow could use" \
+      "ask your agent to set up Jig (jig-setup), or name the flow with git.flow in $JIG_AI_DIR/config.yaml"
+  fi
+}
+
 # Whether `agent.git` (JIG_CFG_LOCAL_ONLY_KEYS, config.sh) is in a state
 # `jig task ship` can actually use: not shadowed by a project-layer value it
 # will never read, and not an unrecognised word either way. config.sh answers
@@ -646,6 +678,7 @@ cmd_doctor() {
       _doctor_check_instructions
       _doctor_check_config_local
       _doctor_check_config_keys
+      _doctor_check_git_flow
       _doctor_check_agent_git
       _doctor_check_host_runtime
     else

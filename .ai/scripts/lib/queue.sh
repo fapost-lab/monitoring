@@ -945,8 +945,8 @@ _queue_next() {
   jig_require_init
   # shellcheck source=lib/hklog.sh
   . "$JIG_LIB/hklog.sh"
-  local file items="" facts="" kind f2 f3 f4 f5 id tasks_dir notq=0 d
-  local seen=" " merged open_ids
+  local file items="" facts="" kind f2 f3 f4 f5 id tasks_dir notq=0 d st
+  local seen=" " merged open_ids nl=$'\n' queued=$'\n'
   file=$(queue_file)
   if [ -f "$file" ]; then
     _jig_queue_readable "$file" \
@@ -962,6 +962,7 @@ _queue_next() {
   while IFS=$'\t' read -r kind f2 f3 f4 f5; do
     case "$kind" in
       item)
+        queued="$queued$f2$nl"
         case "$f2" in
           task:*)
             facts="$facts$(_queue_next_task_fact "${f2#task:}")"$'\n'
@@ -979,14 +980,20 @@ $items
 EOF
   # An epic's dependencies are inherited by its tasks, so the epic itself is
   # asked about only through them; a task that is not queued is only counted.
+  # Every workspace is asked, so none of them costs a process: the id comes off
+  # the path, the state into a variable, and "is it queued" is answered by the
+  # item refs the loop above collected (convention-shell, `<name>_v`).
   tasks_dir="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"
   for d in "$tasks_dir"/*/; do
     [ -f "${d}state" ] || continue
-    id=$(basename "$d")
+    id=${d%/}
+    id=${id##*/}
     jig_valid_id "$id" || continue
-    case "$(_jig_task_state_value "$id" status)" in active) ;; *) continue ;; esac
-    [ "$(_jig_task_state_value "$id" paused)" != true ] || continue
-    printf '%s\n' "$items" | awk -F '\t' -v r="task:$id" '$1 == "item" && $2 == r { f = 1 } END { exit !f }' && continue
+    jig_task_state_var st "$id" status
+    [ "$st" = active ] || continue
+    jig_task_state_var st "$id" paused
+    [ "$st" != true ] || continue
+    case "$queued" in *"${nl}task:$id$nl"*) continue ;; esac
     notq=$((notq + 1))
   done
   local result
@@ -1002,13 +1009,16 @@ EOF
 # (`gone` without a state file), paused, started (a branch and a base commit
 # both recorded) and whether a pause request waits in the queue.
 _queue_next_task_fact() {
-  local id="$1" st="gone" paused=false started=0 req=0
+  local id="$1" st="gone" paused=false started=0 req=0 v
   if jig_valid_id "$id" && [ -f "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$id/state" ]; then
-    st=$(_jig_task_state_value "$id" status)
+    jig_task_state_var st "$id" status
     [ -n "$st" ] || st=unknown
-    [ "$(_jig_task_state_value "$id" paused)" != true ] || paused=true
-    if [ -n "$(_jig_task_state_value "$id" branch)" ] && [ -n "$(_jig_task_state_value "$id" base_commit)" ]; then
-      started=1
+    jig_task_state_var v "$id" paused
+    [ "$v" != true ] || paused=true
+    jig_task_state_var v "$id" branch
+    if [ -n "$v" ]; then
+      jig_task_state_var v "$id" base_commit
+      [ -z "$v" ] || started=1
     fi
     if jig_pause_request "$id"; then req=1; fi
   fi

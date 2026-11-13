@@ -22,7 +22,7 @@
 # answer
 # *only* from this list, never falling back to the project layer the way every
 # other key here does.
-JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive"
+JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
 
 # Keys whose project-layer value `cfg` never reads at all: only the local
 # file and the default answer. A key belongs here, rather than merely in
@@ -70,9 +70,13 @@ JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_t
 # (adr-20261009-autopilot-stops-reach-telegram). `notify.interactive` says
 # whether an ordinary session that waits for them sends one too, through the
 # hook they opted into (adr-20261010-a-waiting-session-reaches-telegram).
+# `github.account` names the `gh` account this clone's GitHub calls are made
+# as, for a person who holds several: a login is one person's, and a committed
+# one would send every contributor's calls out under it
+# (adr-20261110-a-clone-names-its-github-account).
 # `jig_config_project_ignored` reports a project-layer value here so it does
 # not silently do nothing.
-JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive"
+JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
 
 # Path of the config file for the current project (JIG_PROJECT must be set).
 jig_config_file() { printf '%s/%s/config.yaml\n' "$JIG_PROJECT" "$JIG_AI_DIR"; }
@@ -81,9 +85,11 @@ jig_config_file() { printf '%s/%s/config.yaml\n' "$JIG_PROJECT" "$JIG_AI_DIR"; }
 # to. A worktree answers with the checkout it was added from, so one local
 # file serves every worktree of a clone, including one made after the file.
 #
-# Read from git's own files rather than `git rev-parse --git-common-dir`: cfg
-# runs in a command substitution per key, where a cached answer does not
-# survive, and the session hook promises no git on its idle path. A worktree's
+# Read from git's own files rather than `git rev-parse --git-common-dir`: the
+# answer is cached once per process for each JIG_PROJECT
+# (jig_config_clone_root_v), but a `$(cfg ...)` started before the first lookup
+# finds nothing cached and pays the search itself, and the session hook
+# promises no git on its idle path. A worktree's
 # `.git` is a file naming its git directory, and that directory's `commondir`
 # names the shared one. Anything else — a main checkout, a submodule (no
 # commondir), a separate git dir or a bare repository (common dir not named
@@ -100,18 +106,22 @@ jig_config_clone_root() {
 : "${_JIG_TS_ON:=0}"
 
 # jig_config_clone_root_v <var> — jig_config_clone_root's answer into <var>.
-# Inside a read snapshot (jig_read_snapshot_begin) it is worked out once per
-# process; a main checkout costs no process at all, a worktree one subshell.
+# Worked out once per process for each JIG_PROJECT: a main checkout costs no
+# process at all, a worktree three, and every config read asks. Which checkout
+# a worktree was added from does not change while a command runs, so the answer
+# is kept outside a read snapshot too, under the JIG_PROJECT it was found for —
+# a command that reads another checkout (`status --json`, _task_touched_in) is
+# answered for that one. A subshell inherits what its parent has found.
 _CFG_CLONE_ROOT=""
+_CFG_CLONE_ROOT_OF=""
 jig_config_clone_root_v() {
-  if [ "$_JIG_TS_ON" = 1 ] && [ -n "$_CFG_CLONE_ROOT" ]; then
+  if [ -n "$_CFG_CLONE_ROOT" ] && [ "$_CFG_CLONE_ROOT_OF" = "$JIG_PROJECT" ]; then
     printf -v "$1" '%s' "$_CFG_CLONE_ROOT"
     return 0
   fi
-  local __ccr_root
-  __ccr_root=$(_jig_config_clone_root_find)
-  [ "$_JIG_TS_ON" != 1 ] || _CFG_CLONE_ROOT=$__ccr_root
-  printf -v "$1" '%s' "$__ccr_root"
+  _CFG_CLONE_ROOT=$(_jig_config_clone_root_find)
+  _CFG_CLONE_ROOT_OF=$JIG_PROJECT
+  printf -v "$1" '%s' "$_CFG_CLONE_ROOT"
 }
 
 _jig_config_clone_root_find() {
@@ -243,6 +253,12 @@ git.branch_per_task|true|boolean|true,false|Whether starting a task creates and 
 git.branch_template|task/{id}|text||The name of a task's branch; {id} is the task id.
 git.worktree_root|../<project>.worktrees|text||Where task worktrees are made.
 git.delete_merged_branches|true|boolean|true,false|Whether a branch Jig made is deleted once its work has landed.
+git.flow|direct|choice|direct,staging|How a task travels: straight to the base branch, or through a staging branch first.
+git.staging_branch||text||The branch a task lands on before the base branch, in the staging flow.
+git.staging_land|pr|choice|pr,external|How a task lands on the staging branch: a pull request, or merged by CI.
+git.staging_review|ask|choice|ask,require,none|Whether an approval is needed before a task lands on the staging branch.
+git.promote_merge|human|choice|human,auto|Who merges the pull request into the base branch that prepare for prod opens.
+git.staging_stale_after|14d|duration||How long a task may wait on the staging branch with no promotion before jig status names it.
 worktree.carry|[]|list||Extra paths copied into a new task worktree.
 worktree.share|[]|list||Directories a new task worktree shares with this checkout.
 worktree.setup||text||A command run in a new task worktree after it is made.
@@ -275,6 +291,7 @@ executor.implement_runtime||choice|claude,codex|The runtime that owns the implem
 executor.review_runtime||choice|claude,codex|The runtime that owns each review stage; empty keeps the current session.
 executor.implement_model||text||The model for an external implementation process.
 executor.review_model||text||The model for an external review process.
+github.account||text||The gh account GitHub is asked as from this clone; unset, Jig finds it.
 notify.telegram.token||text||The Telegram bot token messages are sent with; never shown.
 notify.telegram.chat_id||text||The Telegram chat messages go to: digits or @name.
 notify.autopilot|true|boolean|true,false|Whether autopilot runs send Telegram messages.
@@ -364,9 +381,9 @@ jig_config_unknown() {
 # reads it. Reporting only, for `jig status` and `jig doctor`: nothing here
 # changes what `cfg` answers.
 jig_config_project_ignored() {
-  local key value
+  local key value file="$JIG_PROJECT/$JIG_AI_DIR/config.yaml"
   for key in $JIG_CFG_LOCAL_ONLY_KEYS; do
-    value=$(_cfg_read "$(jig_config_file)" "$key")
+    _cfg_read_v value "$file" "$key" || continue
     [ -n "$value" ] || continue
     printf '%s\t%s\n' "$key" "$value"
   done
@@ -386,11 +403,11 @@ jig_config_local_ignored() {
 # `ignored` is a key outside JIG_CFG_LOCAL_KEYS, including a misspelt one.
 jig_config_local_entries() {
   local file key value
-  file=$(jig_config_local_file)
+  jig_config_local_file_v file
   [ -f "$file" ] || return 0
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    value=$(_cfg_read "$file" "$key")
+    _cfg_read_v value "$file" "$key" || continue
     [ -n "$value" ] || continue
     if jig_config_local_key "$key"; then
       printf '%s\t%s\tlocal\n' "$key" "$value"
@@ -527,8 +544,36 @@ cfg_v() {
 }
 
 # cfg_list <key> [default-list] — print an inline list as space-separated words.
+#
+# Brackets are dropped wherever they stand, a comma is a space, and the words
+# between runs of spaces are printed one space apart. Builtins only: a command
+# asks several lists, and each was three `tr` and a `sed`.
 cfg_list() {
-  cfg "$1" "${2:-}" | tr -d '[]' | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
+  local __cll_v __cll_c __cll_w __cll_out=""
+  cfg_v __cll_v "$1" "${2:-}"
+  for __cll_c in '[' ']'; do
+    while :; do
+      case "$__cll_v" in
+        *"$__cll_c"*) __cll_v=${__cll_v%%"$__cll_c"*}${__cll_v#*"$__cll_c"} ;;
+        *) break ;;
+      esac
+    done
+  done
+  while :; do
+    case "$__cll_v" in
+      *,*) __cll_v="${__cll_v%%,*} ${__cll_v#*,}" ;;
+      *) break ;;
+    esac
+  done
+  while [ -n "$__cll_v" ]; do
+    __cll_w=${__cll_v%% *}
+    [ -z "$__cll_w" ] || __cll_out="$__cll_out${__cll_out:+ }$__cll_w"
+    case "$__cll_v" in
+      *" "*) __cll_v=${__cll_v#* } ;;
+      *) __cll_v="" ;;
+    esac
+  done
+  printf '%s\n' "$__cll_out"
 }
 
 # cfg_list_lines <key> — items of an inline list `key: [a, b]`, one per line,
@@ -710,6 +755,120 @@ _cfg_route_depth() {
   esac
 }
 
+# --- the git flow -------------------------------------------------------------
+# Which git flow the project picked, and its bricks: all project keys, because a
+# flow is the team's and not one person's. Each reader prints the value and
+# exits 0, or prints the value read and exits 1, like jig_agent_git.
+
+jig_git_flow() {
+  local value
+  value=$(cfg git.flow direct)
+  printf '%s\n' "$value"
+  case "$value" in direct | staging) return 0 ;; *) return 1 ;; esac
+}
+
+# jig_staging_branch — the staging branch's name, empty when none is named.
+jig_staging_branch() {
+  cfg git.staging_branch ""
+}
+
+jig_staging_land() {
+  local value
+  value=$(cfg git.staging_land pr)
+  printf '%s\n' "$value"
+  case "$value" in pr | external) return 0 ;; *) return 1 ;; esac
+}
+
+jig_staging_review() {
+  local value
+  value=$(cfg git.staging_review ask)
+  printf '%s\n' "$value"
+  case "$value" in ask | require | none) return 0 ;; *) return 1 ;; esac
+}
+
+jig_promote_merge() {
+  local value
+  value=$(cfg git.promote_merge human)
+  printf '%s\n' "$value"
+  case "$value" in human | auto) return 0 ;; *) return 1 ;; esac
+}
+
+# jig_staging_stale_after — how long a task may wait on the staging branch with
+# no promotion before the drift report names it, as given (`14d` by default);
+# exits 1 on a value that is not a duration (jig_duration_seconds' form).
+jig_staging_stale_after() {
+  local value
+  value=$(cfg git.staging_stale_after 14d)
+  printf '%s\n' "$value"
+  case "${value%[dhms]}" in
+    '' | *[!0-9]* | ?????????*) return 1 ;;
+  esac
+  return 0
+}
+
+# jig_git_flow_problems — one line per fault in the project's choice of flow,
+# nothing when it is sound. The bricks are looked at only in the staging flow:
+# the direct flow reads none of them.
+jig_git_flow_problems() {
+  local flow branch value
+  if ! flow=$(jig_git_flow); then
+    printf "git.flow: '%s' is not a flow: direct or staging\n" "$flow"
+    return 0
+  fi
+  [ "$flow" = staging ] || return 0
+  branch=$(jig_staging_branch)
+  if [ -z "$branch" ]; then
+    printf 'git.staging_branch: the staging flow needs the name of the staging branch\n'
+  elif ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+    printf "git.staging_branch: git rejects the name '%s'\n" "$branch"
+  elif case "$branch" in refs/* | origin/*) true ;; *) false ;; esac; then
+    printf "git.staging_branch: '%s' is a ref; write the branch's own name, as in git.base_branch\n" "$branch"
+  elif [ "$branch" = "$(cfg git.base_branch main)" ]; then
+    printf "git.staging_branch: '%s' is the base branch; the staging branch has to be another one\n" "$branch"
+  fi
+  if ! value=$(jig_staging_land); then
+    printf "git.staging_land: '%s' is not pr or external\n" "$value"
+  fi
+  if ! value=$(jig_staging_review); then
+    printf "git.staging_review: '%s' is not ask, require or none\n" "$value"
+  fi
+  if ! value=$(jig_promote_merge); then
+    printf "git.promote_merge: '%s' is not human or auto\n" "$value"
+  fi
+  return 0
+}
+
+# jig_staging_in_use — print the staging branch's name and exit 0 when the
+# project's flow is `staging` and jig_git_flow_problems finds nothing in it;
+# exit 1, printing nothing, otherwise. Every reader of a task's staging state
+# asks this first, so a project on the `direct` flow, or one whose choice
+# cannot work, sees nothing new anywhere (jig doctor names what is wrong).
+jig_staging_in_use() {
+  local flow
+  cfg_v flow git.flow direct
+  [ "$flow" = staging ] || return 1
+  [ -z "$(jig_git_flow_problems)" ] || return 1
+  jig_staging_branch
+}
+
+# jig_staging_offer — the branches named stage or staging that origin has as of
+# the last fetch, one per line, and nothing once the project has named a flow:
+# turning the flow on is a person's answer, and a branch of that name may be for
+# something else. Reads refs only, never the network.
+jig_staging_offer() {
+  local file b
+  file=$(jig_config_file)
+  if [ -f "$file" ] && _config_has_key "$file" git.flow; then
+    return 0
+  fi
+  for b in stage staging; do
+    if git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+      printf '%s\n' "$b"
+    fi
+  done
+  return 0
+}
+
 # _cfg_chat_id <value> — exit 0 when <value> is a Telegram chat id: digits,
 # with a leading `-` for a group, or a public `@name`. Shared by `jig config
 # set` and the sender (notify.sh), which checks a value written by hand before
@@ -770,6 +929,8 @@ _cfg_parallel() {
 # - claude.*_model and codex.*_model: anything — the value is
 #   the runtime's to understand, never Jig's
 #   (adr-20261005-jig-names-the-roles-not-the-models);
+# - github.account: a GitHub login, as `gh auth status` names it (an
+#   Enterprise Managed User's carries a `_shortcode`);
 # - notify.telegram.chat_id: a chat id, digits with an optional `-`, or an
 #   `@name`; notify.autopilot and notify.interactive: `true` or `false`;
 # - notify.telegram.token: never — a token on a command line is in `ps`, the
@@ -794,7 +955,7 @@ jig_config_value_problem() {
       esac
       ;;
     housekeeping.trash_ttl | housekeeping.abandoned_ttl | housekeeping.stale_after \
-      | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout)
+      | git.staging_stale_after | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout)
       case "${value%[dhms]}" in
         '' | *[!0-9]* | ?????????*) printf 'not a duration (e.g. 7d, 12h, 30m, 90s)\n'; return 1 ;;
       esac
@@ -852,6 +1013,14 @@ jig_config_value_problem() {
       esac
       ;;
     claude.implement_model | claude.review_model | codex.implement_model | codex.review_model | executor.implement_model | executor.review_model) ;;
+    github.account)
+      case "$value" in
+        -* | *- | *--* | *[!A-Za-z0-9_-]* | ????????????????????????????????????????*)
+          printf 'not a GitHub login: letters, digits and single hyphens, as gh auth status names it\n'
+          return 1
+          ;;
+      esac
+      ;;
     notify.telegram.chat_id)
       _cfg_chat_id "$value" \
         || { printf 'not a chat id: digits (a group starts with -), or @name\n'; return 1; }

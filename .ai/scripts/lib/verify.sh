@@ -10,8 +10,9 @@
 #
 # CI-backed projects (ADR-0041): `verify.full_run: ci` in .ai/config.yaml is
 # the project's claim that its CI runs the full set. A flag-less `jig verify`
-# then narrows to what changed since the merge base with git.base_branch,
-# unless CI is set or --full is given. A project map
+# then narrows to what changed since the merge base with the base the current
+# task was cut from (jig_task_base, ADR-0039), or git.base_branch when there is
+# no current task, unless CI is set or --full is given. A project map
 # (.ai/verify/<profile>.map) is parsed here, never in a profile, and handed to
 # profiles declaring `scope: [changed, map]` as JIG_VERIFY_MAPPED.
 #
@@ -41,6 +42,69 @@ _verify_changed_files() {
       && git -C "$JIG_PROJECT" diff --name-only HEAD --
     git -C "$JIG_PROJECT" ls-files --others --exclude-standard
   } 2>/dev/null | sed '/^$/d' | LC_ALL=C sort -u
+}
+
+# _verify_task_base <base-var> <which-var> — the base the task in this
+# checkout was cut from into <base-var>, and which task into <which-var>
+# (`task <id>`); both empty when there is no task to ask. The answer is
+# jig_task_base's, the one `task ship`, housekeeping and context judge the
+# task by (ADR-0039). The current task comes from `jig task current` run as a
+# process, not from sourcing task.sh (ARCHITECTURE.md: one command library
+# never sources another). Several live tasks on one branch (exit 2, one
+# candidate per stderr line, id first) give their base only when they all
+# agree on it; tasks that disagree, or no task, leave the configured base to
+# the caller.
+_verify_task_base() {
+  local __vtb_cur __vtb_rc=0 __vtb_err __vtb_ids __vtb_id __vtb_b
+  local __vtb_agreed="" __vtb_which=""
+  printf -v "$1" '%s' ""
+  printf -v "$2" '%s' ""
+  __vtb_err=$(mktemp "${TMPDIR:-/tmp}/jig-verify-current.XXXXXX") || return 0
+  jig_cleanup_add "$__vtb_err"
+  # JIG_INTERNAL_REDRAW: a re-entry, not a session's command — it must neither
+  # rewrite the checkout record nor spend a pending HEAD-moved notice, whose
+  # stderr lines would also be read below as task ids.
+  __vtb_cur=$(JIG_INTERNAL_REDRAW=1 "$JIG_SELF" task current 2>"$__vtb_err") || __vtb_rc=$?
+  case "$__vtb_rc" in
+    0)
+      jig_task_base_v __vtb_agreed "$__vtb_cur"
+      __vtb_which="task $__vtb_cur"
+      ;;
+    2)
+      __vtb_ids=$(awk '{ print $1 }' "$__vtb_err")
+      for __vtb_id in $__vtb_ids; do
+        jig_task_base_v __vtb_b "$__vtb_id"
+        if [ -z "$__vtb_agreed" ]; then
+          __vtb_agreed="$__vtb_b"
+        elif [ "$__vtb_b" != "$__vtb_agreed" ]; then
+          __vtb_agreed=""
+          break
+        fi
+        __vtb_which="${__vtb_which:+$__vtb_which, }$__vtb_id"
+      done
+      __vtb_which="tasks $__vtb_which"
+      ;;
+  esac
+  rm -f "$__vtb_err"
+  if [ -n "$__vtb_agreed" ]; then
+    printf -v "$1" '%s' "$__vtb_agreed"
+    printf -v "$2" '%s' "$__vtb_which"
+  fi
+  return 0
+}
+
+# _verify_merge_base <base-branch> <ref-var> <mb-var> — the ref <base-branch>
+# is judged by (jig_base_ref) into <ref-var>, and its merge base with HEAD into
+# <mb-var>; <mb-var> is empty when either cannot be found.
+_verify_merge_base() {
+  local __vmb_ref __vmb_mb=""
+  __vmb_ref=$(jig_base_ref "$1")
+  if [ -n "$__vmb_ref" ]; then
+    __vmb_mb=$(git -C "$JIG_PROJECT" merge-base "$__vmb_ref" HEAD 2>/dev/null) || __vmb_mb=""
+  fi
+  printf -v "$2" '%s' "$__vmb_ref"
+  printf -v "$3" '%s' "$__vmb_mb"
+  return 0
 }
 
 # _verify_ref_label <ref> — how a base ref reads in the report:
@@ -482,7 +546,7 @@ cmd_verify() {
   local scope=0 base="" nfiles=0 scope_ok note full=0 explicit=0 full_run
   local header="" base_branch base_ref mb map map_ok map_err maps maps_listed map_bad b
   local incomplete=0 covered=0 explained=0 unknown=0 plan_output plan_bad hr_state hr_rt hr_text
-  local covered_needs_install=0 is_fallback=0 run_output ci_left=0
+  local covered_needs_install=0 is_fallback=0 run_output ci_left=0 task_base="" task_which="" task_note=""
   JIG_VERIFY_TMP=""
   JIG_VERIFY_MAP_TMP=""
   JIG_VERIFY_MAP_ALL_TMP=""
@@ -567,16 +631,28 @@ cmd_verify() {
       header="verify: full run (CI is set)"
     else
       scope=1
+      # The current task's own base first (ADR-0039): a task cut from an epic
+      # is measured from the epic, not from main, or every task re-runs the
+      # whole epic's diff. A recorded base this clone cannot resolve (an epic
+      # deleted after its merge, never fetched) falls back to the configured
+      # one, never to the working tree alone.
       base_branch=$(cfg git.base_branch main)
-      base_ref=$(jig_base_ref "$base_branch")
+      _verify_task_base task_base task_which
+      base_ref=""
       mb=""
-      if [ -n "$base_ref" ]; then
-        mb=$(git -C "$JIG_PROJECT" merge-base "$base_ref" HEAD 2>/dev/null) || mb=""
+      if [ -n "$task_base" ]; then
+        _verify_merge_base "$task_base" base_ref mb
+        if [ -n "$mb" ]; then
+          base_branch="$task_base"
+          task_note="base of $task_which; "
+        fi
       fi
+      [ -n "$mb" ] || _verify_merge_base "$base_branch" base_ref mb
       if [ -n "$mb" ]; then
         base="$mb"
-        header=$(printf 'verify: scope changed since %s@%s (verify.full_run: ci, full set runs in CI)' \
-          "$(_verify_ref_label "$base_ref")" "$(git -C "$JIG_PROJECT" rev-parse --short "$mb")")
+        header=$(printf 'verify: scope changed since %s@%s (%sverify.full_run: ci, full set runs in CI)' \
+          "$(_verify_ref_label "$base_ref")" "$(git -C "$JIG_PROJECT" rev-parse --short "$mb")" \
+          "$task_note")
       else
         header="verify: scope changed in the working tree only, no merge base with $base_branch (verify.full_run: ci, full set runs in CI)"
       fi

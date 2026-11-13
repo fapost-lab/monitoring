@@ -351,8 +351,8 @@ _ot_origin_heads() {
     _OT_HEADS_STATE=none
     return 0
   fi
-  if _OT_HEADS=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
-    jig_net git -C "$JIG_PROJECT" ls-remote --heads origin 2>/dev/null); then
+  jig_git_origin_account "$OT_WHO" read
+  if _OT_HEADS=$(jig_net jig_git_origin ls-remote --heads origin 2>/dev/null); then
     _OT_HEADS_STATE=known
   else
     _OT_HEADS=""
@@ -924,6 +924,13 @@ _ot_ship_steps() {
     return 0
   fi
   jig_ship_require_commits "$OT_WHO" "$OT_BRANCH" "$OT_BASE"
+  # The same pair for the GitHub account a pull request is opened as: an
+  # answer before the push, not a refusal after it (jig_ship_account).
+  if ! _ot_capture jig_ship_account "$OT_WHO" "$OT_LEVEL"; then
+    OT_NOTE=$_OT_CAP
+    return 0
+  fi
+  jig_ship_account "$OT_WHO" "$OT_LEVEL"
   if ! _ot_capture jig_ship_push "$OT_WHO" "$OT_BRANCH"; then
     OT_NOTE=$_OT_CAP
     return 0
@@ -1052,6 +1059,26 @@ ot_record_write() {
   } > "$tmp"
   mv "$tmp" "$file"
   jig_record_changed
+}
+
+# ot_record_over <target> — say in its record that the write is over (ot_judge's `gone`),
+# from the record as read (OT_R_*) and _OT_J_WHY: `merged: 1` for a merge, `ended: <why>`
+# otherwise. Under the lock. Reads go on counting the write as waiting until it does.
+ot_record_over() {
+  OT_BRANCH=$OT_R_BRANCH
+  OT_BASE=$OT_R_BASE
+  OT_COMMIT=$OT_R_COMMIT
+  OT_PUSHED=$OT_R_PUSHED
+  OT_PR=$OT_R_PR
+  OT_MERGED=$OT_R_MERGED
+  OT_ENDED=$OT_R_ENDED
+  OT_SENT=$OT_R_SENT
+  if [ "$_OT_J_WHY" = merged ]; then
+    OT_MERGED=1
+  else
+    OT_ENDED=$_OT_J_WHY
+  fi
+  ot_record_write "$1"
 }
 
 # ot_targets — the targets that have a record, one per line.

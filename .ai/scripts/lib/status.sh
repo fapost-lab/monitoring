@@ -216,6 +216,7 @@ _status_report() {
   _status_config_local
   _status_agent_git
   _status_autopilot_git
+  _status_github_account
   _status_notify
 
   if manifest_exists; then
@@ -229,6 +230,7 @@ _status_report() {
   fi
   _status_new_release_hint
   _status_share_hint
+  _status_global_skill
 
   # Drift: one pass over the manifest, then one git process for every file
   # still on disk (jig_hash_list). A manifest_hash_of and a jig_hash per path
@@ -322,6 +324,14 @@ $rel"
   else
     printf 'specs: none\n'
   fi
+  # Only when there is one: a `jig-idea` conversation kept on disk before it
+  # became a spec (spec.sh, "idea drafts"). It is in no branch and no tree, so
+  # this line is how the next session learns there is one to continue from.
+  local drafts
+  drafts=$(spec_draft_count)
+  if [ "$drafts" -gt 0 ]; then
+    printf 'drafts: %s (jig spec draft list)\n' "$drafts"
+  fi
   # Only when something waits: the edits Jig committed in its own tree that have not
   # landed. Counted, not listed, as specs are: `jig writes` lists.
   # shellcheck source=lib/owntree.sh
@@ -336,9 +346,24 @@ $rel"
   local found=0 rec line default_base blocking bcount autopilot_note qlines qon qreason qago
   [ -n "$_STATUS_LIVE_READY" ] || _status_live_collect
   default_base=$_STATUS_DEFAULT_BASE
+  # The project's git flow and where its tasks stand on the staging branch:
+  # nothing on the default `direct` flow, whose report stays what it was.
+  _status_flow
+  # The staging drift report, a `staging: ` line each (jig_staging_drift).
+  _status_drift
+  [ -z "$_STATUS_DRIFT" ] || jig_staging_drift_lines "$_STATUS_DRIFT_STAGING" "$_STATUS_DRIFT"
+  _status_parked_read "$_STATUS_STAGING"
+  local staging_state sid sst parked parked_line=""
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _status_rec "$rec"
+    # A task parked at the staging branch is not listed with the work going on:
+    # it is named on the `parked:` line below.
+    _task_parked_lookup_v parked "$_ST_ID"
+    if [ -n "$parked" ]; then
+      parked_line="${parked_line:+$parked_line, }$_ST_ID ($(_task_parked_words "$parked"))"
+      continue
+    fi
     found=1
     line="task $_ST_ID class=$_ST_CLASS status=$_ST_STATUS"
     # Where `jig task list` shows it (adr-20261010-a-task-carries-its-tracker-issue).
@@ -387,6 +412,15 @@ EOF
     if [ -n "$_ST_BASE" ] && [ "$_ST_BASE" != "$default_base" ]; then
       line="$line base=$_ST_BASE"
     fi
+    # On the staging flow, whether the task's work is on the staging branch
+    # (jig_staging_states, read once in _status_flow).
+    staging_state=""
+    while IFS=$'\t' read -r sid sst; do
+      [ "$sid" != "$_ST_ID" ] || staging_state=$sst
+    done <<EOF
+$_STATUS_STAGING
+EOF
+    [ -z "$staging_state" ] || line="$line staging=$staging_state"
     if [ "$_ST_PAUSED" = "true" ]; then
       if [ -n "$_ST_REASON" ]; then
         line="$line paused ($_ST_REASON)"
@@ -424,7 +458,8 @@ EOF
   done <<EOF
 $_STATUS_LIVE
 EOF
-  [ "$found" = 1 ] || printf '%s\n' "no active tasks"
+  [ "$found" = 1 ] || [ -n "$parked_line" ] || printf '%s\n' "no active tasks"
+  [ -z "$parked_line" ] || printf 'parked: %s\n' "$parked_line"
   [ "$_STATUS_FINISHED" -gt 0 ] && printf '(%d finished; jig task list --all)\n' "$_STATUS_FINISHED"
   [ "$_STATUS_ARCHIVED" -gt 0 ] && printf 'archived: %d (jig task list --status archived)\n' "$_STATUS_ARCHIVED"
   # Which queued task to take next, when the clone keeps a queue.
@@ -460,6 +495,115 @@ EOF
   _status_instructions
 }
 
+# _status_flow — the `flow:` line, printed only off the default `direct` flow:
+# a flow jig doctor finds fault with, a staging branch origin does not have,
+# or how many live tasks are on the staging branch and how many behind it.
+# Fills _STATUS_STAGING with jig_staging_states' answer for the live tasks
+# ("<id><TAB>on|behind"), asked once for all of them; empty otherwise.
+_STATUS_STAGING=""
+_STATUS_FLOW_STAGING="" # the staging branch, once _status_flow found the flow sound and origin has it
+_STATUS_FLOW_RAN=""     # 1 once _status_flow judged the flow in this process
+_status_flow() {
+  local flow problems staging rows="" rec on=0 behind=0 id st t=$'\t'
+  _STATUS_STAGING=""
+  _STATUS_FLOW_STAGING=""
+  _STATUS_FLOW_RAN=1
+  cfg_v flow git.flow direct
+  [ "$flow" != direct ] || return 0
+  problems=$(jig_git_flow_problems)
+  if [ -n "$problems" ]; then
+    printf 'flow: %s, not usable: %s (jig doctor)\n' "$flow" "${problems%%$'\n'*}"
+    return 0
+  fi
+  staging=$(jig_staging_branch)
+  if ! git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/remotes/origin/$staging"; then
+    printf 'flow: staging via %s, which origin does not have (git fetch, or push it)\n' "$staging"
+    return 0
+  fi
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _status_rec "$rec"
+    [ -n "$_ST_BRANCH" ] || continue
+    rows="$rows$_ST_ID$t$_ST_BRANCH$t${_ST_BASE:-$_STATUS_DEFAULT_BASE}
+"
+  done <<EOF
+$_STATUS_LIVE
+EOF
+  _STATUS_STAGING=$(jig_staging_states "$staging" "$rows")
+  _STATUS_FLOW_STAGING=$staging
+  while IFS="$t" read -r id st; do
+    case "$st" in
+      on) on=$((on + 1)) ;;
+      behind) behind=$((behind + 1)) ;;
+    esac
+  done <<EOF
+$_STATUS_STAGING
+EOF
+  printf 'flow: staging via %s; on staging: %d, behind staging: %d\n' "$staging" "$on" "$behind"
+}
+
+# _status_drift — the staging drift report's records (jig_staging_drift) for
+# this checkout's live tasks into _STATUS_DRIFT, asked once per process: the
+# plain report and the page's items read the same answer. Empty off a sound
+# staging flow. The forge's answers come from the forge cache, never the forge
+# (adr-20261015-a-read-is-one-json-envelope).
+_STATUS_DRIFT=""
+_STATUS_DRIFT_READY=""
+_STATUS_DRIFT_STAGING="" # the staging branch the records are about
+_status_drift() {
+  local flow staging stale rows="" rec purl t=$'\t'
+  [ -z "$_STATUS_DRIFT_READY" ] || return 0
+  _STATUS_DRIFT_READY=1
+  _STATUS_DRIFT=""
+  # The direct flow asks nothing more, in this shell, as _status_flow does;
+  # after _status_flow the staging branch it judged sound is taken as it is.
+  cfg_v flow git.flow direct
+  [ "$flow" = staging ] || return 0
+  if [ -n "$_STATUS_FLOW_RAN" ]; then
+    staging=$_STATUS_FLOW_STAGING
+    [ -n "$staging" ] || return 0
+  else
+    staging=$(jig_staging_in_use) || return 0
+  fi
+  _STATUS_DRIFT_STAGING=$staging
+  stale=$(jig_staging_stale_after) || stale=""
+  [ -n "$_STATUS_LIVE_READY" ] || _status_live_collect
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _status_rec "$rec"
+    [ -n "$_ST_BRANCH" ] || continue
+    task_state_var purl "$_ST_ID" promote_url
+    rows="$rows$_ST_ID$t$_ST_BRANCH$t${_ST_BASE:-$_STATUS_DEFAULT_BASE}$t$purl
+"
+  done <<EOF
+$_STATUS_LIVE
+EOF
+  _STATUS_DRIFT=$(jig_staging_drift "$staging" "$stale" "$rows" "$(forgecache_read)")
+}
+
+# _status_parked_read [<staging-states>] — which live tasks wait at the staging
+# branch, into task.sh's _TASK_PARKED through its own reader (_task_parked_read):
+# the report never decides parking itself. Read once per run; the direct flow
+# starts no process. <staging-states> is _status_flow's answer, when it ran.
+_STATUS_PARKED_READY=""
+_status_parked_read() {
+  local rec ids=""
+  _STATUS_PARKED_READY=1
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    _status_rec "$rec"
+    ids="$ids$_ST_ID
+"
+  done <<EOF
+$_STATUS_LIVE
+EOF
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    _task_parked_read "$ids" "$1"
+  else
+    _task_parked_read "$ids"
+  fi
+}
+
 # --- the terminal form (adr-20261005-output-is-decorated-only-on-a-terminal) ----
 #
 # At a terminal `jig status` is read by section. A heading names the version,
@@ -490,6 +634,8 @@ _STT_AGENT=""        # the agent.git line's value, when it is valid
 _STT_AUTOPILOT=""    # the autopilot.git line's value, when it is valid
 _STT_CURRENT=""      # the current task, when it is not ambiguous
 _STT_NEXT=""         # the advice line's text after "next: ", when the clone has a queue
+_STT_FLOW=""         # the flow line's text after "flow: ", off the direct flow
+_STT_PARKED=""       # the parked line's text after "parked: ", when a task waits at staging
 _STT_UNSEEN=""       # 1 when the runtime does not name its sessions
 _STT_MODE=""         # the install's mode (copy, link)
 _STT_CURRENT_FW=""   # 1 when the project's framework is the global one
@@ -507,7 +653,7 @@ _status_terminal_report() {
   _status_report > "$tmp"
   root=$(jig_config_clone_root)
   _STT_NAME=${root##*/}
-  _STT_HEAD=$(jig_checkout_occupants)
+  _STT_HEAD=$(jig_checkout_occupants "" "$(_task_parked_ids)")
   _STT_HEAD=${_STT_HEAD%%$'\n'*}
   _status_terminal < "$tmp"
   rm -f "$tmp"
@@ -564,7 +710,7 @@ _status_terminal() {
   _STT_NEED_LEVEL=() _STT_NEED_TEXT=() _STT_NEED_DETAIL=() _STT_TASKS=() _STT_OTHERS=()
   _STT_INSTALL=() _STT_KNOW=() _STT_CFG=() _STT_REST=() _STT_HOOKS=() _STT_INSTR=()
   _STT_INSTR_OWN=()
-  _STT_AGENT="" _STT_CURRENT="" _STT_NEXT="" _STT_UNSEEN="" _STT_MODE="" _STT_CURRENT_FW="" _STT_INIT=""
+  _STT_AGENT="" _STT_CURRENT="" _STT_NEXT="" _STT_FLOW="" _STT_PARKED="" _STT_UNSEEN="" _STT_MODE="" _STT_CURRENT_FW="" _STT_INIT=""
   while IFS= read -r l || [ -n "$l" ]; do
     # A line indented by two spaces belongs to the list named above it
     # (modified:, missing:), which belongs to the drift line before that, or
@@ -661,6 +807,11 @@ _status_terminal() {
         t=${l#specs: }
         _STT_KNOW+=("specs"$'\t'"${t% (jig spec list)}"$'\t'"jig spec list")
         ;;
+      # A draft waits for nobody: a row beside the specs, not something to do.
+      "drafts: "*" (jig spec draft list)")
+        t=${l#drafts: }
+        _STT_KNOW+=("drafts"$'\t'"${t% (jig spec draft list)}"$'\t'"jig spec draft list")
+        ;;
       "epic: "*", branch missing") _status_need warn "$l" ;;
       "epic: "*) _STT_KNOW+=("epic"$'\t'"${l#epic: }"$'\t') ;;
       "task "*)
@@ -683,6 +834,15 @@ _status_terminal() {
       # The queue's advice is a fact about the tasks, never something the
       # reader must do: `next: none` is an answer, not a warning.
       "next: "*) _STT_NEXT=${l#next: } ;;
+      # The flow is a fact about the tasks too, unless it cannot work.
+      "flow: "*", not usable: "*" (jig doctor)" | "flow: "*", which origin does not have"*)
+        _status_need warn "$l"
+        ;;
+      "flow: "*) _STT_FLOW=${l#flow: } ;;
+      # The staging drift report: each line asks the reader for something.
+      "staging: "*) _status_need warn "$l" ;;
+      # Waiting at the staging branch is a fact about the tasks, not an ask.
+      "parked: "*) _STT_PARKED=${l#parked: } ;;
       "working here: "*" (jig "*", "*" ago)")
         t=${l#working here: }
         v=${t%% (jig *}
@@ -1042,6 +1202,7 @@ _status_terminal_tasks() {
           uncommitted=0) ;;
           uncommitted=*) note+=("${wd#uncommitted=} uncommitted") ;;
           base=*) note+=("base ${wd#base=}") ;;
+          staging=*) note+=("${wd#staging=} staging") ;;
           autopilot=on) note+=("autopilot on") ;;
           autopilot=handed-over) note+=("autopilot handed over") ;;
           queue=*) note+=("queue ${wd#queue=}") ;;
@@ -1067,7 +1228,8 @@ _status_terminal_tasks() {
       notes+=("$t")
     done
   fi
-  [ "$ntasks" -gt 0 ] || [ -n "$finished" ] || [ -n "$_STT_CURRENT" ] || [ -n "$_STT_NEXT" ] || return 0
+  [ "$ntasks" -gt 0 ] || [ -n "$finished" ] || [ -n "$_STT_CURRENT" ] || [ -n "$_STT_NEXT" ] \
+    || [ -n "$_STT_FLOW" ] || [ -n "$_STT_PARKED" ] || return 0
   out_section "Tasks" "$counts"
   w=20
   for id in "${ids[@]+"${ids[@]}"}"; do
@@ -1111,6 +1273,8 @@ _status_terminal_tasks() {
     done
   done
   [ -z "$_STT_NEXT" ] || out_row dim 4 "$OUT_MARK" plain 0 "next: $_STT_NEXT"
+  [ -z "$_STT_FLOW" ] || out_row dim 4 "$OUT_MARK" plain 0 "flow: $_STT_FLOW"
+  [ -z "$_STT_PARKED" ] || out_row dim 4 "$OUT_MARK" plain 0 "parked: $_STT_PARKED"
   [ -z "$_STT_CURRENT" ] || out_row dim 4 "$OUT_MARK" plain 0 "current task: $_STT_CURRENT"
 }
 
@@ -1976,8 +2140,9 @@ _status_attn() {
 # the counts (_SC_*) — and both print the same records, so nothing is computed
 # twice.
 _status_attention() {
-  local stopped="" gates="" git_steps="" rec id stop_reason stop_at ago level queue url live hk_note pr_ids=""
-  local nc wrong kept closed open settled phase phase_stops="" todo
+  local stopped="" gates="" git_steps="" rec id stop_reason stop_at ago level queue url live hk_note pr_ids="" parked
+  [ -n "$_STATUS_PARKED_READY" ] || _status_parked_read
+  local nc wrong kept closed open open_closed settled phase phase_stops="" todo
   hk_note=""
   [ -z "$_STATUS_HK_AT" ] || hk_note="housekeeping at $_STATUS_HK_WHEN"
   level=$(jig_agent_git 2>/dev/null) || level=none
@@ -2116,8 +2281,10 @@ UPR
     esac
     # 3. Finished, and the next git step is the reader's (agent.git). Only
     # once the knowledge decision is recorded: that is the last step before
-    # `jig task ship`, so an earlier `ready` is still the agent's.
-    if [ "$_ST_STATUS" = ready ] && [ "$_ST_KC" = true ] && [ -z "$_ST_PR_URL" ]; then
+    # `jig task ship`, so an earlier `ready` is still the agent's. A task
+    # parked at the staging branch has taken its git step already.
+    _task_parked_lookup_v parked "$_ST_ID"
+    if [ "$_ST_STATUS" = ready ] && [ "$_ST_KC" = true ] && [ -z "$_ST_PR_URL" ] && [ -z "$parked" ]; then
       queue=""
       case "$level" in
         none) queue="Review the changes and commit them: the agent may not commit in this clone." ;;
@@ -2138,18 +2305,26 @@ LIVE
   printf '%s' "$stopped$gates$git_steps"
 
   # 4. A pull request waits for review or merge: one jig opened (pr_url), or
-  # one the last housekeeping run saw open (a closed task's too).
+  # one the last housekeeping run saw open.
   #
-  # Deliberately outside hklog_flagged_ids, and "a closed task's too" is the
-  # reason: closing a task does not merge its pull request, so a consolidated
-  # task with `remote=open` contradicts nothing and this item still asks for
-  # something real. Only the forge can answer whether it is open, which is why
-  # it is worded in the past tense and asks for a refresh first.
+  # Deliberately outside hklog_flagged_ids: only the forge can answer whether
+  # a pull request is open, which is why this item is worded in the past
+  # tense and asks for a refresh first.
   #
-  # One live answer does reach it, in the loop below: a task the person
-  # abandoned. That disproves no flag either -- it makes the item's ask wrong,
-  # so the item changes what it asks instead of disappearing.
+  # Two live answers do reach it, in the loop below. A task the person
+  # abandoned disproves no flag -- it makes the item's ask wrong, so the item
+  # changes what it asks instead of disappearing. A task closed since the run
+  # does disprove it: `task set status consolidated` refuses a task with a
+  # pr_url unless the forge answers `merged` (_task_close_refusal), and a
+  # merge is final, so "open" is stale and the item is not built.
+  #
+  # Only a close after the run proves that: one the run itself already saw
+  # (`status=consolidated remote=open`) may predate the gate (2026-09-30),
+  # when a task could be closed with its pull request still open, and the
+  # forge called it open after that close -- so that item stays. A task with
+  # no pr_url never went through the forge's answer, and keeps its item too.
   open=$(hklog_ids ' remote=open ')
+  open_closed=$(hklog_ids ' status=consolidated remote=open ')
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     _status_in "$id" "$pr_ids" || pr_ids="$pr_ids$id
@@ -2167,15 +2342,33 @@ OPEN
       url=$(task_state_get "$id" pr_url)
       live=$(task_state_get "$id" status)
     fi
-    if [ "$live" = abandoned ] || [ "$live" = archived ]; then
+    # Parked at the staging branch (_task_parked_read): `signal` waits for
+    # "prepare for prod", not for this pull request, which is on staging;
+    # `review, landing` waits for review and for this person to land it.
+    parked=""
+    _task_parked_lookup_v parked "$id"
+    case "$parked" in
+      signal$'\t'*) continue ;;
+      *$'\t'landing)
+        _status_attn pull-request-waiting task "$id" "$id" \
+          "A pull request is waiting for review and for you to land it" "parked at the staging branch" \
+          "Once it is reviewed, land it on the staging branch: jig task land $id, or merge it on the forge. jig lands it itself only at agent.git: merge." "$url"
+        continue ;;
+    esac
+    if [ "$live" = consolidated ] && [ -n "$url" ] && _status_in "$id" "$open" \
+      && ! _status_in "$id" "$open_closed"; then
+      # Closed since the run, through the merge gate: see 4. above.
+      continue
+    elif [ "$live" = abandoned ] || [ "$live" = archived ]; then
       # `task abandon` never touches the forge, so a task the person gave up
       # on keeps its pull request. The flag stands -- only the forge knows
       # whether it is still open -- but the ask does not: work nobody wants is
       # not work to merge. So this item keeps the borrowed fact and changes
       # what it asks for, which is the one thing the local answer is good for
-      # here. `consolidated` is deliberately not treated this way: a closed
-      # task with an open pull request is worth looking at, and merging it is
-      # still the right move.
+      # here. `consolidated` is not treated this way: a task closed with a
+      # pull request had it merged (the gate above), and one the run saw
+      # closed may predate that gate -- merging its pull request is still the
+      # right move.
       #
       # Borrowed exactly as much as the item below it, and worded the same
       # way: past tense, and a refresh asked for first. Only what the task's
@@ -2200,6 +2393,41 @@ OPEN
   done <<PRS
 $pr_ids
 PRS
+
+  # 4b. The staging drift report (jig_staging_drift, read once in
+  # _status_drift): read from git and the forge cache by branch name, so a
+  # colleague's task waiting on staging is named here too. Nothing off a sound
+  # staging flow.
+  _status_drift
+  if [ -n "$_STATUS_DRIFT" ]; then
+    local dk da db dc dd de staging_name todo_promote
+    staging_name=$_STATUS_DRIFT_STAGING
+    while IFS=$'\t' read -r dk da db dc dd de; do
+      case "$dk" in
+        conflicting)
+          _status_attn promotion-conflicting task "$da" "$da" \
+            "The promotion conflicts with $dc" "open and conflicting as of $dd, as the forge last said" \
+            "Run jig task promote $da again: it pushes a merge of $dc into the task branch once that merge is resolved, and names the files that conflict." \
+            "$de" "$db	$dc	open	$dd" ;;
+        unpromoted)
+          # A task known here only by its branch is promoted by id from any
+          # checkout (_promote_branch_of), or by its owner.
+          todo_promote="run jig task promote $da"
+          [ "$de" = here ] || todo_promote="run jig task promote $da from any checkout, or ask its owner"
+          _status_attn staging-unpromoted task "$da" "$da" \
+            "Waiting on $staging_name with no promotion" "$db has been on $staging_name for $dd day(s)" \
+            "Once it passed its test on $staging_name, $todo_promote. Jig takes nothing off $staging_name." \
+            "" "$db	$dd" ;;
+        unowned)
+          _status_attn staging-unowned project "" "" \
+            "Work on $staging_name that no live task branch holds" "$da commit(s) on $staging_name that the base does not have" \
+            "Find out whose they are ($db), and bring them to the base through a task. Jig takes nothing off $staging_name." \
+            "" "$da" ;;
+      esac
+    done <<DRIFT
+$_STATUS_DRIFT
+DRIFT
+  fi
 
   # 5. Merged and ready to close (needs-consolidation, ADR-0030). 6. Work that
   # landed elsewhere, a pull request closed unmerged, a worktree left behind:
@@ -2242,6 +2470,20 @@ IDS
     "Reopen it, or tell the agent to abandon the task."
   _status_attention_per_task worktree-kept "$kept" "A worktree was kept because it still holds work" "$hk_note" \
     "Commit or discard what is left in the task's worktree; the next housekeeping removes it."
+
+  # 6b. The base here is behind origin's, as of the last fetch: what lands there
+  # (a decision, a merged task) is not in this checkout until it is brought up
+  # (adr-20261112-refresh-brings-the-clone-up-to-origin). Before the knowledge
+  # items, which may be asking for what origin already decided.
+  local obase ocounts ofetched
+  obase=$(cfg git.base_branch main)
+  if ocounts=$(jig_origin_counts "$obase") && [ "${ocounts%% *}" -gt 0 ]; then
+    ofetched=$(jig_origin_fetched_at) || ofetched=""
+    _status_attn base-behind-origin project "" "" \
+      "This checkout is behind origin" \
+      "$obase is ${ocounts%% *} commit(s) behind origin/$obase${ofetched:+, as of the fetch at $ofetched}" \
+      "jig refresh"
+  fi
 
   # 7. Knowledge nobody has agreed to yet reaches no agent (ADR-0016).
   if [ -n "$_SC_PROPOSALS" ] && [ "$_SC_PROPOSALS" -gt 0 ]; then
@@ -2378,6 +2620,23 @@ X
         json_str_or_null "$xat"; o="$o,\"fetched_at\":$_JSON}"
         json_str_or_null "$xto"; o="$o,\"versions\":{\"to\":$_JSON}"
         ;;
+      # The staging drift report's data (schemas/json.md).
+      promotion-conflicting)
+        IFS="$(printf '\t')" read -r xb xbase xst xat <<X
+$extra
+X
+        json_quote "$xb"; o="$o,\"pull_request\":{\"branch\":$_JSON"
+        json_quote "$xbase"; o="$o,\"base\":$_JSON"
+        json_quote "$xst"; o="$o,\"state\":$_JSON"
+        json_str_or_null "$xat"; o="$o,\"fetched_at\":$_JSON}"
+        ;;
+      staging-unpromoted)
+        IFS="$(printf '\t')" read -r xb xat <<X
+$extra
+X
+        json_quote "$xb"; o="$o,\"staging\":{\"branch\":$_JSON,\"days\":$xat}"
+        ;;
+      staging-unowned) o="$o,\"staging\":{\"commits\":$extra}" ;;
     esac
     o="$o}"
     objs="$objs${objs:+,}$o"
@@ -2393,7 +2652,27 @@ ATTN
   fi
   json_str_or_null "$_SC_AT"
   jig_read_snapshot_end
-  printf '{"attention":[%s],"housekeeping":%s,"knowledge_counts_at":%s}\n' "$objs" "$hk" "$_JSON"
+  local kc="$_JSON" origin
+  _status_origin_json
+  origin=$_JSON
+  printf '{"attention":[%s],"housekeeping":%s,"knowledge_counts_at":%s,"origin":%s}\n' "$objs" "$hk" "$kc" "$origin"
+}
+
+# _status_origin_json — _JSON <- how this clone stands against origin, as of the last
+# fetch: the base, when the clone last fetched, and how far the base is behind and
+# ahead of origin's (`null` each when it cannot be told). No network.
+_status_origin_json() {
+  local base fetched counts o
+  base=$(cfg git.base_branch main)
+  fetched=$(jig_origin_fetched_at) || fetched=""
+  json_quote "$base"; o="{\"base\":$_JSON"
+  json_str_or_null "$fetched"; o="$o,\"fetched_at\":$_JSON"
+  if counts=$(jig_origin_counts "$base"); then
+    o="$o,\"behind\":${counts%% *},\"ahead\":${counts#* }}"
+  else
+    o="$o,\"behind\":null,\"ahead\":null}"
+  fi
+  _JSON=$o
 }
 
 # _status_html_phase_run — "Phase run": the roadmap phases a coordinator is
@@ -2523,15 +2802,23 @@ _status_phase_slots() {
 # the terminal groups them (_status_task_groups): a heading per epic or spec
 # with its progress, its own table under it, and "Other tasks" last.
 _status_html_tasks() {
-  local rec rows="" paused_rows="" rank row tab
+  local rec rows="" paused_rows="" parked_rows="" rank row tab parked
   local -a ids=()
   tab=$(printf '\t')
+  [ -n "$_STATUS_PARKED_READY" ] || _status_parked_read
   printf '<section id="tasks">\n<h2>Running now</h2>\n'
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     _status_rec "$rec"
     [ "$_ST_AUTOPILOT" != stopped ] || continue
     row=$(_status_html_task_row)
+    # Waiting at the staging branch: not running, listed apart like a pause.
+    _task_parked_lookup_v parked "$_ST_ID"
+    if [ -n "$parked" ]; then
+      parked_rows="$parked_rows$row
+"
+      continue
+    fi
     if [ "$_ST_PAUSED" = true ]; then
       paused_rows="$paused_rows$row
 "
@@ -2561,6 +2848,11 @@ EOF
   if [ -n "$paused_rows" ]; then
     printf '<details id="paused"><summary>Paused</summary>\n'
     _status_html_task_table "$paused_rows"
+    printf '</details>\n'
+  fi
+  if [ -n "$parked_rows" ]; then
+    printf '<details id="parked"><summary>Parked at the staging branch</summary>\n'
+    _status_html_task_table "$parked_rows"
     printf '</details>\n'
   fi
   if [ "$_STATUS_ARCHIVED" -gt 0 ]; then
@@ -2658,6 +2950,9 @@ _status_html_task_row() {
     printf ' <span class="badge warn">paused</span>'
     [ -z "$_ST_REASON" ] || printf ' <span class="muted">%s</span>' "$(_status_h "$_ST_REASON")"
   fi
+  local parked
+  _task_parked_lookup_v parked "$_ST_ID"
+  [ -z "$parked" ] || printf ' <span class="badge">parked: %s</span>' "$(_status_h "$(_task_parked_words "$parked")")"
   printf '</td><td>'
   _status_html_stage
   # The Task Base, and only where there is one: it is recorded by `jig task
@@ -2817,6 +3112,11 @@ _status_html_summary() {
   [ -z "$_STATUS_NEXT" ] || _status_html_item "Next task" "${_STATUS_NEXT#next: }" 0
   _status_html_count "Knowledge awaiting decision" "$_SC_PROPOSALS"
   _status_html_count "Linked sources changed" "$_SC_SOURCES"
+  # Only when there is one, as the text report: counted here and not among the
+  # saved counts, because it is one glob of the workspace.
+  local drafts
+  drafts=$(spec_draft_count)
+  [ "$drafts" -eq 0 ] || _status_html_item "Idea drafts" "$drafts" 0
   _status_html_count "Needs consolidation" "$(_status_hk_count needs-consolidation)"
   _status_html_count "Worktrees kept" "$(_status_hk_count worktree-kept)"
   _status_html_count "Landed on the wrong base" "$(_status_hk_count wrong-base)"
@@ -3049,6 +3349,27 @@ $(jig_share_candidates "$JIG_PROJECT")
 EOF
 }
 
+# _status_global_skill — one line when Jig placed jig-pr-review for this
+# person in Claude Code and it is not what this project installs. Claude Code
+# lets a person's skill win over a project's of the same name, so the
+# project's copy is not the one that runs; while that skill is being changed
+# here, this line is how anyone learns it
+# (adr-20261112-the-pr-review-skill-is-installed-per-user). Read-only: the
+# version is declared, never run (jig_declared_version).
+_status_global_skill() {
+  local source path mine ver
+  mine="$JIG_PROJECT/.claude/skills/jig-pr-review"
+  [ -d "$mine" ] || return 0
+  [ -f "$JIG_LIB/globalskill.sh" ] || return 0
+  source=$(jig_global_source) || return 0
+  # shellcheck source=globalskill.sh
+  . "$JIG_LIB/globalskill.sh"
+  path=$(jig_global_skill_installed "$source") || return 0
+  diff -rq -x "$JIG_GLOBAL_SKILL_MARKER" "$path/" "$mine/" >/dev/null 2>&1 && return 0
+  ver=$(jig_declared_version "$source" 2>/dev/null) || ver=unknown
+  printf '%s\n' "pr-review skill: personal $ver shadows this project's ($path)"
+}
+
 # _status_new_release_hint — the one line the plain-text report shows when
 # _status_latest_release_available found something; nothing otherwise
 # (task status-says-a-newer-jig-exists). The HTML page's own card
@@ -3120,6 +3441,21 @@ $(jig_notify_failing)
 EOF
   [ -n "$at" ] || return 0
   printf 'notify: Telegram messages are failing: %s (%s, %s)\n' "$why" "$who" "$at"
+}
+
+# _status_github_account — one line while Jig itself chose, among several, the
+# gh account this clone asks GitHub as (jig_gh_resolve, common.sh): a choice
+# nobody typed is one a person should be able to see and change. Read from
+# what was remembered, never by asking gh; a clone that sets `github.account`
+# shows it on its config.local line, and one account needs no line.
+_status_github_account() {
+  local f login="" how=""
+  [ -z "$(cfg github.account "")" ] || return 0
+  f=$(jig_gh_memo_file)
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r _ login how < "$f" || true
+  [ "$how" = detected ] && [ -n "$login" ] || return 0
+  printf 'github.account: %s (found: the gh account that may push here; jig config set --local github.account <login> names another)\n' "$login"
 }
 
 # _status_agent_git — one line naming the review queue `agent.git`'s level
