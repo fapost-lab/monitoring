@@ -401,7 +401,7 @@ km_check_doc_frontmatter() {
 
   domains=$(fm_list "$file" domains)
   paths_out=$(fm_list "$file" paths)
-  if [ -z "$domains" ] && [ -z "$paths_out" ]; then
+  if [ -z "$domains" ] && [ -z "$paths_out" ] && [ "$(fm_get "$file" load)" != stage ]; then
     km_warn "$relpath" "document has neither domains nor paths: listed in every catalog, never required"
   fi
 
@@ -468,7 +468,10 @@ km_check_load() {
   [ -n "$load" ] || return 0
   case "$load" in
     always | domain | matched) ;;
-    *) km_fail "$relpath" "invalid load: $load (expected always, domain or matched)" ;;
+    stage)
+      [ -n "$(fm_list "$file" stages)" ] ||
+        km_fail "$relpath" "load: stage without stages: the document is required at no stage" ;;
+    *) km_fail "$relpath" "invalid load: $load (expected always, domain, matched or stage)" ;;
   esac
 }
 
@@ -2368,6 +2371,10 @@ _km_decide_main() {
   jig_cleanup_add "$msg"
   _km_decide_in_tree "$sub" "$date"
   _km_decide_message > "$msg"
+  if [ -n "$OT_TOOK_IN" ]; then
+    printf '\nTakes in %s at %s: %s reached it after %s was cut.\n' \
+      "$(_km_ref_name "$OT_BASE_REF")" "$OT_TOOK_IN" "$_KM_TOOK_IN_IDS" "$OT_BRANCH" >> "$msg"
+  fi
   ot_commit "$msg" "$JIG_AI_DIR/knowledge"
   ot_ship "Knowledge decisions" "Decisions on knowledge, made through Jig on a branch of its own: nobody's checkout moved. Each commit is one call's decisions, and further decisions land here."
   rm -f "$msg"
@@ -2552,11 +2559,14 @@ _km_here_facts() {
 # about as the call decides it (_km_decide_kind_of), <sub> naming the command. The question is the
 # read's (_km_decidable_reasons), asked of the same rows with the same _km_ref_holds, at the
 # commit the tree stands on: the document's path, and for a `reject` of a stub whose source
-# changed or went here, that change. `not-on-branch` when the base has it and the tree, on a
-# write branch cut before it got there, does not; `not-on-base` otherwise: only in this
-# checkout, or only in commits origin does not have. What the tree does carry is judged by
+# changed or went here, that change. When the base has it and the tree, on a waiting branch
+# cut before it got there, does not, the tree takes the base in (ot_take_in_base) and the
+# ids go to _KM_TOOK_IN_IDS for the commit message; `not-on-branch` only when that merge
+# conflicts. `not-on-base` otherwise: only in this checkout, or only in commits origin
+# does not have, and it wins over a merge. What the tree does carry is judged by
 # the checks there: a decision already waiting is `not-proposed`, an id no document has is
 # `not-found`.
+_KM_TOOK_IN_IDS=""
 _km_refuse_what_is_only_here() {
   local sub="$1" i=0 n=0 rows tip id a b t
   t=$(printf '\t')
@@ -2589,22 +2599,31 @@ _km_refuse_what_is_only_here() {
   _km_ref_holds "$OT_BASE_REF" "$rows" > "$rows.base"
   exec 4< "$rows.tree"
   exec 5< "$rows.base"
-  local refused="" code=""
+  local refused="" behind="" files
   while IFS= read -r id; do
     IFS= read -r a <&4 || a=0
     IFS= read -r b <&5 || b=0
     [ "$a" != 1 ] || continue
-    refused=$id
-    if [ "$b" = 1 ]; then code=not-on-branch; else code=not-on-base; fi
-    break
+    if [ "$b" = 1 ]; then
+      behind="$behind${behind:+, }$id"
+    elif [ -z "$refused" ]; then
+      refused=$id
+    fi
   done < "$rows.ids"
   exec 4<&- 5<&-
   rm -f "$rows" "$rows.ids" "$rows.tree" "$rows.base"
-  [ -n "$refused" ] || return 0
-  if [ "$code" = not-on-branch ]; then
-    jig_fail not-on-branch "knowledge $sub: $refused, as this checkout has it, reached $OT_BASE after $OT_BRANCH was cut, and the decision is judged on that branch; decide it once the decisions waiting there have landed"
+  if [ -n "$refused" ]; then
+    jig_fail not-on-base "knowledge $sub: $refused, as this checkout has it, is not on $OT_BASE as $(_km_ref_name "$OT_BASE_REF") has it, and the decision is judged there; commit and push it, then decide"
   fi
-  jig_fail not-on-base "knowledge $sub: $refused, as this checkout has it, is not on $OT_BASE as $(_km_ref_name "$OT_BASE_REF") has it, and the decision is judged there; commit and push it, then decide"
+  [ -n "$behind" ] || return 0
+  # The base has it and the waiting branch, cut before it got there, does not: the branch
+  # takes the base in, and the decision joins the pull request that waits
+  # (adr-20261115-the-decisions-branch-takes-in-the-base).
+  if ! ot_take_in_base; then
+    files=$(printf '%s\n' "$_OT_CONFLICTS" | sed '$!s/$/,/' | tr '\n' ' ' | sed 's/ $//')
+    jig_fail not-on-branch "knowledge $sub: $behind, as this checkout has it, reached $OT_BASE after $OT_BRANCH was cut, and taking $OT_BASE in conflicts on $files; merge or close the decisions waiting there, then decide"
+  fi
+  _KM_TOOK_IN_IDS=$behind
 }
 
 # _km_ref_name <ref> — a ref as a person names it: `origin/main`, `main`.
@@ -2708,7 +2727,9 @@ _km_landed_paths_read() {
 
 # _km_decidable_reasons <table> — for each row of <table> (as _km_ref_holds takes it), one
 # line: empty when a decision sent now would be judged on what the row describes, else
-# the code it would be refused with, `not-on-branch` or `not-on-base`. Judged where the
+# the code it would be refused with, `not-on-base`. What the base has and the waiting
+# decisions do not is decidable: the write takes the base in; only a merge conflict,
+# which a read does not predict, refuses it (`not-on-branch`). Judged where the
 # write judges, as of the last fetch: the tip of the decisions waiting when some wait
 # (_km_waiting_top has run), the base as jig_base_ref reads it otherwise. No network.
 _km_decidable_reasons_at() {
@@ -2730,10 +2751,9 @@ _km_decidable_reasons_at() {
   exec 4< "$base_file"
   while IFS= read -r a; do
     IFS= read -r b <&4 || b=0
-    if [ "$a" = 1 ]; then
+    # What the base has, the write takes in (ot_take_in_base): decidable either way.
+    if [ "$a" = 1 ] || [ "$b" = 1 ]; then
       printf '\n'
-    elif [ "$b" = 1 ]; then
-      printf 'not-on-branch\n'
     else
       printf 'not-on-base\n'
     fi
@@ -3376,7 +3396,9 @@ km_check_stages() {
   local file="$1" relpath="$2" stage
   while IFS= read -r stage; do
     [ -n "$stage" ] || continue
-    jig_valid_stage "$stage" || km_fail "$relpath" "invalid stage: $stage"
+    jig_valid_stage "$stage" || { km_fail "$relpath" "invalid stage: $stage"; continue; }
+    jig_resolving_stage "$stage" ||
+      km_warn "$relpath" "stage $stage is resolved by no skill: the document is never read at it"
   done < <(fm_list "$file" stages)
 }
 

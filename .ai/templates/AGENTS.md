@@ -19,7 +19,7 @@ column is the way; the right-hand one is what it replaces.
 |---|---|---|
 | Take on work someone described, or the next task | the `jig-task` skill; for the next task, `jig queue next` | starting to edit code straight away, or picking from the list yourself |
 | Decide how much process the work needs | the risk test in the `jig-task` skill | reading a class off one word in the route table |
-| File the work as a unit | `jig task new <id>`, then `jig queue set <id> --priority <0-5>` | the runtime's own background tasks (`spawn_task` in Claude Code): they open another session, not a task with a route, a workspace and consolidation |
+| File the work as a unit | `jig task new <id>`, then `jig queue set <id> --priority <0-5>` | the runtime's own background tasks (`spawn_task` in Claude Code): they open another session, not a task with a route, a workspace and consolidation. A session the coordinator of an autopilot set opens for a filed task of its set (`jig-autopilot` §7) runs that task and is not this |
 | Get a branch for the task, or a tree of its own | `jig task start <id>`, or `jig task start <id> --worktree` | `git checkout -b`, `git worktree add` |
 | Find what to read for the files you touch | `jig context --files <files>` | grepping `.ai/knowledge/`, or reading all of it |
 | Write one of the task's documents | `jig task artifact write <id> <kind> --from <file>` | your editing tools on a path under `.ai/workspace/` |

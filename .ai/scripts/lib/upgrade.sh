@@ -1350,8 +1350,33 @@ _upgrade_finish() {
     # deleted here and on origin (adr-20261007-a-merged-branch-leaves-with-its-work).
     jig_ship_leave "upgrade" "$_UPGRADE_BRANCH" "$base" "$sha"
   fi
-  [ "$JIG_SHIP_MERGED" = 1 ] || _upgrade_step_back "$base"
+  if [ "$JIG_SHIP_MERGED" != 1 ]; then
+    _upgrade_record_pr "$base"
+    _upgrade_step_back "$base"
+  fi
   _upgrade_next
+}
+
+# _upgrade_record_pr <base> — put the pull request this run opened, or found
+# already open, into the forge cache as open (forgecache_record), so `jig
+# status` names the upgrade waiting for its merge at once, on GitHub and GitLab
+# alike, and not only after housekeeping next runs: housekeeping runs from a
+# session started in this project, and an upgrade made from anywhere else
+# (another session, Jig UI) would go unmentioned until then (task
+# gitlab-upgrade-mr-in-status). Nothing when no pull request was opened. The
+# URL is kept only when it is a pull or merge request's own address.
+_upgrade_record_pr() {
+  local base="$1" url="$JIG_SHIP_URL" sha
+  [ -n "$url" ] || return 0
+  case "$url" in */pull/* | */merge_requests/*) ;; *) url="" ;; esac
+  sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$_UPGRADE_BRANCH" 2>/dev/null) || sha=""
+  # forgecache.sh finds the cache through task.sh's _task_borrowed_tasks_root,
+  # as for every reader (ARCHITECTURE.md, Scripts layout).
+  # shellcheck source=lib/task.sh
+  . "$JIG_LIB/task.sh"
+  # shellcheck source=lib/forgecache.sh
+  . "$JIG_LIB/forgecache.sh"
+  forgecache_record "$_UPGRADE_BRANCH" "$base" open "$sha" "$url"
 }
 
 # Set by _upgrade_step_back: the branch (or commit) this checkout went back
@@ -1779,7 +1804,10 @@ upgrade_pending() {
 # the upgrade's branch still here. Once the forge has merged it, `--land` is
 # the step that brings it here: back on git.base_branch, fetched, fast-forwarded
 # to origin's, and the upgrade's branch let go the way Jig lets go of a branch
-# after a merge it made itself (jig_ship_leave). It asks the forge, because
+# after a merge it made itself (jig_ship_leave). A checkout on a third branch
+# (or a detached HEAD) is never switched: other work may be going on in it, so
+# the base branch is moved as a ref, by fast-forward, and the checkout takes
+# the upgrade when it next merges the base. It asks the forge, because
 # only the forge knows whether the pull request is merged; it never stashes,
 # never forces, and changes nothing when anything stands in its way.
 
@@ -1794,6 +1822,7 @@ _UPGRADE_L_COMMIT=""
 _UPGRADE_L_LEVEL=""
 _UPGRADE_L_DELETED=0
 _UPGRADE_L_DELETED_ORIGIN=0
+_UPGRADE_L_ON_BASE=1
 
 # _upgrade_land_prs <forge> <base> [<head>] — the forge's pull requests from
 # Jig's upgrade branches into <base>, newest first, one line each:
@@ -1880,7 +1909,7 @@ _upgrade_rebuilds() {
 # _upgrade_land_run [--quiet] — `jig upgrade --land`.
 _upgrade_land_run() {
   local quiet=0 a base forge prs cur have line head st sha url to label pick="" open_url="" open_head=""
-  local reasons="" tracked leave level
+  local reasons="" tracked stay=0
   for a in "$@"; do
     case "$a" in
       --land) ;;
@@ -1950,22 +1979,31 @@ PICK
   _UPGRADE_L_BRANCH=$head
   _UPGRADE_L_URL=$url
 
-  # Everything that stands in the way, all at once, before anything moves.
-  tracked=$(git -C "$JIG_PROJECT" status --porcelain 2>/dev/null | grep -v '^??' || true)
-  if [ -n "$tracked" ]; then
-    reasons="${reasons}the working tree has uncommitted changes; commit them or finish the task they belong to, then run \`jig upgrade --land\` again
-"
-  fi
+  # On a third branch, or a detached HEAD, this checkout stays where it is:
+  # only the base's ref moves, so neither the tree nor its uncommitted changes
+  # are in the way. On the base or the upgrade's branch the tree is moved.
   if [ "$cur" != "$base" ] && [ "$cur" != "$head" ]; then
-    reasons="${reasons}this checkout is on ${cur:-a detached HEAD}, not on $base or $head; switch to $base (\`git checkout $base\`), then run \`jig upgrade --land\` again
+    stay=1
+  fi
+
+  # Everything that stands in the way, all at once, before anything moves.
+  if [ "$stay" = 0 ]; then
+    tracked=$(git -C "$JIG_PROJECT" status --porcelain 2>/dev/null | grep -v '^??' || true)
+    if [ -n "$tracked" ]; then
+      reasons="${reasons}the working tree has uncommitted changes; commit them or finish the task they belong to, then run \`jig upgrade --land\` again
 "
-  elif [ "$cur" != "$base" ] && [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
+    fi
+  fi
+  if [ "$stay" = 0 ] && [ "$cur" != "$base" ] && [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
     # A linked worktree is never switched to the base, as jig_ship_leave
     # never switches one: housekeeping finds a worktree by the branch git
     # lists in it, and one moved to the base would be found by nothing.
     reasons="${reasons}this is a linked worktree on $head, and Jig never switches one to $base; run \`jig upgrade --land\` in the main checkout ($(jig_config_clone_root))
 "
   elif [ "$cur" != "$base" ] && jig_branch_checked_out "$base"; then
+    # A base checked out elsewhere is that worktree's to move: git could not
+    # switch here to it, and a ref moved under it would leave that tree and
+    # index behind the branch.
     reasons="${reasons}$base is checked out in another worktree; run \`jig upgrade --land\` there
 "
   fi
@@ -2004,6 +2042,10 @@ $(printf '%s' "$reasons" | sed 's/^/  - /')"
   fi
 
   _UPGRADE_L_FROM=$have
+  if [ "$stay" = 1 ]; then
+    _upgrade_land_stay "$base" "$head" "$sha" "$url" "$cur"
+    return 0
+  fi
   if [ "$cur" != "$base" ]; then
     git -C "$JIG_PROJECT" checkout -q "$base" >/dev/null 2>&1 \
       || jig_die "upgrade --land: could not switch to $base; you are still on $cur"
@@ -2014,19 +2056,35 @@ $(printf '%s' "$reasons" | sed 's/^/  - /')"
   _UPGRADE_L_TO=$(_upgrade_land_version HEAD)
   _UPGRADE_L_OUTCOME=landed
   _upgrade_out "upgrade: landed $head${url:+ ($url)}; on $base at ${_UPGRADE_L_COMMIT:0:12}, Jig ${_UPGRADE_L_TO:-unknown}"
+  _upgrade_land_let_go "$head" "$base" "$sha" 0
+  return 0
+}
 
-  # Origin is shared: its copy of the branch goes only for a person whose
-  # agent may push, as in housekeeping's sweep; without the merged head the
-  # local branch alone is let go, and only if git sees its work merged.
+# _upgrade_land_let_go <head> <base> <merged-head> <stayed> — let the landed
+# upgrade's branch go and report it. Origin is shared: its copy of the branch
+# goes only for a person whose agent may push, as in housekeeping's sweep;
+# without the merged head the local branch alone is let go, and only if git
+# sees its work merged. Back on the base (<stayed> 0) that is jig_ship_leave,
+# as after a merge Jig made. From a checkout that stayed on another branch
+# (<stayed> 1) it is jig_branch_leave with the merged head for the local
+# branch at every level: `git branch -d` measures a branch that lost its
+# upstream against HEAD, and HEAD is not the base there.
+_upgrade_land_let_go() {
+  local head="$1" base="$2" sha="$3" stayed="$4" level rsha leave
   level=$(jig_agent_git 2>/dev/null) || level=none
   _UPGRADE_L_LEVEL=$level
+  rsha=$sha
   case "$level" in
     push | pr | merge) ;;
-    *) sha="" ;;
+    *) rsha="" ;;
   esac
-  # shellcheck disable=SC2034 # read by jig_ship_leave (common.sh)
-  JIG_SHIP_MERGED=1
-  leave=$(jig_ship_leave "upgrade" "$head" "$base" "$sha")
+  if [ "$stayed" = 1 ]; then
+    leave=$(jig_branch_leave "upgrade" "$head" "$rsha" "$sha")
+  else
+    # shellcheck disable=SC2034 # read by jig_ship_leave (common.sh)
+    JIG_SHIP_MERGED=1
+    leave=$(jig_ship_leave "upgrade" "$head" "$base" "$rsha")
+  fi
   if [ -n "$leave" ]; then
     _upgrade_out "$leave"
     jig_has_line "upgrade: deleted branch $head" "$leave" && _UPGRADE_L_DELETED=1
@@ -2034,6 +2092,44 @@ $(printf '%s' "$reasons" | sed 's/^/  - /')"
   fi
   if [ "$_UPGRADE_L_DELETED" = 0 ] && ! git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$head"; then
     _UPGRADE_L_DELETED=1
+  fi
+  return 0
+}
+
+# _upgrade_land_stay <base> <head> <merged-head> <url> <cur> — the landing
+# from a checkout on neither the base nor the upgrade's branch: the base is
+# fast-forwarded to origin's without a checkout, and the upgrade's branch let
+# go. `git fetch .` moves the ref, not `update-ref`: it takes a fast-forward
+# only, so a commit that reached the base since the checks is never lost, and
+# it refuses a branch any worktree has checked out or is rebasing or
+# bisecting, which `git worktree list` shows as a detached HEAD. A base that
+# already equals origin's needs no move, so it is not fetched: git would
+# refuse it in use whatever its value. A clone with no local base gets one,
+# set to track origin's.
+_upgrade_land_stay() {
+  local base="$1" head="$2" sha="$3" url="$4" cur="$5" had=1 now mine theirs
+  git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$base" || had=0
+  mine=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base" 2>/dev/null || true)
+  theirs=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$base" 2>/dev/null || true)
+  if [ "$had" = 0 ] || [ -z "$theirs" ] || [ "$mine" != "$theirs" ]; then
+    git -C "$JIG_PROJECT" fetch -q --no-tags --no-recurse-submodules . \
+      "refs/remotes/origin/$base:refs/heads/$base" >/dev/null 2>&1 \
+      || jig_die "upgrade --land: $base could not be fast-forwarded to origin/$base (another worktree uses it, or it moved while this ran); nothing was changed"
+  fi
+  if [ "$had" = 0 ]; then
+    git -C "$JIG_PROJECT" branch -q --set-upstream-to="origin/$base" "$base" >/dev/null 2>&1 || true
+  fi
+  _UPGRADE_L_ON_BASE=0
+  _UPGRADE_L_COMMIT=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base" 2>/dev/null || true)
+  _UPGRADE_L_TO=$(_upgrade_land_version "refs/heads/$base")
+  _UPGRADE_L_OUTCOME=landed
+  _upgrade_out "upgrade: landed $head${url:+ ($url)}; $base at ${_UPGRADE_L_COMMIT:0:12}, Jig ${_UPGRADE_L_TO:-unknown}; this checkout stays on ${cur:-a detached HEAD}"
+  _upgrade_land_let_go "$head" "$base" "$sha" 1
+  # Said only while the checkout's own Jig differs from the base's: a branch
+  # that has merged the base already has the upgrade.
+  now=$(_upgrade_land_version HEAD)
+  if [ -n "$cur" ] && [ "$now" != "$_UPGRADE_L_TO" ]; then
+    _upgrade_out "next: $cur is still at Jig ${now:-unknown}; merge $base into it to take the upgrade"
   fi
   return 0
 }
@@ -2061,6 +2157,7 @@ _upgrade_land_json_data() {
     json_str_or_null "$_UPGRADE_L_COMMIT"; o="$o,\"commit\":$_JSON,\"pushed\":true"
     json_str_or_null "$_UPGRADE_L_URL"; o="$o,\"pull_request\":$_JSON,\"merged\":true}"
     json_quote "$_UPGRADE_L_BASE"; o="$o,\"land\":{\"base\":$_JSON"
+    json_bool "$( [ "$_UPGRADE_L_ON_BASE" = 1 ] && printf true )"; o="$o,\"checkout_on_base\":$_JSON"
     json_bool "$( [ "$_UPGRADE_L_DELETED" = 1 ] && printf true )"; o="$o,\"branch_deleted\":$_JSON"
     json_bool "$( [ "$_UPGRADE_L_DELETED_ORIGIN" = 1 ] && printf true )"; o="$o,\"origin_branch_deleted\":$_JSON}"
   else

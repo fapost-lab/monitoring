@@ -410,7 +410,7 @@ jig_checkout_record() {
 }
 
 _jig_checkout_record_inner() {
-  local runtime head name told body
+  local runtime head name told body session cmd
   _jig_checkout_ready || return 0
   runtime=$(_jig_checkout_runtime)
   [ -d "$runtime" ] || mkdir -p "$runtime" 2>/dev/null || return 0
@@ -432,6 +432,7 @@ _jig_checkout_record_inner() {
   # working record is named, because that naming may give up on a run that
   # still works a task (one whose branch is checked out elsewhere).
   _jig_checkout_take "$@" || true
+  _jig_checkout_revive || true
 
   name=""
   if ! name=$(_jig_checkout_name_from_args "$head" "$@"); then
@@ -442,8 +443,21 @@ _jig_checkout_record_inner() {
   [ -n "$name" ] || return 0
   jig_valid_id "$name" || return 0
   [ -d "$runtime/working" ] || mkdir -p "$runtime/working" 2>/dev/null || return 0
-  _jig_checkout_write "$runtime/working/$name" "command: $*
-" || true
+  # `session:` is what lets the session's end find the records it made under a
+  # task's name (jig_checkout_end); a record named by the session id needs none.
+  # One line per key, as the taken record does: an argument holding a line
+  # break must not start a key (`ended:`, `session:`) of its own.
+  cmd=$*
+  cmd=${cmd//$'\n'/ }
+  cmd=${cmd//$'\r'/ }
+  body="command: $cmd
+"
+  session=$(jig_checkout_session)
+  if [ -n "$session" ] && [ "$session" != "$name" ]; then
+    body="$body""session: $session
+"
+  fi
+  _jig_checkout_write "$runtime/working/$name" "$body" || true
   return 0
 }
 
@@ -573,6 +587,32 @@ command: $cmd
   return 0
 }
 
+# _jig_checkout_revive — a session that goes on after its end was marked (the
+# same id resumed) takes the mark off its own taken records. A working record is
+# rewritten by every command; a taken one only by a command that works its task,
+# so without this a resumed session's task would be offered to others.
+_jig_checkout_revive() {
+  local session root f line body
+  session=$(jig_checkout_session)
+  [ -n "$session" ] || return 0
+  root=$(jig_config_clone_root 2>/dev/null) || return 0
+  [ -n "$root" ] || return 0
+  for f in "$root/$JIG_AI_DIR"/runtime/taken/*/"$session"; do
+    [ -f "$f" ] || continue
+    _jig_checkout_read "$f" ended || continue
+    body=""
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}
+      case "$line" in "ended: "*) continue ;; esac
+      body="$body$line
+"
+    done < "$f"
+    _jig_checkout_write "$f" "$body" || true
+    jig_record_changed >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
 # jig_checkout_taken_begin — read once per command what every
 # jig_checkout_taken call compares with: this session's id, the window, the
 # clock and the clone root. A listing asks per task; the session lookup is a
@@ -614,6 +654,7 @@ jig_checkout_taken() {
     jig_valid_id "$name" || continue
     if [ "$_JIG_TK_NOW" -lt "$mtime" ]; then age=0; else age=$((_JIG_TK_NOW - mtime)); fi
     [ "$age" -le "$_JIG_TK_TTL" ] || continue
+    if _jig_checkout_read "$f" ended; then continue; fi
     if [ "$mtime" -gt "$best" ] \
       || { [ "$mtime" -eq "$best" ] && [ -n "$_JIG_TK_SELF" ] && [ "$name" = "$_JIG_TK_SELF" ]; }; then
       best=$mtime
@@ -631,6 +672,72 @@ jig_checkout_taken() {
   if _jig_checkout_read "$bestf" since && [ -n "$_JIG_CHECKOUT_READ" ]; then since=$_JIG_CHECKOUT_READ; fi
   if _jig_checkout_read "$bestf" command && [ -n "$_JIG_CHECKOUT_READ" ]; then cmd=$_JIG_CHECKOUT_READ; fi
   printf '%s\t%s\t%s\t%s\n' "$checkout" "$since" "$age" "$cmd"
+  return 0
+}
+
+# --- ending ---------------------------------------------------------------------
+#
+# A record lapses by its mtime, so a session that is over keeps its records live
+# for checkout.busy_ttl. The runtime's own end-of-session hook says it is over
+# (scripts/jig-session-end-hook), and this marks what that session wrote with an
+# `ended:` line, which the readers skip. Marked, not deleted: RULES.md lets a
+# script delete only what is shaped like a workspace or a trash entry, and a
+# record is neither. The mark names a session id and touches only that session's
+# records, so a live neighbour is never made to look free; a session that goes
+# on after all (the same id resumed) rewrites its record on its next command,
+# and the rewrite carries no mark. A record several sessions wrote under one
+# task's name holds the last writer's id; if that one ends, the other is shown
+# as free until its next command, the same ambiguity the shared file always had.
+
+# _jig_checkout_mark_ended <file> — rewrite a record with `ended:` added, in
+# place and atomically. Nothing when it is marked already or cannot be read.
+#
+# <expect> is the session id being ended; when the record's `session:` no
+# longer names it (another session rewrote the file in between), it is left
+# alone. A record named by the id itself carries no `session:` and passes.
+_jig_checkout_mark_ended() {
+  local file="$1" expect="${2:-}" line body="" sess=""
+  [ -f "$file" ] || return 0
+  _jig_checkout_read "$file" ended && return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case "$line" in 'session: '*) sess=${line#session: } ;; esac
+    body="$body$line
+"
+  done < "$file"
+  if [ -n "$expect" ] && [ -n "$sess" ] && [ "$sess" != "$expect" ]; then
+    return 0
+  fi
+  _jig_checkout_write "$file" "${body}ended: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+" || true
+  return 0
+}
+
+# jig_checkout_end <session-id> — mark every record <session-id> wrote as ended:
+# the working records in this checkout (named by the id, or carrying it as
+# `session:`) and its taken records in the clone. Never fails, prints nothing.
+jig_checkout_end() {
+  local session="$1" f name root
+  jig_valid_id "$session" || return 0
+  _jig_checkout_ready || return 0
+  for f in "$(_jig_checkout_runtime)"/working/*; do
+    [ -f "$f" ] || continue
+    name=${f##*/}
+    jig_valid_id "$name" || continue
+    if [ "$name" = "$session" ]; then
+      _jig_checkout_mark_ended "$f" "$session"
+    elif _jig_checkout_read "$f" session && [ "$_JIG_CHECKOUT_READ" = "$session" ]; then
+      _jig_checkout_mark_ended "$f" "$session"
+    fi
+  done
+  root=$(jig_config_clone_root 2>/dev/null) || root=""
+  if [ -n "$root" ]; then
+    for f in "$root/$JIG_AI_DIR"/runtime/taken/*/"$session"; do
+      [ -f "$f" ] || continue
+      _jig_checkout_mark_ended "$f"
+      jig_record_changed >/dev/null 2>&1 || true
+    done
+  fi
   return 0
 }
 
@@ -785,6 +892,8 @@ jig_checkout_busy() {
     if _jig_checkout_task_elsewhere "$name" "$head" "$list"; then continue; fi
     if [ "$now" -lt "$mtime" ]; then age=0; else age=$((now - mtime)); fi
     [ "$age" -le "$ttl" ] || continue
+    # A session that said it ended is not here, however fresh its record is.
+    if _jig_checkout_read "$f" ended; then continue; fi
     cmd=""
     if _jig_checkout_read "$f" command; then cmd="$_JIG_CHECKOUT_READ"; fi
     [ -n "$cmd" ] || cmd="jig"

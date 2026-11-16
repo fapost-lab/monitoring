@@ -68,7 +68,8 @@ could hold rules (`notes/`, `docs-private/`), never dependency or build director
   and gets no `paths`: it stays in the catalog. Give `--domains` and `--paths` only when the
   source really is limited to them; a project-wide document gets neither, so every catalog lists
   it and it is required only through `--ids` or `load: always`; `knowledge check` warns about it. Propose
-  `load: always` only with the source's size in front of the human. Replace the stub's placeholder
+  `load: always` only with the source's size in front of the human; a rule that belongs to one
+  stage — published docs at consolidation — is `load: stage` with `stages`, not `load: always`. Replace the stub's placeholder
   heading with the source's title and give it a summary. Write the size of every source into
   `knowledge-map.md` (`doc:` lines carry it; for an instruction file, `wc -c`). A line saying
   `linked by` already has a stub — do not propose it again.

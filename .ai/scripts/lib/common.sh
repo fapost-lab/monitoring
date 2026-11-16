@@ -354,6 +354,67 @@ jig_goal_check() {
   JIG_GOAL=$goal
 }
 
+# jig_task_goal_v <var> <task.md> — the goal of a task's brief (task.sh's `_task_goal`: the first
+# paragraph under `## Goal`, `(none)` for none) into <var>, read line by line
+# in the caller's shell: the listing asks it of every task.
+jig_task_goal_v() {
+  local __tg_raw __tg_line __tg_pre __tg_rest __tg_text="" __tg_in=0 __tg_comment=0
+  local __tg_head='^##[[:space:]]+Goal[[:space:]]*$'
+  if [ -f "$2" ]; then
+    while IFS= read -r __tg_raw || [ -n "$__tg_raw" ]; do
+      # The heading starts (or restarts) the goal wherever it is.
+      if [[ $__tg_raw =~ $__tg_head ]]; then
+        __tg_in=1
+        continue
+      fi
+      [ "$__tg_in" -eq 1 ] || continue
+      if [ "$__tg_comment" -eq 0 ]; then
+        case "$__tg_raw" in '#'*) break ;; esac
+      fi
+      __tg_line=$__tg_raw
+      while :; do
+        if [ "$__tg_comment" -eq 1 ]; then
+          case "$__tg_line" in
+            *'-->'*) __tg_line=${__tg_line#*-->}; __tg_comment=0 ;;
+            *) __tg_line=""; break ;;
+          esac
+        fi
+        case "$__tg_line" in
+          *'<!--'*) ;;
+          *) break ;;
+        esac
+        __tg_pre=${__tg_line%%<!--*}
+        __tg_rest=${__tg_line#*<!--}
+        case "$__tg_rest" in
+          *'-->'*) __tg_line=$__tg_pre${__tg_rest#*-->} ;;
+          *) __tg_line=$__tg_pre; __tg_comment=1; break ;;
+        esac
+      done
+      __tg_line=${__tg_line#"${__tg_line%%[![:space:]]*}"}
+      __tg_line=${__tg_line%"${__tg_line##*[![:space:]]}"}
+      if [ -z "$__tg_line" ]; then
+        if [ -n "$__tg_text" ] && [ "$__tg_comment" -eq 0 ]; then
+          case "$__tg_raw" in
+            *'-->'*) ;;
+            *) break ;;
+          esac
+        fi
+        continue
+      fi
+      __tg_text=${__tg_text:+$__tg_text }$__tg_line
+    done < "$2"
+  fi
+  printf -v "$1" '%s' "${__tg_text:-(none)}"
+}
+
+# jig_task_has_goal <task.md> — true when the brief has a goal by jig_task_goal_v's
+# reading: what `task list --goals` shows as `(none)` is what `task start`
+# warns about, or refuses for T3/T4.
+jig_task_has_goal() {
+  local goal
+  jig_task_goal_v goal "$1"
+  [ "$goal" != "(none)" ]
+}
 # Die unless the project has been initialised with jig init.
 # jig_has_line <line> <text> — exit 0 when <line> is a whole line of <text>,
 # compared as a string. A `case`, never `printf | grep -qxF`: bash writes a
@@ -1021,14 +1082,72 @@ jig_task_state_var() {
 # base can be behind it (a teammate who never fetched the branch) or ahead of
 # it (commits nobody pushed), and a bare name lets git pick the local one.
 jig_base_ref() {
-  local name="${1:-}"
-  [ -n "$name" ] || return 0
-  if git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$name^{commit}" >/dev/null 2>&1; then
-    printf '%s\n' "refs/remotes/origin/$name"
-  elif git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$name^{commit}" >/dev/null 2>&1; then
-    printf '%s\n' "refs/heads/$name"
+  local __jbr_out
+  jig_base_ref_v __jbr_out "${1:-}"
+  [ -z "$__jbr_out" ] || printf '%s\n' "$__jbr_out"
+  return 0
+}
+
+# jig_base_ref_v <var> <name> — jig_base_ref into <var>, in the caller's shell: the one
+# lookup, minus the subshell a `$(...)` would start for each call of a listing's row.
+jig_base_ref_v() {
+  local __jbr_name="${2:-}"
+  printf -v "$1" '%s' ""
+  [ -n "$__jbr_name" ] || return 0
+  if git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$__jbr_name^{commit}" >/dev/null 2>&1; then
+    printf -v "$1" '%s' "refs/remotes/origin/$__jbr_name"
+  elif git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$__jbr_name^{commit}" >/dev/null 2>&1; then
+    printf -v "$1" '%s' "refs/heads/$__jbr_name"
   fi
   return 0
+}
+
+# jig_branch_in_base <tip> <base-ref> — exit 0 when the work of <tip> is in
+# <base-ref> by git alone, however it was merged: <tip> is an ancestor (a
+# fast-forward or a merge commit); the branch's whole diff since the merge
+# base has the patch-id of one commit the base gained since (a squash); or
+# every commit of it is upstream by `git cherry` (a rebase). Exit 1 otherwise,
+# and whenever git cannot tell. Housekeeping's ancestry tier
+# (_hk_ancestry_state) and the staging close (_task_close_staging_refusal) ask
+# this one question; the squash check walks the base's new commits, so it is
+# for a command, never for a listing's every row.
+jig_branch_in_base() {
+  local tip="$1" base="$2" mb combined c cherry
+  if [ -z "$tip" ] || [ -z "$base" ]; then
+    return 1
+  fi
+  if git -C "$JIG_PROJECT" merge-base --is-ancestor "$tip" "$base" 2>/dev/null; then
+    return 0
+  fi
+  mb=$(git -C "$JIG_PROJECT" merge-base "$base" "$tip" 2>/dev/null || printf '')
+  [ -n "$mb" ] || return 1
+  # Squash: the branch's contribution collapses into one commit on the base,
+  # so its combined diff's patch-id matches that commit's, not any single
+  # commit of the branch. Guarded: an unguarded pipeline assignment under
+  # `set -e` + `pipefail` would abort the caller.
+  combined=$(git -C "$JIG_PROJECT" diff "$mb" "$tip" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1) || combined=""
+  if [ -n "$combined" ]; then
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      [ "$c" != "$combined" ] || return 0
+    done < <(_jig_base_patch_ids "$mb" "$base")
+  fi
+  # Rebase: every commit upstream individually; a single `+` did not land.
+  cherry=$(git -C "$JIG_PROJECT" cherry "$base" "$tip" 2>/dev/null || printf '')
+  case "$cherry" in
+    '' | '+'* | *$'\n+'*) return 1 ;;
+  esac
+  return 0
+}
+
+# _jig_base_patch_ids <merge-base> <base> — patch-id of every commit the base
+# gained since the merge base, one per line.
+_jig_base_patch_ids() {
+  local mb="$1" base="$2" sha
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    git -C "$JIG_PROJECT" show "$sha" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1
+  done < <(git -C "$JIG_PROJECT" rev-list "$mb..$base" 2>/dev/null)
 }
 
 # jig_staging_states <staging-branch> <rows> — "<id><TAB>on|behind" for each
@@ -1293,9 +1412,15 @@ EOF
 #       has open and conflicting with <base>, as of <fetched_at>.
 #   unowned<TAB><count><TAB><command>
 #       <count> commits, merges left out, are on origin's staging branch and
-#       not in the base (git.base_branch, origin first), and no live task
-#       branch — here or on origin — holds them; <command> lists exactly
-#       those: the count is that command's.
+#       not in the base (git.base_branch, origin first), no live task branch —
+#       here or on origin — holds them, they are this clone's person's
+#       (jig_staging_own) and the person has not acknowledged them
+#       (`jig staging ack`). <command> is the command that acknowledges them;
+#       `<command> --dry-run` lists exactly those: the count is its.
+#       Nobody else's commits are counted, named or listed
+#       (adr-20261113-staging-work-is-reported-to-its-own-author-until-acknowledged).
+#   unowned-commit<TAB><sha><TAB><author-date><TAB><subject>
+#       after `unowned`, those commits newest first, at most <cap> of them.
 # Read from git by branch name: the tasks are every branch
 # `git.branch_template` names, here or on origin, and this checkout's own; a
 # branch no workspace knows is judged against git.base_branch. The workspace
@@ -1304,14 +1429,16 @@ EOF
 # branch has and the base does not is counted, so a promoted task whose branch
 # was deleted after it landed is nobody's drift (the same ADR).
 #
+# <cap> (default 20) bounds the `unowned-commit` records; `all` prints every one.
+#
 # The processes it starts do not grow with the tasks or the commits
 # (conventions/shell.md): one for-each-ref, _jig_staging_walk's, one rev-list
-# of staging's own commits with their parents and times, one of those no task
-# branch holds, and one `date`.
+# of staging's own commits with their parents and times, jig_staging_own's,
+# and one `date`.
 jig_staging_drift() {
-  local staging="$1" stale="$2" rows="$3" cache="$4" t=$'\t'
+  local staging="$1" stale="$2" rows="$3" cache="$4" cap="${5:-20}" t=$'\t'
   local stip dbase base_ref bsha template prefix="" suffix="" kind a b c d e
-  local all="" rows3="" stale_s=-1 now walk landing shown shown_cmd
+  local all="" rows3="" stale_s=-1 now walk landing shown
   local -a excl=()
   stip=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$staging^{commit}" 2>/dev/null) || return 0
   [ -n "$stip" ] || return 0
@@ -1411,28 +1538,93 @@ jig_staging_drift() {
           print "conflicting\t" id[i] "\t" br[i] "\t" bs[i] "\t" cat[key] "\t" pu[i]
       }
     }'
-  # Staging's own commits no live task branch holds: one rev-list, with the
-  # same exclusions as the `git log` printed for them, so the two agree — the
-  # template's branches by glob (git's `*` crosses `/`, as the template match
-  # in _jig_staging_drift_refs does), and this checkout's other branches by ref.
-  shown=$(git -C "$JIG_PROJECT" rev-list --count --no-merges "$stip" "^$bsha" --not ${excl[@]+"${excl[@]}"} 2>/dev/null) || shown=0
-  if [ "${shown:-0}" -gt 0 ]; then
-    case "$base_ref" in
-      refs/remotes/*) b=${base_ref#refs/remotes/} ;;
-      *) b=${base_ref#refs/heads/} ;;
-    esac
-    shown_cmd="git log --no-merges origin/$staging ^$b"
-    if [ ${#excl[@]} -gt 0 ]; then
-      shown_cmd="$shown_cmd --not"
-      for a in "${excl[@]}"; do
-        case "$a" in
-          --*=*) shown_cmd="$shown_cmd ${a%%=*}='${a#*=}'" ;;
-          *) shown_cmd="$shown_cmd $a" ;;
-        esac
-      done
-    fi
-    printf 'unowned\t%s\t%s\n' "$shown" "$shown_cmd"
+  # Staging's own commits no live task branch holds, the person's own and not
+  # acknowledged: one listing, with the template's branches excluded by glob
+  # (git's `*` crosses `/`, as the template match in _jig_staging_drift_refs
+  # does) and this checkout's other branches by ref.
+  shown=$(jig_staging_own "$stip" "$bsha" ${excl[@]+"${excl[@]}"}) || shown=""
+  if [ -n "$shown" ]; then
+    printf '%s\n' "$shown" | awk -F '\t' -v cap="$cap" '
+      { n++; if (cap == "all" || n <= cap + 0) row[n] = $0 }
+      END {
+        print "unowned\t" n "\tjig staging ack"
+        for (i = 1; i <= n; i++) if (i in row) print "unowned-commit\t" row[i]
+      }'
   fi
+}
+
+# jig_staging_ack_file — where `jig staging ack` keeps the person's
+# acknowledged staging commits: .ai/runtime/staging-acked of the checkout that
+# owns the task workspaces, so a task worktree and the main checkout read the
+# same acknowledgements (as forgecache_file). Gitignored, one clone's.
+jig_staging_ack_file() {
+  local borrowed
+  if declare -F _task_borrowed_tasks_root >/dev/null && borrowed=$(_task_borrowed_tasks_root); then
+    printf '%s/runtime/staging-acked\n' "${borrowed%/workspace/tasks}"
+    return 0
+  fi
+  printf '%s/%s/runtime/staging-acked\n' "$JIG_PROJECT" "$JIG_AI_DIR"
+}
+
+# jig_staging_patch_ids — `<patch-id> <sha>` for each commit sha on stdin, by
+# content (`git patch-id --stable`): the same change rebased or cherry-picked
+# has the same patch-id. A commit with no diff prints nothing. Two processes.
+jig_staging_patch_ids() {
+  git -C "$JIG_PROJECT" log --no-walk=unsorted --stdin -p --no-color --no-ext-diff \
+    --format='commit %H' 2>/dev/null | git -C "$JIG_PROJECT" patch-id --stable 2>/dev/null || true
+}
+
+# jig_staging_own <staging-tip> <base-sha> [<exclude>...] — the commits of
+# <staging-tip>, merges left out, that <base-sha> and the <exclude> refs and
+# options (git rev-list's, after --not) do not hold, that are this clone's
+# person's and that the person has not acknowledged (jig_staging_ack_file):
+# `<sha><TAB><author-date><TAB><subject>`, newest first.
+#
+# The person's: the author's email or name (mailmap applied, case ignored) is
+# the email or name of this clone's git author (`git var GIT_AUTHOR_IDENT`:
+# user.email and user.name, or the environment that overrides them) — one
+# person often commits under more than one address, and Jig commits a task as
+# that author, so a task of this clone is covered too. No identity, no owner.
+# Acknowledged: the commit's patch-id, or its sha when it has none, is in the
+# file. The processes do not grow with the commits: one git var, one git log,
+# a cut, and jig_staging_patch_ids only when there are acknowledgements.
+jig_staging_own() {
+  local stip="$1" bsha="$2" email="" name="" ident list ackf acked="" t=$'\t'
+  shift 2
+  # `Name <email> <time> <zone>`: the author a commit made here now would carry.
+  ident=$(git -C "$JIG_PROJECT" var GIT_AUTHOR_IDENT 2>/dev/null) || ident=""
+  case "$ident" in
+    *' <'*'>'*)
+      name=${ident%% <*}
+      email=${ident#* <}
+      email=${email%%>*} ;;
+  esac
+  [ -n "$email$name" ] || return 0
+  list=$(git -C "$JIG_PROJECT" log --no-merges --no-color --format="%H$t%aE$t%aN$t%aI$t%s" \
+    "$stip" "^$bsha" ${1+--not "$@"} 2>/dev/null) || return 0
+  # Through the environment, not -v: awk -v would read `\` in a name as an escape.
+  list=$(printf '%s\n' "$list" | JIG_OWN_EMAIL=$email JIG_OWN_NAME=$name awk -F '\t' '
+    BEGIN { e = tolower(ENVIRON["JIG_OWN_EMAIL"]); n = tolower(ENVIRON["JIG_OWN_NAME"]) }
+    $1 != "" && ((e != "" && tolower($2) == e) || (n != "" && tolower($3) == n)) {
+      s = $5; for (i = 6; i <= NF; i++) s = s " " $i
+      print $1 "\t" $4 "\t" s
+    }')
+  [ -n "$list" ] || return 0
+  ackf=$(jig_staging_ack_file)
+  if [ -s "$ackf" ]; then
+    acked=$(printf '%s\n' "$list" | cut -f1 | jig_staging_patch_ids)
+    list=$( { awk '{ print "A\t" $1 "\t" $2 }' "$ackf"
+              printf '%s\n' "$acked" | awk 'NF == 2 { print "P\t" $1 "\t" $2 }'
+              printf '%s\n' "$list" | awk '$0 != "" { print "L\t" $0 }'; } | awk -F '\t' '
+      $1 == "A" { ack[$2] = 1; ack[$3] = 1; next }
+      $1 == "P" { pid[$3] = $2; next }
+      $1 == "L" {
+        if (($2 in pid) && (pid[$2] in ack)) next
+        if ($2 in ack) next
+        print substr($0, 3)
+      }')
+  fi
+  [ -z "$list" ] || printf '%s\n' "$list"
 }
 
 # _jig_staging_drift_refs <rows> <prefix> <suffix> <staging> <base> —
@@ -1487,7 +1679,7 @@ jig_staging_drift_lines() {
           printf 'staging: %s has waited on %s %s day(s) with no promotion (jig task promote %s, from any checkout, or ask its owner)\n' "$a" "$staging" "$d" "$a"
         fi ;;
       unowned)
-        printf 'staging: %s commit(s) on %s that no live task branch holds (%s)\n' "$a" "$staging" "$b" ;;
+        printf 'staging: %s commit(s) of yours on %s that the base does not have and no live task branch holds (list them: %s --dry-run; mark them as known: %s)\n' "$a" "$staging" "$b" "$b" ;;
       conflicting)
         printf 'staging: the promotion of %s conflicts with %s as of %s (run jig task promote %s again)\n' "$a" "$c" "$d" "$a" ;;
     esac
@@ -1966,15 +2158,15 @@ jig_release_raise() {
   return 0
 }
 
-# jig_release_notes_through <from> — the commit this branch's release notes say
+# jig_release_notes_through <from> [<head>] — the commit this branch's release notes say
 # they describe: the newest `Release-Notes-Through: <sha>` trailer among the
-# commits <from>..HEAD, resolved to a full sha, or as written when it does not
+# commits <from>..<head> (HEAD unless a pull request's head is named), resolved to a full sha, or as written when it does not
 # resolve; nothing when no commit carries one. The newest wins: notes brought up
 # to date after the base moved are a later commit with a later trailer
 # (adr-20261112-release-notes-name-the-commit-they-describe).
 jig_release_notes_through() {
   local v full
-  v=$(git -C "$JIG_PROJECT" log --format=%B "$1..HEAD" 2>/dev/null \
+  v=$(git -C "$JIG_PROJECT" log --format=%B "$1..${2:-HEAD}" 2>/dev/null \
     | awk 'found == "" && /^Release-Notes-Through:[[:space:]]*[0-9a-fA-F]+[[:space:]]*$/ {
         sub(/^Release-Notes-Through:[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); found = $0
       }
@@ -1987,7 +2179,8 @@ jig_release_notes_through() {
   fi
 }
 
-# jig_release_notes_gap <tip> — why the release notes on HEAD do not describe
+# jig_release_notes_gap <tip> [<head>] — why the release notes on <head> (HEAD
+# unless a pull request's head is named) do not describe
 # everything up to <tip> (the base's freshest commit), or nothing when they do.
 # Reads git only, no network: the callers fetch, each its own way (a ship as
 # the clone's account, CI with its checkout's token). The answer is the same
@@ -1996,7 +2189,7 @@ jig_release_notes_through() {
 # changelog check can never disagree about it.
 jig_release_notes_gap() {
   local tip="$1" through n list
-  through=$(jig_release_notes_through "$tip")
+  through=$(jig_release_notes_through "$tip" "${2:-HEAD}")
   if [ -z "$through" ]; then
     printf 'none of its commits names the commit its release notes describe; once the notes cover %s, record that commit in a Release-Notes-Through: trailer (jig task set <task> notes_through <sha> adds it to the next ship)\n' \
       "$(git -C "$JIG_PROJECT" rev-parse --short "$tip" 2>/dev/null || printf '%s' "$tip")"
@@ -2018,7 +2211,7 @@ jig_release_notes_gap() {
     "$n" "$(git -C "$JIG_PROJECT" rev-parse --short "$through")" "$list"
 }
 
-# jig_release_notes_refusal <who> <base> — jig_release_notes_gap against the
+# jig_release_notes_refusal <who> <base> [<head>] — jig_release_notes_gap against the
 # freshest <base>: origin's, fetched now as the clone's account, or the local
 # branch where there is no origin. A fetch that fails is itself the refusal:
 # a release whose notes cannot be checked against the base does not go out.
@@ -2036,7 +2229,7 @@ jig_release_notes_refusal() {
     tip="refs/heads/$base"
   fi
   git -C "$JIG_PROJECT" rev-parse --verify --quiet "$tip" >/dev/null 2>&1 || return 0
-  jig_release_notes_gap "$tip"
+  jig_release_notes_gap "$tip" "${3:-HEAD}"
 }
 
 # jig_fresh_base_ref <name> <who> — the ref to cut from <name>: the fresher of
@@ -2255,6 +2448,95 @@ jig_check_newest_release() {
   fi
   best=$(printf '%s\n' "$out" | jig_newest_release) || return 4
   printf '%s\n' "$best"
+}
+
+# jig_release_check_record <file> — ask the global framework checkout's origin
+# for the newest release (jig_check_newest_release) and record the answer in
+# <file>: `latest=<X.Y.Z>` and `checked_at=<UTC time>`, or `failed` and
+# `checked_at=` when the network did not answer. The one place the answer is
+# written, for housekeeping's per-project file (.ai/runtime/latest-release) and
+# for the machine's (`jig version --json`). Fails, writing nothing, only when
+# there is no global framework checkout to ask or <file> cannot be written; a
+# failed check is a recorded answer, not a failure.
+jig_release_check_record() {
+  local file="$1" exe root rc=0 best tmp now
+  tmp="$file.tmp.$$"
+  jig_cleanup_add "$tmp"
+  exe=$(jig_global_executable) || return 1
+  root="${exe%/scripts/jig}"
+  best=$(jig_check_newest_release "$root" "$_JIG_RELEASE_CHECK_TIMEOUT") || rc=$?
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ "$rc" -eq 0 ]; then
+    printf 'latest=%s\nchecked_at=%s\n' "${best#v}" "$now" > "$tmp" || return 1
+  else
+    printf 'failed\nchecked_at=%s\n' "$now" > "$tmp" || return 1
+  fi
+  mv "$tmp" "$file"
+}
+
+# The machine's own record of the newest release, for `jig version --json`,
+# which has no project and so no .ai/runtime: <cache dir>/jig/latest-release,
+# in the format jig_release_check_record writes. An answer is kept
+# _JIG_LATEST_FRESH_MIN minutes, a failed one _JIG_LATEST_RETRY_MIN, so an
+# offline machine does not ask on every read and comes back soon after it is
+# online again. Freshness is the file's age (`find -mmin`, portable), never a
+# parsed time.
+_JIG_LATEST_FRESH_MIN=360
+_JIG_LATEST_RETRY_MIN=60
+
+# jig_machine_latest_file — the path of that record; fails without a home.
+jig_machine_latest_file() {
+  local dir
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    dir="$XDG_CACHE_HOME"
+  elif [ -n "${HOME:-}" ]; then
+    dir="$HOME/.cache"
+  else
+    return 1
+  fi
+  printf '%s/jig/latest-release\n' "$dir"
+}
+
+# jig_machine_latest — set _JIG_LATEST (newest release, `X.Y.Z`) and
+# _JIG_LATEST_AT (when it was asked, UTC) from the machine's record, asking
+# the network first when the record is missing or older than it may be. Both
+# stay empty when nothing is known: no cache dir, no global checkout, or the
+# last check failed. Never fails and never prints.
+jig_machine_latest() {
+  local file line min stale=1
+  _JIG_LATEST=""
+  _JIG_LATEST_AT=""
+  file=$(jig_machine_latest_file) || return 0
+  if [ -f "$file" ]; then
+    min=$_JIG_LATEST_FRESH_MIN
+    grep -q '^latest=' "$file" 2>/dev/null || min=$_JIG_LATEST_RETRY_MIN
+    [ -z "$(find "$file" -mmin "-$min" 2>/dev/null)" ] || stale=0
+  fi
+  if [ "$stale" = 1 ]; then
+    mkdir -p "${file%/*}" 2>/dev/null || return 0
+    jig_release_check_record "$file" 2>/dev/null || true
+  fi
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      latest=*) _JIG_LATEST=${line#latest=} ;;
+      checked_at=*) _JIG_LATEST_AT=${line#checked_at=} ;;
+    esac
+  done < "$file"
+  jig_release_version "v$_JIG_LATEST" >/dev/null 2>&1 || _JIG_LATEST=""
+  return 0
+}
+
+# jig_version_json <installed> — the producer for `jig version --json`:
+# `{"installed", "latest", "checked_at"}` (schemas/json.md).
+jig_version_json() {
+  jig_machine_latest
+  json_quote "$1"
+  printf '{"installed":%s' "$_JSON"
+  json_str_or_null "$_JIG_LATEST"
+  printf ',"latest":%s' "$_JSON"
+  json_str_or_null "$_JIG_LATEST_AT"
+  printf ',"checked_at":%s}\n' "$_JSON"
 }
 
 # jig_fetch_branches <who> <name>... — refresh origin/<name> for each branch
@@ -3228,18 +3510,21 @@ $out"
 }
 
 # jig_ship_pr <who> <head> <base> <message-file> [<title>] [<body-file>] [<draft>]
-# [<match-base>] — open a pull request from <head> into <base> through
+# [<match-base>] [<reviewers>] — open a pull request from <head> into <base> through
 # whichever forge this checkout uses (jig_forge_kind), or report the one
 # already open from <head> rather than opening a second. With <match-base> 1
 # only one open from <head> into <base> counts: "prepare for prod" must not
 # take a task's open pull request into the staging branch for its promotion
 # (adr-20261111-prepare-for-prod-opens-the-promotion-from-git-alone). The title defaults to the message's first
-# line, the body to the rest of it; <draft> 1 opens it as a draft. With no
+# line, the body to the rest of it; <draft> 1 opens it as a draft. <reviewers>,
+# logins comma-separated and already resolved (lib/reviewers.sh), are requested
+# on the pull request this call opens, never on one it finds open: adding them
+# there is another command's. With no
 # usable forge it says the pull request is the human's and returns 0. Leaves
 # the URL in JIG_SHIP_URL, so it is called directly, never in `$()`.
 # shellcheck disable=SC2034 # JIG_SHIP_URL is read by the caller
 jig_ship_pr() {
-  local who="$1" head="$2" base="$3" message_file="$4" title="${5:-}" body_file="${6:-}" draft="${7:-0}" match="${8:-0}" kind
+  local who="$1" head="$2" base="$3" message_file="$4" title="${5:-}" body_file="${6:-}" draft="${7:-0}" match="${8:-0}" reviewers="${9:-}" kind
   _jig_ship_outward "$who"
   JIG_SHIP_URL=""
   kind=$(jig_forge_kind) || exit 1
@@ -3257,18 +3542,20 @@ jig_ship_pr() {
   case "$kind" in
     github)
       jig_gh_require "$who"
-      _jig_ship_pr_github "$who" "$head" "$base" "$title" "$body_file" "$draft" "$match"
+      _jig_ship_pr_github "$who" "$head" "$base" "$title" "$body_file" "$draft" "$match" "$reviewers"
       ;;
-    gitlab) _jig_ship_pr_gitlab "$who" "$head" "$base" "$title" "$body_file" "$draft" "$match" ;;
+    gitlab) _jig_ship_pr_gitlab "$who" "$head" "$base" "$title" "$body_file" "$draft" "$match" "$reviewers" ;;
   esac
 }
 
 # _jig_ship_pr_github <who> <head> <base> <title> <body-file> <draft> <match-base>
+# [<reviewers>]
 # shellcheck disable=SC2034 # JIG_SHIP_URL is read by the caller
 _jig_ship_pr_github() {
-  local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" match="${7:-0}" url out
+  local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" match="${7:-0}" reviewers="${8:-}" url out
   local extra="" only=""
   [ "$draft" != 1 ] || extra="--draft"
+  [ -z "$reviewers" ] || extra="$extra --reviewer $reviewers"
   [ "$match" != 1 ] || only="--base"
   # shellcheck disable=SC2086 # $only is one flag or nothing, its value follows
   url=$(jig_net jig_gh pr list --head "$head" ${only:+$only "$base"} --state open --json url --jq '.[0].url' 2>/dev/null || printf '')
@@ -3276,9 +3563,10 @@ _jig_ship_pr_github() {
   if [ -n "$url" ]; then
     JIG_SHIP_URL="$url"
     printf 'pr %s (already open)\n' "$url"
+    _jig_ship_pr_reviewers_not_added "$who" "$reviewers"
     return 0
   fi
-  # shellcheck disable=SC2086 # $extra is one flag or nothing
+  # shellcheck disable=SC2086 # $extra is flags without spaces in their values
   out=$(jig_net jig_gh pr create --base "$base" --head "$head" --title "$title" --body-file "$body_file" $extra 2>&1) \
     || jig_die "$who: gh pr create failed:
 $out
@@ -3286,32 +3574,52 @@ $(jig_gh_asked_as)"
   url=$(printf '%s\n' "$out" | tail -n 1)
   JIG_SHIP_URL="$url"
   printf 'pr %s\n' "$url"
+  if [ -n "$reviewers" ]; then
+    _jig_list_words_v reviewers "$reviewers"
+    printf '%s: review requested from %s\n' "$who" "$reviewers"
+  fi
+}
+
+# _jig_ship_pr_reviewers_not_added <who> <reviewers> — say so when reviewers
+# were named for a pull request that was already open: they are requested only
+# on one this ship opens.
+_jig_ship_pr_reviewers_not_added() {
+  [ -n "$2" ] || return 0
+  local __jsr_names
+  _jig_list_words_v __jsr_names "$2"
+  printf '%s: no review requested from %s: the pull request was already open, and reviewers are requested only when the ship opens it\n' "$1" "$__jsr_names"
 }
 
 # _jig_ship_pr_gitlab <who> <head> <base> <title> <body-file> <draft>
-# <match-base> — the same through `glab`, whose JSON is read by
+# <match-base> [<reviewers>] — the same through `glab`, whose JSON is read by
 # jig_glab_fields, the reader housekeeping uses.
 # shellcheck disable=SC2034 # JIG_SHIP_URL is read by the caller
 _jig_ship_pr_gitlab() {
-  local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" match="${7:-0}" out url desc
+  local who="$1" head="$2" base="$3" title="$4" body_file="$5" draft="$6" match="${7:-0}" reviewers="${8:-}" out url desc
   local extra="" only=""
   [ "$draft" != 1 ] || extra="--draft"
+  [ -z "$reviewers" ] || extra="$extra --reviewer $reviewers"
   [ "$match" != 1 ] || only="--target-branch"
   out=$(jig_net glab mr list --source-branch "$head" ${only:+$only "$base"} --output json 2>/dev/null || printf '')
-  url=$(printf '%s' "$out" | jig_glab_fields web_url | head -n 1)
+  url=$(printf '%s' "$out" | jig_glab_fields web_url@/merge_requests/ | head -n 1)
   if [ -n "$url" ]; then
     JIG_SHIP_URL="$url"
     printf 'pr %s (already open)\n' "$url"
+    _jig_ship_pr_reviewers_not_added "$who" "$reviewers"
     return 0
   fi
   desc=$(cat "$body_file")
-  # shellcheck disable=SC2086 # $extra is one flag or nothing
+  # shellcheck disable=SC2086 # $extra is flags without spaces in their values
   out=$(jig_net glab mr create --target-branch "$base" --source-branch "$head" --title "$title" --description "$desc" $extra 2>&1) \
     || jig_die "$who: glab mr create failed:
 $out"
   url=$(printf '%s\n' "$out" | grep -oE 'https://[^[:space:]]+' | tail -n 1)
   JIG_SHIP_URL="$url"
   printf 'pr %s\n' "${url:-$out}"
+  if [ -n "$reviewers" ]; then
+    _jig_list_words_v reviewers "$reviewers"
+    printf '%s: review requested from %s\n' "$who" "$reviewers"
+  fi
 }
 
 # --- merging a shipped pull request ----------------------------------------------
@@ -3327,6 +3635,15 @@ $out"
 
 # Set by jig_ship_merge: 1 when it merged, 0 otherwise.
 JIG_SHIP_MERGED=0
+
+# Set by jig_ship_merge beside every `not merged:` line: the failure code a
+# program acts on (schemas/json.md, "Failure codes"), empty when it merged.
+JIG_SHIP_NOT_MERGED_CODE=""
+
+# JIG_SHIP_CI_TIMEOUT — digits, minutes: when set, jig_ship_merge and
+# jig_pr_mergeable use it instead of agent.ci_timeout. A person's command sets
+# it to 0: one look at the checks, never a wait.
+JIG_SHIP_CI_TIMEOUT=""
 
 # The seconds between two looks at a pull request's checks, and how long no
 # check at all may mean "not registered yet" rather than "CI checks nothing".
@@ -3345,6 +3662,25 @@ _jig_ship_last_check() {
   why=$("$JIG_SHIP_LAST_CHECK") || why="the last check before the merge failed"
   [ -n "$why" ] || return 0
   printf 'not merged: %s\n' "$why"
+  JIG_SHIP_NOT_MERGED_CODE="notes-stale"
+  return 1
+}
+
+# jig_ship_timeout_v <var> — the minutes a ship waits for CI into <var>:
+# JIG_SHIP_CI_TIMEOUT when set, else agent.ci_timeout. Returns 1 when
+# agent.ci_timeout is not whole minutes, leaving the raw value in <var> so the
+# caller can name it.
+jig_ship_timeout_v() {
+  local __jst_value
+  if [ -n "$JIG_SHIP_CI_TIMEOUT" ]; then
+    printf -v "$1" '%s' "$JIG_SHIP_CI_TIMEOUT"
+    return 0
+  fi
+  if __jst_value=$(jig_ci_timeout); then
+    printf -v "$1" '%s' "$__jst_value"
+    return 0
+  fi
+  printf -v "$1" '%s' "$__jst_value"
   return 1
 }
 
@@ -3373,14 +3709,17 @@ jig_ship_merge() {
   local who="$1" url="$2" sha="$3" policy="$4" kind timeout
   _jig_ship_outward "$who"
   JIG_SHIP_MERGED=0
-  timeout=$(jig_ci_timeout) || jig_die "$who: invalid agent.ci_timeout: $timeout (expected whole minutes)"
+  JIG_SHIP_NOT_MERGED_CODE=""
+  jig_ship_timeout_v timeout || jig_die "$who: invalid agent.ci_timeout: $timeout (expected whole minutes)"
   kind=$(jig_forge_kind) || exit 1
   if [ "$kind" = none ]; then
     printf "not merged: no forge available; the merge is the human's\n"
+    JIG_SHIP_NOT_MERGED_CODE="forge-unavailable"
     return 0
   fi
   if [ -z "$url" ]; then
     printf 'not merged: no pull request to merge\n'
+    JIG_SHIP_NOT_MERGED_CODE="no-pull-request"
     return 0
   fi
   case "$kind" in
@@ -3444,6 +3783,15 @@ _jig_ship_ci_reason() {
   esac
 }
 
+# _jig_ship_ci_code <state> — the failure code of a CI state other than green.
+_jig_ship_ci_code() {
+  case "$1" in
+    red) printf 'ci-red\n' ;;
+    none) printf 'ci-none\n' ;;
+    *) printf 'ci-pending\n' ;;
+  esac
+}
+
 # _jig_ship_first_line <text> — the first non-empty line, for a refusal.
 _jig_ship_first_line() {
   printf '%s\n' "$1" | awk '!f && /[^[:space:]]/ { print; f = 1 }'
@@ -3468,6 +3816,7 @@ _jig_ship_merge_github() {
   local url="$1" sha="$2" policy="$3" timeout="$4" view draft="" head="" allowed m="" s="" r="" method state out
   if ! view=$(jig_gh pr view "$url" --json isDraft,headRefOid --jq '"\(.isDraft) \(.headRefOid)"' 2>/dev/null); then
     printf 'not merged: could not read the pull request\n'
+    JIG_SHIP_NOT_MERGED_CODE="forge-unavailable"
     return 0
   fi
   read -r draft head <<EOF
@@ -3475,10 +3824,12 @@ $view
 EOF
   if [ "$draft" != false ]; then
     printf 'not merged: the pull request is a draft\n'
+    JIG_SHIP_NOT_MERGED_CODE="draft"
     return 0
   fi
   if [ "$head" != "$sha" ]; then
     printf 'not merged: the pull request is at %s, not at the shipped %s\n' "${head:-an unknown commit}" "$sha"
+    JIG_SHIP_NOT_MERGED_CODE="forge-refused"
     return 0
   fi
   allowed=$(jig_gh repo view --json mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed \
@@ -3497,19 +3848,23 @@ EOF
   if [ -z "$method" ]; then
     if [ "$policy" = merge-commit ] && [ -n "$allowed" ]; then
       printf 'not merged: the repository does not allow merge commits, and this merge keeps its ancestry only with one\n'
+      JIG_SHIP_NOT_MERGED_CODE="forge-refused"
     else
       printf 'not merged: could not tell which merge method the repository allows\n'
+      JIG_SHIP_NOT_MERGED_CODE="forge-refused"
     fi
     return 0
   fi
   state=$(_jig_ship_ci_wait "$timeout" _jig_ship_checks_github "$url")
   if [ "$state" != green ]; then
     printf 'not merged: %s\n' "$(_jig_ship_ci_reason "$state" "$timeout")"
+    JIG_SHIP_NOT_MERGED_CODE=$(_jig_ship_ci_code "$state")
     return 0
   fi
   _jig_ship_last_check || return 0
   if ! out=$(jig_gh pr merge "$url" --match-head-commit "$sha" "--$method" 2>&1); then
     printf 'not merged: the forge refused: %s\n' "$(_jig_ship_first_line "$out")"
+    JIG_SHIP_NOT_MERGED_CODE="forge-refused"
     return 0
   fi
   JIG_SHIP_MERGED=1
@@ -3576,15 +3931,18 @@ _jig_ship_merge_gitlab() {
   iid=$(_jig_ship_glab_mr "$url")
   if [ -z "$iid" ]; then
     printf 'not merged: could not read the merge request from %s\n' "$url"
+    JIG_SHIP_NOT_MERGED_CODE="forge-unavailable"
     return 0
   fi
   if ! json=$(glab mr view "$iid" --output json 2>/dev/null); then
     printf 'not merged: could not read the merge request\n'
+    JIG_SHIP_NOT_MERGED_CODE="forge-unavailable"
     return 0
   fi
   case "$(printf '%s' "$json" | tr -d ' \n')" in
     *'"draft":true'* | *'"work_in_progress":true'*)
       printf 'not merged: the merge request is a draft\n'
+      JIG_SHIP_NOT_MERGED_CODE="draft"
       return 0 ;;
   esac
   project=$(glab api "projects/:id" 2>/dev/null | tr '\n' ' ') || project=""
@@ -3594,16 +3952,19 @@ _jig_ship_merge_gitlab() {
     merge-commit:merge:never | merge-commit:merge:default_off) ;;
     merge-commit:?*:?*)
       printf 'not merged: the project does not merge with a merge commit, and this merge keeps its ancestry only with one\n'
+      JIG_SHIP_NOT_MERGED_CODE="forge-refused"
       return 0 ;;
     any:?*:always | any:?*:default_on) squash="--squash" ;;
     any:?*:?*) ;;
     *)
       printf 'not merged: could not tell which merge method the project allows\n'
+      JIG_SHIP_NOT_MERGED_CODE="forge-refused"
       return 0 ;;
   esac
   state=$(_jig_ship_ci_wait "$timeout" _jig_ship_checks_gitlab "$iid" "$sha")
   if [ "$state" != green ]; then
     printf 'not merged: %s\n' "$(_jig_ship_ci_reason "$state" "$timeout")"
+    JIG_SHIP_NOT_MERGED_CODE=$(_jig_ship_ci_code "$state")
     return 0
   fi
   _jig_ship_last_check || return 0
@@ -3612,6 +3973,7 @@ _jig_ship_merge_gitlab() {
   # shellcheck disable=SC2086 # $squash is one flag or nothing
   if ! out=$(glab mr merge "$iid" --sha "$sha" --yes --auto-merge=false $squash 2>&1); then
     printf 'not merged: the forge refused: %s\n' "$(_jig_ship_first_line "$out")"
+    JIG_SHIP_NOT_MERGED_CODE="forge-refused"
     return 0
   fi
   JIG_SHIP_MERGED=1
@@ -3684,7 +4046,8 @@ _jig_pr_state_ask() {
       return 0
     fi
     out=$(jig_net glab mr view "$iid" --output json 2>"$err") || rc=$?
-    raw=$(printf '%s' "$out" | tr -d ' \n' | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
+    # The first "state": the merge request's own comes before those of the users nested in it.
+    raw=$(printf '%s' "$out" | tr -d ' \n' | { grep -o '"state":"[^"]*"' || true; } | sed -n '1s/^"state":"\(.*\)"$/\1/p')
     [ "$raw" != opened ] || raw=open
   fi
   if [ "$rc" -ne 0 ]; then
@@ -3747,48 +4110,146 @@ _jig_pr_state_no_forge() {
 # (adr-20261110-a-clone-names-its-github-account); the caller resolves it first,
 # in its own shell (land_task: jig_gh_require), since these run in `$()`.
 
-# jig_pr_approval <url> — approved|changes|none|unknown: whether somebody
-# approved the pull request. GitHub: `reviewDecision` when branch protection
-# asks for reviews; when it does not, the decision is empty even for an
-# approved pull request, so the latest review of each reviewer decides —
-# changes requested by anyone wins over an approval. GitLab: who approved
-# (`approved_by`), never `approved`, which is true with no approval at all
-# when the project requires none.
+# jig_pr_approval <url> — approved|changes|waiting|none|unknown: whether the
+# pull request is approved, as jig_pr_approval_v reads it. One word, for a
+# caller that needs no names.
 jig_pr_approval() {
-  local url="$1" kind out decision reviews iid
-  [ -n "$url" ] || { printf 'unknown\n'; return 0; }
-  kind=$(jig_forge_kind) || exit 1
-  case "$kind" in
-    github)
-      out=$(jig_net jig_gh pr view "$url" --json reviewDecision,latestReviews \
-        --jq '"\(.reviewDecision // "")|\([.latestReviews[]?.state] | join(","))"' 2>/dev/null) \
-        || { printf 'unknown\n'; return 0; }
-      decision=${out%%|*}
-      reviews=${out#*|}
-      case "$decision" in
-        APPROVED) printf 'approved\n' ;;
-        CHANGES_REQUESTED) printf 'changes\n' ;;
-        REVIEW_REQUIRED) printf 'none\n' ;;
-        '' | null)
-          case ",$reviews," in
-            *,CHANGES_REQUESTED,*) printf 'changes\n' ;;
-            *,APPROVED,*) printf 'approved\n' ;;
-            *) printf 'none\n' ;;
-          esac ;;
-        *) printf 'unknown\n' ;;
-      esac ;;
-    gitlab)
-      iid=$(_jig_ship_glab_mr "$url")
-      [ -n "$iid" ] || { printf 'unknown\n'; return 0; }
-      out=$(jig_net glab api "projects/:id/merge_requests/$iid/approvals" 2>/dev/null | tr -d ' \n') \
-        || { printf 'unknown\n'; return 0; }
-      case "$out" in
-        *'"approved_by":[]'*) printf 'none\n' ;;
-        *'"approved_by":[{'*) printf 'approved\n' ;;
-        *) printf 'unknown\n' ;;
-      esac ;;
-    *) printf 'unknown\n' ;;
+  local __jpa_state __jpa_pending
+  jig_pr_approval_v __jpa_state __jpa_pending "$1"
+  printf '%s\n' "$__jpa_state"
+}
+
+# jig_pr_approval_github_v <state-var> <decision> <reviews-csv> <pending-csv> —
+# GitHub's word for one pull request into <state-var>, from what the forge
+# said: <decision> is `reviewDecision` (empty or `null` when branch protection
+# asks for no reviews), <reviews-csv> the states of each reviewer's latest
+# review, <pending-csv> the reviewers still requested. A pure function, no
+# process: jig_pr_approval_v asks the forge for one pull request, housekeeping
+# for every open one in its list call, and both decide the same way here.
+# `changes` when the decision or any latest review asks for changes; `waiting`
+# when somebody is still requested; `approved` under an APPROVED decision, or
+# with no decision when a latest review approved; `none` under REVIEW_REQUIRED
+# or when nobody approved; `unknown` for any decision this does not know.
+jig_pr_approval_github_v() {
+  local __jpag_dec="$2" __jpag_reviews="$3" __jpag_p="$4" __jpag_s="unknown"
+  case "$__jpag_dec" in
+    APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | '' | null)
+      # A change request wins under any decision: branch protection's
+      # leaves out reviewers without write access.
+      if [ "$__jpag_dec" = CHANGES_REQUESTED ] \
+        || case ",$__jpag_reviews," in *,CHANGES_REQUESTED,*) true ;; *) false ;; esac; then
+        __jpag_s=changes
+      elif [ -n "$__jpag_p" ]; then
+        __jpag_s=waiting
+      elif [ "$__jpag_dec" = APPROVED ]; then
+        __jpag_s=approved
+      elif [ "$__jpag_dec" = REVIEW_REQUIRED ]; then
+        __jpag_s=none
+      else
+        case ",$__jpag_reviews," in
+          *,APPROVED,*) __jpag_s=approved ;;
+          *) __jpag_s=none ;;
+        esac
+      fi ;;
   esac
+  printf -v "$1" '%s' "$__jpag_s"
+}
+
+# jig_pr_approval_v <state-var> <pending-var> <url> — whether the pull request
+# is approved, into <state-var>: `changes` when anybody's latest review asks for
+# changes, whatever else holds; `waiting` when a reviewer the forge records as
+# requested has not answered yet — added by `jig task ship --reviewer` or by
+# hand — or, on GitLab, approval rules still want more approvals; `approved`
+# when somebody approved and nobody is waited for; `none` when nobody approved;
+# `unknown` when the forge cannot say. <pending-var> gets who is waited for,
+# comma-separated, empty when the forge names nobody.
+# GitHub: `reviewDecision` when branch protection asks for reviews; when it
+# does not, the decision is empty even for an approved pull request, so the
+# latest review of each reviewer decides. A pending `reviewRequests` entry —
+# a person, or a team nobody of which answered — is `waiting` even under an
+# `APPROVED` decision. GitHub drops a request once its reviewer submits any
+# review, a comment included: that is what "answered" means there.
+# GitLab: who approved (`approved_by`), never `approved`, which is true with no
+# approval at all when the project requires none; the merge request's
+# `reviewers` who are not among them, and `approvals_left`.
+# Run in the caller's shell, never in `$(...)`: on GitHub the caller has
+# resolved this clone's account first (jig_gh_require).
+jig_pr_approval_v() {
+  local __jpav_s="unknown" __jpav_p="" __jpav_url="$3" __jpav_kind __jpav_out __jpav_dec
+  local __jpav_reviews __jpav_rest __jpav_iid __jpav_by __jpav_rv __jpav_left __jpav_r
+  if [ -n "$__jpav_url" ]; then
+    __jpav_kind=$(jig_forge_kind) || exit 1
+    case "$__jpav_kind" in
+      github)
+        if __jpav_out=$(jig_net jig_gh pr view "$__jpav_url" --json reviewDecision,latestReviews,reviewRequests \
+          --jq '"\(.reviewDecision | if . == null then "" else . end)|\([.latestReviews[]?.state] | join(","))|\([.reviewRequests[]? | (if .login then .login elif .slug then .slug else .name end) | select(. != null)] | join(","))"' 2>/dev/null); then
+          __jpav_out=${__jpav_out%%$'\n'*}
+          __jpav_out=${__jpav_out%$'\r'}
+          __jpav_dec=${__jpav_out%%|*}
+          __jpav_rest=${__jpav_out#*|}
+          __jpav_reviews=${__jpav_rest%%|*}
+          __jpav_p=""
+          [ "$__jpav_rest" = "$__jpav_reviews" ] || __jpav_p=${__jpav_rest#*|}
+          jig_pr_approval_github_v __jpav_s "$__jpav_dec" "$__jpav_reviews" "$__jpav_p"
+        fi ;;
+      gitlab)
+        __jpav_iid=$(_jig_ship_glab_mr "$__jpav_url")
+        if [ -n "$__jpav_iid" ] \
+          && __jpav_out=$(jig_net glab api "projects/:id/merge_requests/$__jpav_iid/approvals" 2>/dev/null | tr -d ' \n\r') \
+          && case "$__jpav_out" in *'"approved_by":['*) true ;; *) false ;; esac \
+          && __jpav_rv=$(jig_net glab mr view "$__jpav_iid" --output json 2>/dev/null | tr -d ' \n\r'); then
+          __jpav_by=$(_jig_pr_usernames "$__jpav_out" approved_by)
+          __jpav_left=$(printf '%s' "$__jpav_out" | sed -n 's/.*"approvals_left":\([0-9][0-9]*\).*/\1/p')
+          for __jpav_r in $(_jig_pr_usernames "$__jpav_rv" reviewers); do
+            case " $__jpav_by " in
+              *" $__jpav_r "*) ;;
+              *) __jpav_p="${__jpav_p:+$__jpav_p,}$__jpav_r" ;;
+            esac
+          done
+          case "$__jpav_out" in
+            *'"approved_by":[]'*) __jpav_s=none ;;
+            *) __jpav_s=approved ;;
+          esac
+          if [ -n "$__jpav_p" ]; then
+            __jpav_s=waiting
+          elif [ "$__jpav_s" = approved ] && [ "${__jpav_left:-0}" -gt 0 ]; then
+            __jpav_s=waiting
+          fi
+        fi ;;
+    esac
+  fi
+  [ "$__jpav_s" = waiting ] || __jpav_p=""
+  printf -v "$1" '%s' "$__jpav_s"
+  printf -v "$2" '%s' "$__jpav_p"
+}
+
+# _jig_pr_usernames <json> <key> — the `username` values inside the array
+# <json> holds under <key>, space-separated: GitLab's `approved_by` (each
+# `{"user":{...}}`) and `reviewers`. The array is walked to its own closing
+# `]`, strings skipped with their escapes, so a `]` in a person's name never
+# ends it early; the author's `username`, outside it, is never read. Inside a
+# string a quote is escaped, so `"username":"` matches only a real key.
+_jig_pr_usernames() {
+  printf '%s' "$1" | awk -v key="\"$2\":[" '
+    {
+      s = s $0
+    }
+    END {
+      i = index(s, key)
+      if (!i) exit
+      p = i + length(key); depth = 1; ins = 0; out = ""
+      while (p <= length(s) && depth > 0) {
+        c = substr(s, p, 1)
+        if (ins) {
+          if (c == "\\") { out = out c substr(s, p + 1, 1); p += 2; continue }
+          if (c == "\"") ins = 0
+        } else if (c == "\"") ins = 1
+        else if (c == "[") depth++
+        else if (c == "]") { depth--; if (!depth) break }
+        out = out c; p++
+      }
+      print out
+    }' | grep -o '"username":"[^"]*"' | sed 's/^"username":"//; s/"$//' | tr '\n' ' ' || true
 }
 
 # _jig_pr_mergeable_once <kind> <url> — clean|conflict|draft|unknown, one look.
@@ -3836,7 +4297,11 @@ jig_pr_mergeable() {
   local url="$1" kind timeout start limit state
   [ -n "$url" ] || { printf 'unknown\n'; return 0; }
   kind=$(jig_forge_kind) || exit 1
-  timeout=$(jig_ci_timeout) || timeout=0
+  if [ -n "$JIG_SHIP_CI_TIMEOUT" ]; then
+    timeout=$JIG_SHIP_CI_TIMEOUT
+  else
+    timeout=$(jig_ci_timeout) || timeout=0
+  fi
   limit=60
   [ $((timeout * 60)) -ge "$limit" ] || limit=$((timeout * 60))
   start=$SECONDS
@@ -4194,11 +4659,14 @@ jig_spec_link() {
 
 # jig_spec_link_v <var> <task.md> — the same id into <var>, read in the
 # caller's shell; exit 2 on two different specs, as above, or when the file
-# cannot be read.
+# cannot be read. Also sets _JIG_SPEC_PHASE to the phase number of the first
+# link line (empty when it names none), for a caller that shows it.
+_JIG_SPEC_PHASE=""
 jig_spec_link_v() {
   local __jsl_line __jsl_id __jsl_found="" __jsl_conflict=0
-  local __jsl_re='^Spec: \.ai/specs/([A-Za-z0-9._-]+)/([[:space:]]+(—|-|--)[[:space:]]+Phase[[:space:]]+[0-9]+)?[[:space:]]*$'
+  local __jsl_re='^Spec: \.ai/specs/([A-Za-z0-9._-]+)/([[:space:]]+(—|-|--)[[:space:]]+Phase[[:space:]]+([0-9]+))?[[:space:]]*$'
   printf -v "$1" '%s' ""
+  _JIG_SPEC_PHASE=""
   [ -r "$2" ] && [ -f "$2" ] || return 2
   while IFS= read -r __jsl_line || [ -n "$__jsl_line" ]; do
     case "$__jsl_line" in "Spec: "*) ;; *) continue ;; esac
@@ -4207,12 +4675,126 @@ jig_spec_link_v() {
     case "$__jsl_id" in .* | -*) continue ;; esac
     if [ -z "$__jsl_found" ]; then
       __jsl_found=$__jsl_id
+      _JIG_SPEC_PHASE=${BASH_REMATCH[4]}
     elif [ "$__jsl_found" != "$__jsl_id" ]; then
       __jsl_conflict=1
     fi
   done < "$2"
   [ "$__jsl_conflict" -eq 0 ] || return 2
   printf -v "$1" '%s' "$__jsl_found"
+}
+
+# jig_spec_roadmap_ref <spec-id> [<current-branch>] — where the current roadmap of a spec
+# is read. Nothing when this checkout's copy is current: no epic, a finished one, or the
+# epic is checked out here. "<ref>\t<source>" when an open epic elsewhere holds
+# it — progress is made there (ADR-0040) — read with no fetch; <source> names
+# the branch and whether the ref is the remote's as of the last fetch. Exit 1
+# when that epic has no ref here at all, 2 when git rejects its name — no
+# fetch can bring that one. The one place the status page (spec_phase_rows), `spec plan`
+# and housekeeping (_hk_roadmap_open_read) decide it, so they cannot disagree. The
+# checkout's branch comes as the second argument (empty for a detached head) from a
+# caller that asks for many specs; without it, it is read here.
+jig_spec_roadmap_ref() {
+  local __jsr_out rc=0
+  jig_spec_roadmap_ref_v __jsr_out "$@" || rc=$?
+  [ -z "$__jsr_out" ] || printf '%s\n' "$__jsr_out"
+  return "$rc"
+}
+
+# jig_spec_roadmap_ref_v <var> <spec-id> [<current-branch>] — jig_spec_roadmap_ref into
+# <var>, in the caller's shell, with its exit status: the one lookup, minus the
+# subshells a `$(...)` per spec of a listing would start. <var> holds "<ref>\t<source>"
+# or nothing.
+jig_spec_roadmap_ref_v() {
+  local __jsr_line __jsr_branch __jsr_here __jsr_ref
+  printf -v "$1" '%s' ""
+  jig_spec_epic_v __jsr_line "$JIG_PROJECT/$JIG_AI_DIR/specs/$2/roadmap.md" 2>/dev/null || __jsr_line=""
+  [ -n "$__jsr_line" ] || return 0
+  [ "${__jsr_line##* }" != finished ] || return 0
+  __jsr_branch=${__jsr_line% *}
+  if [ "$#" -ge 3 ]; then
+    __jsr_here=$3
+  else
+    __jsr_here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  fi
+  [ "$__jsr_branch" != "$__jsr_here" ] || return 0
+  git check-ref-format --branch "$__jsr_branch" >/dev/null 2>&1 || return 2
+  jig_base_ref_v __jsr_ref "$__jsr_branch"
+  [ -n "$__jsr_ref" ] || return 1
+  case "$__jsr_ref" in
+    refs/remotes/*) printf -v "$1" '%s\t%s as of the last fetch' "$__jsr_ref" "$__jsr_branch" ;;
+    *) printf -v "$1" '%s\t%s' "$__jsr_ref" "$__jsr_branch" ;;
+  esac
+  return 0
+}
+
+# jig_spec_drop_rewrite <roadmap> <task-id> <suffix> <tmp> — write <roadmap> to
+# <tmp> with every unchecked item that names the task checked and <suffix>
+# after its last line, and print the rewritten lines. Exit 3: no item names
+# the task. Exit 4: every item that does is checked already. The id is
+# compared as a string, not a pattern: `.` is legal in an id. A matched item
+# is held until the line after its last continuation line, so the suffix ends
+# the item rather than its first line. Values reach awk through the
+# environment: a `-v` value has its escapes expanded. Here, not in spec.sh, because the
+# actions table (task.sh) asks it, through ot_spec_drop_refusal, whether an item is
+# there to close: one grammar.
+jig_spec_drop_rewrite() {
+  local roadmap="$1" tid="$2" suffix="$3" tmp="$4"
+  JIG_SD_ID="$tid" JIG_SD_SUFFIX="$suffix" awk -v tmp="$tmp" '
+    function flush() {
+      if (!held) return
+      hold[nh] = hold[nh] ENVIRON["JIG_SD_SUFFIX"]
+      for (k = 1; k <= nh; k++) { print hold[k] > tmp; print hold[k] }
+      held = 0; nh = 0
+    }
+    BEGIN { id = ENVIRON["JIG_SD_ID"]; head = "`" id "`" }
+    held && /^[[:space:]]+[^[:space:]]/ && !/^[[:space:]]*[-*][[:space:]]/ { hold[++nh] = $0; next }
+    {
+      flush()
+      line = $0
+      if (line ~ /^[[:space:]]*[-*][[:space:]]+\[[ xX]\]/) {
+        text = line
+        sub(/^[[:space:]]*[-*][[:space:]]+\[[ xX]\][[:space:]]*/, "", text)
+        if (substr(text, 1, length(head)) == head &&
+            substr(text, length(head) + 1) ~ /^[[:space:]]+(—|-|--)[[:space:]]/) {
+          matched++
+          if (line ~ /^[[:space:]]*[-*][[:space:]]+\[ \]/) {
+            sub(/\[ \]/, "[x]", line)
+            marked++
+            held = 1; nh = 1; hold[1] = line
+            next
+          }
+        }
+      }
+      print line > tmp
+    }
+    END {
+      flush()
+      close(tmp)
+      if (matched == 0) exit 3
+      if (marked == 0) exit 4
+    }
+  ' "$roadmap"
+}
+
+# jig_roadmap_open_ids <roadmap.md|-> — task ids named by the unchecked items
+# of a roadmap (`-` reads it from stdin), one per line, each once. An item is
+# "- [ ] `id` — text"; an id follows jig_valid_id (no leading dot or dash). Here because `spec` and
+# housekeeping both read it, and one command library never sources another.
+jig_roadmap_open_ids() {
+  awk '
+    /^[[:space:]]*[-*][[:space:]]+\[ \]/ {
+      text = $0
+      sub(/^[[:space:]]*[-*][[:space:]]+\[ \][[:space:]]*/, "", text)
+      if (text ~ /^`[A-Za-z0-9._-]+`[[:space:]]+(—|-|--)[[:space:]]/) {
+        id = substr(text, 2)
+        sub(/`.*$/, "", id)
+        # The same grammar as jig_valid_id: no leading dot or dash.
+        if (id ~ /^[.-]/) next
+        if (!(id in seen)) { seen[id] = 1; print id }
+      }
+    }
+  ' "$1"
 }
 
 # jig_spec_epic <roadmap.md|-> — "<branch> open" or "<branch> finished" when
@@ -4224,22 +4806,54 @@ jig_spec_link_v() {
 # would be a guess. The branch name is not validated here; a caller that
 # builds a ref from it runs `git check-ref-format --branch` first.
 jig_spec_epic() {
-  awk '
-    /^Epic:[[:space:]]+[^[:space:]]+([[:space:]]+(—|-|--)[[:space:]]+finished)?[[:space:]]*$/ {
-      line = $0
-      sub(/^Epic:[[:space:]]+/, "", line)
-      b = line
-      sub(/[[:space:]].*$/, "", b)
-      st = (line ~ /finished[[:space:]]*$/) ? "finished" : "open"
-      v = b " " st
-      if (found == "") found = v
-      else if (found != v) conflict = 1
-    }
-    END {
-      if (conflict) exit 2
-      if (found != "") print found
-    }
-  ' "$1"
+  local v rc=0
+  jig_spec_epic_v v "$1" || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ -z "$v" ] || printf '%s\n' "$v"
+}
+
+# jig_spec_epic_v <var> <roadmap.md|-> — the same answer into <var>, read in
+# the caller's shell with no process (the task listing asks it per task); exit
+# 2 on two lines that disagree, or a file that cannot be read.
+jig_spec_epic_v() {
+  local __jse_line __jse_found="" __jse_conflict=0 __jse_v
+  local __jse_re='^Epic:[[:space:]]+([^[:space:]]+)([[:space:]]+(—|-|--)[[:space:]]+finished)?[[:space:]]*$'
+  printf -v "$1" '%s' ""
+  if [ "$2" = "-" ]; then
+    exec 8<&0
+  else
+    [ -r "$2" ] && [ -f "$2" ] || return 2
+    exec 8< "$2"
+  fi
+  while IFS= read -r __jse_line <&8 || [ -n "$__jse_line" ]; do
+    case "$__jse_line" in "Epic:"*) ;; *) continue ;; esac
+    [[ $__jse_line =~ $__jse_re ]] || continue
+    __jse_v="${BASH_REMATCH[1]} open"
+    [ -z "${BASH_REMATCH[2]}" ] || __jse_v="${BASH_REMATCH[1]} finished"
+    if [ -z "$__jse_found" ]; then
+      __jse_found=$__jse_v
+    elif [ "$__jse_found" != "$__jse_v" ]; then
+      __jse_conflict=1
+    fi
+  done
+  exec 8<&-
+  [ "$__jse_conflict" -eq 0 ] || return 2
+  printf -v "$1" '%s' "$__jse_found"
+}
+
+# jig_spec_title_v <var> <spec.md> — the text of the first level-one heading
+# into <var>, empty when there is none or the file cannot be read; no process.
+# What `spec_title` answers, so the listing and the task JSON cannot disagree.
+jig_spec_title_v() {
+  local __jst_line
+  printf -v "$1" '%s' ""
+  [ -r "$2" ] && [ -f "$2" ] || return 0
+  while IFS= read -r __jst_line || [ -n "$__jst_line" ]; do
+    if [[ $__jst_line =~ ^#[[:space:]]+(.*)$ ]]; then
+      printf -v "$1" '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done < "$2"
 }
 
 # jig_task_epic <task.md> — which epic a task is built on, by its `Spec:` line
@@ -4630,6 +5244,12 @@ jig_glob_pattern_v() {
     */) __jgp_out="$__jgp_out*" ;;
   esac
   printf -v "$1" '%s' "$__jgp_out"
+}
+
+# _jig_list_words_v <var> <csv> — a comma list as a person reads it ("a, b"):
+# the one place that decides how reviewers are named in a message.
+_jig_list_words_v() {
+  _jig_replace_all_v "$1" "$2" "," ", "
 }
 
 # _jig_replace_all_v <var> <text> <find> <with> — every <find> in <text>, left
@@ -5040,6 +5660,97 @@ jig_record_changed() {
   jig_status_page_dirty
 }
 
+# --- the shipping record ------------------------------------------------------
+#
+# A `jig task ship` at `merge` waits for CI and then merges. While it does, it
+# keeps `<clone-root>/.ai/runtime/shipping/<id>` (`pid: <n>`, `since: <UTC>` and
+# `deadline: <epoch seconds>`), so a person's merge button, a program reading
+# `jig task list --json` and another ship can tell "the agent is waiting for CI
+# and merges itself" from "the merge is the person's". The clone root, not the
+# checkout the ship runs in, so a ship in a worktree is seen from the main
+# checkout. The ship writes the deadline: the CI timeout it waits with plus a
+# quarter of an hour. A record reads as live only while its process lives and
+# the deadline has not passed, so a SIGKILLed ship whose pid was recycled reads
+# as alive no longer than the deadline. A record whose process is gone, whose
+# deadline passed or that has no (numeric) deadline reads as no record; a read
+# never deletes it. Both writes raise the revision (jig_record_changed).
+
+# jig_shipping_file_v <var> <id> — the record's path into <var>; dies for an
+# id that is not one, before a path is built from it.
+jig_shipping_file_v() {
+  local __jsf_root
+  jig_valid_id "$2" || jig_die "invalid task id: $2"
+  jig_config_clone_root_v __jsf_root
+  printf -v "$1" '%s/%s/runtime/shipping/%s' "$__jsf_root" "$JIG_AI_DIR" "$2"
+}
+
+# jig_shipping_begin <id> — write the record for this process, atomically, and
+# remove it when the command ends however it ends. Its deadline is the CI
+# timeout the ship waits with (jig_ship_timeout_v) plus 15 minutes; when that
+# timeout is invalid the record has no deadline line, reads as absent, and
+# jig_ship_merge dies on it anyway.
+_JIG_SHIPPING_ID=""
+jig_shipping_begin() {
+  local id="$1" file tmp timeout deadline_line=""
+  jig_shipping_file_v file "$id"
+  mkdir -p "${file%/*}" 2>/dev/null || return 0
+  if jig_ship_timeout_v timeout; then
+    printf -v deadline_line 'deadline: %s\n' "$(( $(date +%s) + 10#$timeout * 60 + 900 ))"
+  fi
+  tmp="${file%/*}/.tmp.$id.$$"
+  jig_cleanup_add "$tmp"
+  printf 'pid: %s\nsince: %s\n%s' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$deadline_line" > "$tmp" 2>/dev/null || return 0
+  mv "$tmp" "$file" 2>/dev/null || return 0
+  jig_record_changed
+  _JIG_SHIPPING_ID=$id
+  jig_on_exit '_jig_shipping_exit'
+}
+
+# _jig_shipping_exit — the exit action: remove the record this process made.
+_jig_shipping_exit() {
+  [ -z "$_JIG_SHIPPING_ID" ] || jig_shipping_end "$_JIG_SHIPPING_ID"
+}
+
+# jig_shipping_end <id> — remove the record when it is this process's.
+jig_shipping_end() {
+  local id="$1" file pid
+  jig_shipping_file_v file "$id"
+  [ -f "$file" ] || { _JIG_SHIPPING_ID=""; return 0; }
+  pid=$(_jig_verify_busy_value "$file" pid || true)
+  [ "$pid" = "$$" ] || return 0
+  rm -f "$file"
+  _JIG_SHIPPING_ID=""
+  jig_record_changed
+}
+
+# jig_shipping_since_v <var> <id> — the record's `since` while its process
+# lives and its `deadline` (all digits, written by the ship) has not passed,
+# else empty: a record without a deadline reads as absent. Reads only.
+jig_shipping_since_v() {
+  local __jss_var="$1" __jss_file __jss_pid __jss_since="" __jss_deadline
+  jig_shipping_file_v __jss_file "$2"
+  if [ -f "$__jss_file" ]; then
+    __jss_pid=$(_jig_verify_busy_value "$__jss_file" pid || true)
+    case "$__jss_pid" in
+      '' | *[!0-9]*) ;;
+      *)
+        if kill -0 "$__jss_pid" 2>/dev/null; then
+          __jss_deadline=$(_jig_verify_busy_value "$__jss_file" deadline || true)
+          case "$__jss_deadline" in
+            '' | *[!0-9]*) ;;
+            *)
+              if [ "$(date +%s)" -le "$((10#$__jss_deadline))" ]; then
+                __jss_since=$(_jig_verify_busy_value "$__jss_file" since || true)
+              fi
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  fi
+  printf -v "$__jss_var" '%s' "$__jss_since"
+}
+
 # jig_revision_claim <expected> — claim the revision right above <expected>,
 # for a write that must be refused when the clone changed after its caller
 # read <expected> (adr-20261019-the-queue-is-one-file-written-against-a-revision).
@@ -5316,6 +6027,24 @@ _jig_task_state_value() {
   local value
   jig_task_state_var value "$1" "$2"
   [ "$_JIG_TS_FOUND" = 0 ] || printf '%s\n' "$value"
+}
+
+# jig_autopilot_building <id> — exit 0 when an agent is still building task
+# <id>: its autopilot run is `on` and its knowledge is not consolidated yet.
+# That is what holds an `autopilot.parallel` slot; a run stopped for a person,
+# answered or not, and one consolidated and waiting for its turn to ship hold
+# none (adr-20261114-a-waiting-run-holds-no-slot,
+# adr-20260922-a-phase-run-is-coordinated). A task with no state is not building,
+# and neither is one abandoned, archived or closed: `abandon` and `archive`
+# leave `autopilot` as it was, and such a run must not hold a slot forever.
+jig_autopilot_building() {
+  local __jab_ap __jab_kc __jab_st
+  jig_task_state_var __jab_st "$1" status
+  case "$__jab_st" in active | ready) ;; *) return 1 ;; esac
+  jig_task_state_var __jab_ap "$1" autopilot
+  [ "$__jab_ap" = on ] || return 1
+  jig_task_state_var __jab_kc "$1" knowledge_consolidated
+  [ "$__jab_kc" != true ]
 }
 
 # jig_pause_request_refusal <id> — why `jig queue request task:<id> pause`
@@ -5621,10 +6350,119 @@ jig_duration_seconds() {
   esac
 }
 
+# --- bounded runs of a project's command
+#
+# Rolled by hand like jig_ls_remote_tags: no `timeout` is guaranteed to exist
+# (ADR-0002). Shared by `worktree.setup` and the gate hooks, so that the two
+# cannot drift apart on how a hung command is stopped (for one, the Windows
+# tree).
+
+# _jig_winpid <pid> — the Windows process id behind the MSYS/Cygwin process
+# <pid>, or nothing when there is none to read.
+_jig_winpid() {
+  cat "/proc/$1/winpid" 2>/dev/null || true
+}
+
+# jig_stop_tree <pid> — under Git Bash, end the Windows process tree of <pid>
+# before its group is signalled. MSYS delivers a signal only to its own
+# processes: a native program the command started — `php` under `composer`,
+# `docker` — never hears it and goes on running. `taskkill /T` walks the tree
+# by parent, so it runs first, while <pid> is still there to be its root.
+# Asked of the machine, not its name (ADR-0037): with no taskkill or no
+# winpid to read — macOS, Linux — nothing: the group signal that
+# follows is the whole stop. MSYS rewrites `/T` into a path unless argument
+# conversion is off, as for _jig_junction.
+jig_stop_tree() {
+  local winpid
+  command -v taskkill >/dev/null 2>&1 || return 0
+  winpid=$(_jig_winpid "$1")
+  case "$winpid" in '' | *[!0-9]*) return 0 ;; esac
+  MSYS2_ARG_CONV_EXCL='*' taskkill /T /F /PID "$winpid" >/dev/null 2>&1 || true
+  return 0
+}
+
+# _jig_bounded_stop — the exit action that stops a bounded run still going
+# when Jig itself ends: its whole tree, as the limit does.
+_JIG_BOUNDED_PID=""
+_jig_bounded_stop() {
+  [ -n "$_JIG_BOUNDED_PID" ] || return 0
+  jig_stop_tree "$_JIG_BOUNDED_PID"
+  kill -TERM -- "-$_JIG_BOUNDED_PID" 2>/dev/null || kill -TERM "$_JIG_BOUNDED_PID" 2>/dev/null || true
+  _JIG_BOUNDED_PID=""
+  return 0
+}
+
+# jig_run_bounded <var> <secs> <command> [args...] — run <command> (a function
+# or a program) and leave in <var> its exit code, or the word `timeout` when it
+# was still running after <secs> seconds and was stopped; 0 waits for ever.
+#
+# The command runs in the background in a process group of its own (`set -m`),
+# so that at the limit the whole group — `make`, the `docker exec` under it,
+# the `composer` under that — is sent SIGTERM, and SIGKILL five seconds later;
+# under Git Bash, where native programs hear no signal, its Windows process
+# tree is ended first (jig_stop_tree). A process a container started inside
+# itself may not get the signal; that boundary is the container's.
+#
+# The caller's redirections on this call (`</dev/null >file 2>&1`) are the
+# command's: the background job inherits them. A group of its own does not
+# hear the terminal's Ctrl-C, which reaches only Jig; so whatever ends Jig
+# ends the command with it (jig_on_exit). One run at a time.
+jig_run_bounded() {
+  local __rb_var="$1" __rb_secs="$2" __rb_pid __rb_rc="" __rb_ticks=0 __rb_max __rb_waited __rb_monitor=0
+  shift 2
+  case "$-" in *m*) __rb_monitor=1 ;; esac
+  set -m
+  "$@" &
+  __rb_pid=$!
+  [ "$__rb_monitor" = 1 ] || set +m
+  _JIG_BOUNDED_PID=$__rb_pid
+  jig_on_exit '_jig_bounded_stop'
+
+  if [ "$__rb_secs" -gt 0 ]; then
+    __rb_max=$((__rb_secs * 5))
+    while kill -0 "$__rb_pid" 2>/dev/null; do
+      if [ "$__rb_ticks" -ge "$__rb_max" ]; then
+        jig_stop_tree "$__rb_pid"
+        # The group may be gone already (taskkill ended it, or it exited
+        # since kill -0): a failed signal must not end Jig mid-gate.
+        kill -TERM -- "-$__rb_pid" 2>/dev/null || kill -TERM "$__rb_pid" 2>/dev/null || true
+        __rb_waited=0
+        while kill -0 "$__rb_pid" 2>/dev/null && [ "$__rb_waited" -lt 25 ]; do
+          sleep 0.2
+          __rb_waited=$((__rb_waited + 1))
+        done
+        kill -KILL -- "-$__rb_pid" 2>/dev/null || true
+        wait "$__rb_pid" 2>/dev/null || true
+        __rb_rc=timeout
+        break
+      fi
+      sleep 0.2
+      __rb_ticks=$((__rb_ticks + 1))
+    done
+  fi
+  if [ -z "$__rb_rc" ]; then
+    __rb_rc=0
+    wait "$__rb_pid" 2>/dev/null || __rb_rc=$?
+  fi
+  _JIG_BOUNDED_PID=""
+  printf -v "$__rb_var" '%s' "$__rb_rc"
+  return 0
+}
+
 # Fixed route vocabulary shared by context and knowledge metadata validation.
 jig_valid_stage() {
   case "$1" in
     analyze | discover | specify | alternatives | design | plan | implement | review | architecture-review | verify | consolidate) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The stages whose skill runs `jig context resolve --stage <stage>`. A document that names
+# only stages outside this list reaches nobody, so `knowledge check` warns. Keep it next to
+# jig_valid_stage: a stage added there is added here once a skill resolves it.
+jig_resolving_stage() {
+  case "$1" in
+    discover | analyze | implement | review | architecture-review | verify | consolidate) return 0 ;;
     *) return 1 ;;
   esac
 }

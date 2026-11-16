@@ -64,14 +64,21 @@ their own file is answered by `config unset` too — say that the key then answe
    different level for runs only: the usual case is `pr` for their own work and `merge` for
    autopilot, which merges what autopilot builds and leaves the rest to them. `merge` here needs
    the same explanation and the same explicit yes as question 2.
-4. **Asking** (`autopilot.unattended`). Before asking, explain: on autopilot the agent stops to
+4. **Landing on the staging branch** (`agent.git_staging`) — only when the project is on the
+   staging flow (`git.flow: staging` in `jig config show`). "When a task is ready, may the agent
+   land it on the staging branch itself, even where it merges nothing into the main branch?"
+   Default: the same level as question 1 — say so, and write nothing. `merge` here needs the same
+   explanation and explicit yes as question 2, about the staging branch: the agent lands its own
+   pull request there once CI passed and the review rule allows; everything into the main branch
+   — Jig upgrades, specs, epics, releases, promotion — still follows question 1.
+5. **Asking** (`autopilot.unattended`). Before asking, explain: on autopilot the agent stops to
    ask at a design approval, an unmade decision, a destructive step or a problem it could not
    fix; with `true` it asks nothing — it approves its own design, picks the most reversible
    option, never destroys anything, opens a draft when fixing fails, and writes every such
    choice into the pull request. Recommend `false` for a developer who can answer those
    questions, `true` only for someone who cannot and would rather have the change delivered.
    Set `true` only on an explicit yes.
-5. **Releases** (`release.merge`) — only with `true` to question 4 and `merge` at either level.
+6. **Releases** (`release.merge`) — only with `true` to question 5 and `merge` at either level.
    Before asking, explain: a release is the pull request that raises the project's version — the
    release notes made last, or a release epic's final pull request; with `agent` (default) the run
    merges it once CI passed and its notes cover everything on the main branch, a `major` always
@@ -79,19 +86,19 @@ their own file is answered by `config unset` too — say that the key then answe
    a feature epic's final one included, are not affected. "Should the agent merge a release by itself, or leave that
    one to you?" Recommend `human` to someone whose main branch deploys or who wants to choose
    when a release goes out.
-6. **CI wait** (`agent.ci_timeout`) — only with `merge` at either level. "How many minutes should it wait for
+7. **CI wait** (`agent.ci_timeout`) — only with `merge` at any of the three levels (`agent.git`, `autopilot.git`, `agent.git_staging`). "How many minutes should it wait for
    the checks before leaving the pull request open for you?" Default 30.
-7. **At once** (`autopilot.parallel`). "When a whole roadmap phase runs, how many of its tasks
+8. **At once** (`autopilot.parallel`). "When a whole roadmap phase runs, how many of its tasks
    may agents work on at the same time?" Each one gets its own folder and its own agent, so
    more means more of the machine and more to read when they finish. Default 2, at most 16.
    Recommend 2, or 1 for someone who wants to watch every change.
-8. **Process** (`route.depth`). "How much process should your tasks get?" `full` — each risk
+9. **Process** (`route.depth`). "How much process should your tasks get?" `full` — each risk
    class's whole route (default); `lean` — a shorter analysis, the plan folded into it, one
    review round where the class allows it. Say what never changes: tests on changed files, CI
    before a merge, the design approval and architecture review of risky work. Recommend `full`;
    `lean` for someone who would rather trade a little review depth for time and tokens. One
    task can always differ.
-9. **Cleanup** (`housekeeping.*`, `git.delete_merged_branches`) — one question, offer to skip:
+10. **Cleanup** (`housekeeping.*`, `git.delete_merged_branches`) — one question, offer to skip:
    how long an abandoned task stays in the lists before it goes to the archive
    (`housekeeping.abandoned_ttl`, 14d), how long the trash of closed tasks is kept
    (`housekeeping.trash_ttl`, 7d), when an untouched task is moved to the archive
@@ -99,9 +106,9 @@ their own file is answered by `config unset` too — say that the key then answe
    days, 1d), whether it may `git fetch` (`housekeeping.fetch`, true), and whether a branch Jig
    made is deleted once its work has landed (`git.delete_merged_branches`, true — `false` keeps
    every branch). Recommend the defaults.
-10. **Worktrees** (`git.worktree_root`) — only if they run several agents at once and want the
+11. **Worktrees** (`git.worktree_root`) — only if they run several agents at once and want the
     task folders somewhere other than `../<project>.worktrees`.
-11. **Where the checks run** (`run.exec`). First run `.ai/scripts/jig verify --explain` and read
+12. **Where the checks run** (`run.exec`). First run `.ai/scripts/jig verify --explain` and read
     its `verify: checks run in …` or `verify: refused: …` line: it names what Jig detected, or
     the signs of a container it could not place. Ask: "Where do this project's tests run — here,
     or in a container?" With a detection that is right, nothing needs writing (`auto` keeps
@@ -110,7 +117,7 @@ their own file is answered by `config unset` too — say that the key then answe
     `docker exec -i -w <dir> <container>`) and show it; never ask the person to type one. A PHP on
     this machine that is not first on `PATH` and was not detected (Herd's is) goes to `run.path`,
     the folder that holds it.
-12. **Helpers** (`claude.implement_model`, `claude.review_model`, `codex.implement_model`,
+13. **Helpers** (`claude.implement_model`, `claude.review_model`, `codex.implement_model`,
     `codex.review_model`) — ask only about the runtime this session uses. Explain that the
     agent can hand implementation and review to a helper on a chosen model; Jig still checks
     findings, the review receipt and verification. One review setting covers every review,
@@ -121,7 +128,7 @@ their own file is answered by `config unset` too — say that the key then answe
     helpers to someone unsure why they would want them. Never set the other runtime's keys
     from this session.
 
-13. **The other runtime** (`executor.implement_runtime`, `executor.review_runtime`,
+14. **The other runtime** (`executor.implement_runtime`, `executor.review_runtime`,
     `executor.implement_model`, `executor.review_model`) — only when the other runtime's CLI
     (`claude` or `codex`) is installed here (`command -v`). Explain that a stage can run in that
     CLI instead of this session: the agent starts it in the task worktree with limited tools, a
@@ -130,9 +137,9 @@ their own file is answered by `config unset` too — say that the key then answe
     Ask: "Should coding or reviews run in <other runtime>, and on which model?" Options: neither
     (default — nothing written), coding, reviews, or both; a model only if they name one, written
     as given. Write the runtime as `claude` or `codex`, never this session's own (that is
-    question 12). Recommend reviews only to someone who wants a second vendor's eyes on the work.
+    question 13). Recommend reviews only to someone who wants a second vendor's eyes on the work.
 
-14. **Telegram** (`notify.telegram.token`, `notify.telegram.chat_id`). "Should Jig message your
+15. **Telegram** (`notify.telegram.token`, `notify.telegram.chat_id`). "Should Jig message your
     Telegram when an autopilot run stops, ends or chooses for you?" On a yes, explain where the
     two values come from: a bot made with @BotFather (`/newbot`) gives the token; they send that
     bot any message, and their chat id is `chat` → `id` on
@@ -148,7 +155,7 @@ their own file is answered by `config unset` too — say that the key then answe
     unattended run's choices — and keeps the bot and chat for later; `true` (default) needs
     nothing written.
 
-15. **Messages from ordinary sessions** (`notify.interactive`), only after a yes to 14 or with
+16. **Messages from ordinary sessions** (`notify.interactive`), only after a yes to 15 or with
     both values already set. "Should it also message you when an ordinary session waits for
     your permission or answer?" Default no: it is for walking away from the screen. Say that in
     the desktop app and the IDE a permission prompt messages them after about six seconds even
@@ -157,7 +164,7 @@ their own file is answered by `config unset` too — say that the key then answe
     `notify hook (claude)` and the file as it would be, and write it only after their yes — Jig
     itself never edits that file. Codex has no such hook; say so instead.
 
-16. **GitHub account** (`github.account`) — only when `gh auth status` names more than one
+17. **GitHub account** (`github.account`) — only when `gh auth status` names more than one
     account for the project's host. Run `.ai/scripts/jig gh api user --jq .login` first: it
     prints the login Jig asks GitHub as from this clone — the one account that may push here —
     or refuses because several may. "Which of your GitHub accounts is this project's?" With an

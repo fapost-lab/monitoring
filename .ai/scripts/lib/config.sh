@@ -15,14 +15,14 @@
 # is one: which of its own branches a clone keeps is that clone's business
 # (adr-20261007-a-merged-branch-leaves-with-its-work).
 #
-# `agent.git`, `autopilot.git`, `agent.ci_timeout`, `autopilot.unattended`,
+# `agent.git`, `autopilot.git`, `agent.git_staging`, `agent.ci_timeout`, `autopilot.unattended`,
 # `autopilot.parallel` and `route.depth` are also in JIG_CFG_LOCAL_ONLY_KEYS
 # below (with `run.exec`, `run.path` and the `claude.*_model` and
 # `codex.*_model` and `executor.*` keys): they
 # answer
 # *only* from this list, never falling back to the project layer the way every
 # other key here does.
-JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
+JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.git_staging agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
 
 # Keys whose project-layer value `cfg` never reads at all: only the local
 # file and the default answer. A key belongs here, rather than merely in
@@ -76,7 +76,7 @@ JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_t
 # (adr-20261110-a-clone-names-its-github-account).
 # `jig_config_project_ignored` reports a project-layer value here so it does
 # not silently do nothing.
-JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
+JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.git_staging agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
 
 # Path of the config file for the current project (JIG_PROJECT must be set).
 jig_config_file() { printf '%s/%s/config.yaml\n' "$JIG_PROJECT" "$JIG_AI_DIR"; }
@@ -265,6 +265,10 @@ worktree.setup||text||A command run in a new task worktree after it is made.
 worktree.setup_timeout|10m|duration||How long worktree.setup may run; 0 waits for ever.
 forge|auto|choice|auto,github,gitlab,none|Which code forge pull requests and CI are read from.
 task.issue_pattern||text||A regular expression for the tracker issue at the start of a task id.
+hooks.ready|[]|list||The project's scripts run when a task is marked ready; a non-zero exit refuses it.
+hooks.consolidate|[]|list||The project's scripts run when a task's knowledge decision is recorded; a non-zero exit refuses it.
+hooks.ship|[]|list||The project's scripts run when a task is shipped; a non-zero exit refuses it.
+hooks.timeout|5m|duration||How long each gate hook may run before it is stopped and refuses the gate; 0 waits for ever.
 housekeeping.cadence|1d|duration||How often the session hook runs housekeeping, in whole days.
 housekeeping.fetch|true|boolean|true,false|Whether housekeeping may run git fetch.
 housekeeping.trash_ttl|7d|duration||How long trashed workspaces and specs are kept.
@@ -273,9 +277,10 @@ housekeeping.stale_after|60d|duration||How long an untouched active task stays b
 checkout.busy_ttl|12h|duration||How long a checkout's record of work in progress counts as a live session.
 agent.git|none|choice|none,commit,push,pr,merge|How far your agent takes a finished task with git.
 autopilot.git||choice|none,commit,push,pr,merge|The git level of an autopilot run; when unset, agent.git answers.
+agent.git_staging||choice|none,commit,push,pr,merge|The git level for a task whose pull request goes into the staging branch; when unset, agent.git answers.
 agent.ci_timeout|30|number||Minutes a merge waits for the pull request's checks; 0 looks once.
 autopilot.unattended|false|boolean|true,false|Whether an autopilot run asks nothing and decides each stop itself.
-autopilot.parallel|2|number||How many tasks of a roadmap phase are built at once, 1 to 16.
+autopilot.parallel|2|number||How many tasks autopilot builds at once, 1 to 16; a run stopped for a person holds none.
 route.depth|full|choice|full,lean|How much of its route a task runs.
 release.merge|agent|choice|agent,human|Who merges a release in an unattended run.
 knowledge.require_frontmatter|true|boolean|true,false|Whether jig knowledge check fails on a document without frontmatter.
@@ -621,6 +626,14 @@ jig_agent_git() {
   _cfg_agent_git_level "$value"
 }
 
+# jig_agent_git_v <var> — the same, into <var> in the caller's shell: a listing that asks
+# it of every row starts no process. Exit 1 when the level is invalid, <var> holding the
+# value read.
+jig_agent_git_v() {
+  cfg_v "$1" agent.git none
+  _cfg_agent_git_level "${!1}"
+}
+
 # jig_autopilot_git — `<level><TAB><key>`: the git level an autopilot run
 # ships at, and the key it came from. `autopilot.git` when this clone sets it,
 # else `agent.git`: nothing has to be filled in, and a clone without the key
@@ -649,6 +662,35 @@ jig_autopilot_git_v() {
   cfg_v __jag_value agent.git none
   printf -v "$1" '%s\tagent.git' "$__jag_value"
   _cfg_agent_git_level "$__jag_value"
+}
+
+# jig_staging_git — `<level><TAB><key>`: the git level for a task whose pull
+# request goes into the staging branch, and the key it came from.
+# `agent.git_staging` when this clone sets it, else `agent.git`: a clone
+# without the key answers staging exactly as it answers everything else. Exit
+# 1, still printing the value read and its key, when the level is not one of
+# none|commit|push|pr|merge; a set but invalid agent.git_staging never falls
+# back to agent.git (adr-20261114-landing-on-staging-has-its-own-git-level).
+jig_staging_git() {
+  local line rc=0
+  jig_staging_git_v line || rc=$?
+  printf '%s\n' "$line"
+  return "$rc"
+}
+
+# jig_staging_git_v <var> — the same `<level><TAB><key>` into <var>, with the
+# same exit status, in the caller's shell.
+jig_staging_git_v() {
+  local __jsg_value
+  cfg_v __jsg_value agent.git_staging ""
+  if [ -n "$__jsg_value" ]; then
+    printf -v "$1" '%s\tagent.git_staging' "$__jsg_value"
+    _cfg_agent_git_level "$__jsg_value"
+    return
+  fi
+  cfg_v __jsg_value agent.git none
+  printf -v "$1" '%s\tagent.git' "$__jsg_value"
+  _cfg_agent_git_level "$__jsg_value"
 }
 
 # _cfg_agent_git_level <value> — exit 0 when <value> is an agent.git level.
@@ -693,13 +735,16 @@ jig_unattended() {
   [ "$value" = true ]
 }
 
-# jig_autopilot_parallel — print autopilot.parallel, how many tasks of a
-# roadmap phase a coordinator may have agents building at once (default 2), and
-# exit 0; for anything but a whole number in 1..16, print the value read and
-# exit 1, like jig_agent_git. Only agents *building* a task count: one whose
-# work is consolidated and waiting for its turn to ship holds no slot, and the
+# jig_autopilot_parallel — print autopilot.parallel, how many tasks autopilot
+# may have agents building at once (default 2): a phase run's wave
+# (`jig spec plan`) and a run over a set of tasks (`jig queue next`'s `slots`).
+# Exit 0; for anything but a whole number in 1..16, print the value read and
+# exit 1, like jig_agent_git. Only agents *building* a task count
+# (jig_autopilot_building): one whose work is consolidated and waiting for its
+# turn to ship holds no slot, nor does a run stopped for a person, and the
 # short-lived agents that repair the merge queue are outside the limit
-# (adr-20260922-a-phase-run-is-coordinated).
+# (adr-20260922-a-phase-run-is-coordinated,
+# adr-20261114-a-waiting-run-holds-no-slot).
 jig_autopilot_parallel() {
   local value
   value=$(cfg autopilot.parallel 2)
@@ -955,7 +1000,7 @@ jig_config_value_problem() {
       esac
       ;;
     housekeeping.trash_ttl | housekeeping.abandoned_ttl | housekeeping.stale_after \
-      | git.staging_stale_after | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout)
+      | git.staging_stale_after | checkout.busy_ttl | verify.busy_ttl | worktree.setup_timeout | hooks.timeout)
       case "${value%[dhms]}" in
         '' | *[!0-9]* | ?????????*) printf 'not a duration (e.g. 7d, 12h, 30m, 90s)\n'; return 1 ;;
       esac
@@ -967,7 +1012,7 @@ jig_config_value_problem() {
         *) printf 'not true or false\n'; return 1 ;;
       esac
       ;;
-    agent.git | autopilot.git)
+    agent.git | autopilot.git | agent.git_staging)
       _cfg_agent_git_level "$value" \
         || { printf 'not a level: none, commit, push, pr or merge\n'; return 1; }
       ;;

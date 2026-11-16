@@ -54,8 +54,10 @@ Usage: jig <command> [args]
                                  update framework-owned files (manifest-aware); a copy
                                  takes a released source only, unless --unreleased; --json
                                  reports what it did as data (schemas/json.md)
-  upgrade --land [--json]        once an upgrade's pull request is merged: back on the
-                                 base branch, fast-forwarded, the upgrade branch let go
+  upgrade --land [--json]        once an upgrade's pull request is merged: the base branch
+                                 fast-forwarded (checked out from the base or the upgrade
+                                 branch; on any other branch only its ref moves), the
+                                 upgrade branch let go
   status [--html | --open | --json]
                                  active tasks, housekeeping flags, drift;
                                  --html writes the status page to .ai/runtime/status.html,
@@ -73,6 +75,8 @@ Usage: jig <command> [args]
   task findings <id> [--blocking]  list findings; --blocking exits 1 while any block completion
   task ship <id> --message-file <f> [...]
                                  commit/push/open a pull request, up to agent.git's level
+                                 (--reviewer <login|name>, repeated: request those reviews
+                                 on the pull request it opens)
   task promote <id> [--commit <sha>]
                                  prepare for prod: a task tested on the staging branch
                                  gets its pull request into the base branch
@@ -133,6 +137,10 @@ Usage: jig <command> [args]
   queue request|cancel <ref> pause [--reason <text>] [--revision <n>] [--json]
                                  ask a task to pause at its next stage boundary,
                                  or take the request back
+  pr reviewers [--base <branch>] [--json]
+                                 who may review a pull request into <branch> (the staging
+                                 branch, else the base): recent reviewers, most frequent
+                                 first, else everyone the repository may ask; asks the forge
   pr fetch <url>                 a GitHub pull request or GitLab merge request into
                                  refs/jig/pr/<n>/ and a detached worktree beside the
                                  repository, for jig-pr-review
@@ -148,6 +156,11 @@ Usage: jig <command> [args]
                                  once CI passed (<target> is spec:<id> or knowledge)
   refresh [--json]               fetch origin and fast-forward the base branch, never
                                  moving your checkout or touching your changes
+  staging ack [--dry-run] [--expect <n>]
+                                 on the staging flow, mark your own commits on the staging
+                                 branch that no task holds as known, so jig status names
+                                 only new ones; --dry-run lists them, --expect refuses
+                                 unless they are <n>
   housekeeping [--dry-run] [--verbose]  reconcile workspaces with remote state
   config set <key> <value> [...] --local [--dry-run | --revision <n>] [--json]
                                  write your own settings to .ai/config.local.yaml;
@@ -171,7 +184,7 @@ Usage: jig <command> [args]
   measure                        knowledge quality, process weight, change size
   doctor                         check the local environment jig runs in
   self-update                    move the global framework checkout to the newest release
-  version                        print version
+  version [--json]               print version (--json: with the newest release)
 EOF
 }
 
@@ -192,8 +205,17 @@ main() {
       if [ -n "$root" ] && jig_is_source_root "$root"; then
         v=$(jig_source_version "$root" 2>/dev/null) || v=""
       fi
-      printf 'jig %s\n' "${v:-$JIG_VERSION}" ;;
-    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|refresh|pr|gh|housekeeping|measure|doctor|config|notify)
+      v="${v:-$JIG_VERSION}"
+      case "${1:-}" in
+        --json)
+          [ $# -eq 1 ] || jig_die "version: unexpected argument: $2"
+          # shellcheck source=lib/json.sh
+          . "$JIG_LIB/json.sh"
+          json_run jig_version_json "$v" ;;
+        '') printf 'jig %s\n' "$v" ;;
+        *) jig_die "version: unknown option: $1" ;;
+      esac ;;
+    init|upgrade|status|task|context|verify|knowledge|spec|queue|writes|refresh|staging|pr|gh|housekeeping|measure|doctor|config|notify)
       if [ ! -f "$JIG_LIB/$cmd.sh" ]; then
         jig_die "command '$cmd' is not available in jig $JIG_VERSION"
       fi

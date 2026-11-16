@@ -48,8 +48,11 @@ need not reach zero.
 
 ## Order and waiting
 
-- **Within one number**, the started task goes first, then the place decides:
-  `.ai/scripts/jig queue move <id> --before <other>`.
+- **Within one number**, the place decides: a new item, or one whose number changed, takes its place
+  after the last item with the same or a more urgent number, and `jig queue next` never advises a
+  started task. Change the place with `.ai/scripts/jig queue move <id> --before <other>`. Starting
+  another task than the one advised is refused unless
+  `jig task start <id> --out-of-order --reason "<why>"`: the reason is shown by `jig status`.
 - **A task that waits for another** gets a dependency with its reason, not a lower number:
   `.ai/scripts/jig queue depend <id> --on <other> --reason "<why>"`.
 

@@ -8,6 +8,10 @@ description: Verify a Jig task with evidence — run the project's checks and co
 Resolve context with `--stage verify` and the task's explicit selectors before verification;
 read required knowledge and use the same selectors for pending/guard.
 
+```
+.ai/scripts/jig context resolve --task <id> --stage verify --catalog
+```
+
 ## 1. Run the project's checks
 
 Reuse completed checks when their code, test inputs, and relevant environment have not
