@@ -268,10 +268,14 @@ _ctx_matched_docs() {
   local t doc status reason relpath out=""
   t=$(printf '\t')
 
-  local block source_doc id
+  local block source_doc id load
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
     fm_read_v block "$doc" || continue
+
+    # No stage here, so a stage-only document is never listed.
+    fm_get_block_v load "$block" load
+    [ "$load" = stage ] && continue
 
     if [ "$show_all" -ne 1 ]; then
       fm_get_block_v status "$block" status
@@ -433,6 +437,16 @@ _ctx_select_reason() {
   load=$(fm_get_block "$block" load)
   [ -n "$load" ] || load=matched
 
+  # `load: stage` is selected by the stage alone: paths, domains and topics
+  # never reach it, so it costs nothing outside the stage that needs it.
+  if [ "$load" = stage ]; then
+    if [ -n "$CTX_STAGE" ] && jig_has_line "$CTX_STAGE" "$(fm_list_block "$block" stages)"; then
+      printf 'load: stage; stage: %s\n' "$CTX_STAGE"
+      return 0
+    fi
+    return 1
+  fi
+
   if [ "$load" = always ]; then
     printf 'load: always\n'
     return 0
@@ -541,8 +555,9 @@ _ctx_cache_fingerprint() {
     done < <(jig_knowledge_docs)
   } | LC_ALL=C sort > "$doclist"
   # rule= names the selection rule itself, so a cache written under an older
-  # rule (load: domain was domain-only) is never served after the rule changed.
-  printf 'rule=domain-or-paths\nstage=%s\nfiles=%s\ndomains=%s\ntopics=%s\nids=%s\nall=%s\n' \
+  # rule (load: domain was domain-only; load: stage did not exist) is never
+  # served after the rule changed.
+  printf 'rule=domain-or-paths;stage-only\nstage=%s\nfiles=%s\ndomains=%s\ntopics=%s\nids=%s\nall=%s\n' \
     "$CTX_STAGE" "$CTX_FILES" "$CTX_DOMAINS" "$CTX_TOPICS" "$CTX_IDS" "$CTX_ALL"
   jig_hash_list "$JIG_PROJECT" "$doclist"
   rm -f "$doclist"
@@ -758,7 +773,8 @@ _ctx_global_rows() {
 # belongs to no domain an agent could enter and matches no file it could
 # touch, so without this it would reach no agent at all (ADR-0014 amendment
 # 2026-09-18). Metadata only: the agent decides whether to pull one in with
-# --ids, and no body is loaded merely because it is listed.
+# --ids, and no body is loaded merely because it is listed. A `load: stage`
+# document is never listed: it is required at its stage or not offered at all.
 _ctx_catalog_rows() {
   local rows="$1" t doc block relpath id summary dom hit readp read_rc doms
   t=$(printf '\t')
@@ -770,6 +786,7 @@ _ctx_catalog_rows() {
     # re-reading and re-parsing $doc for each of domains, paths, id and
     # summary in turn (knowledge-costs-one-walk task.md).
     block=$(fm_block "$doc")
+    [ "$(fm_get_block "$block" load)" = stage ] && continue
     hit=0
     doms=$(fm_list_block "$block" domains)
     if [ -z "$doms" ]; then

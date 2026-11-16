@@ -43,11 +43,53 @@ Auto-merge on $_PROMOTE_SWITCHED_OFF was switched off: it would have merged this
   _promote_refuse "$code" "$msg"
 }
 
-# _promote_needs_person <message> — a promotion only a person (or their
+# The person's promotion (`jig task promote <id> --by human`,
+# adr-20261114-a-persons-pull-request-action-does-not-read-agent-git): 1 when a
+# person pressed the button. The git level is then not read, and
+# `git.promote_merge: auto` may switch auto-merge on, as at `merge`.
+_PROMOTE_BY_HUMAN=0
+
+# 1 when the command runs as the producer of `--json`: a promotion only a
+# person can finish is then a coded refusal, not exit 3, and what the run did
+# is left in the globals below for the one JSON value it prints.
+_PROMOTE_JSON=0
+
+# The revision a promotion claims right before it first sends anything
+# (jig_revision_claim); empty: no claim.
+_PROMOTE_EXPECTED=""
+
+# What the last _promote_one did, for `--json`: the pull request, whether it
+# was open already, whether a branch was pushed, the tested commit, whether
+# the work was in the base already, and who merges and why.
+_PROMOTE_URL=""
+_PROMOTE_ALREADY_OPEN=0
+_PROMOTE_PUSHED=0
+_PROMOTE_TESTED=""
+_PROMOTE_IN_BASE=0
+_PROMOTE_MERGE_OUTCOME=""
+_PROMOTE_MERGE_REASON=""
+
+# _promote_claim <who> — claim the revision right before the first push or
+# pull request: a stale one stops here with nothing sent.
+_promote_claim() {
+  local rc=0
+  [ -n "$_PROMOTE_EXPECTED" ] || return 0
+  jig_revision_claim "$_PROMOTE_EXPECTED" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) _promote_refuse stale-revision "$1: the clone changed since revision $_PROMOTE_EXPECTED; read again and retry" ;;
+    *) jig_die "$1: cannot claim the clone revision in $(jig_revision_dir)" ;;
+  esac
+}
+
+# _promote_needs_person <code> <message> — a promotion only a person (or their
 # agent) can finish: said on stderr, exit 3 from the command, as `task ship`
-# hands over at `agent.git: none`.
+# hands over at `agent.git: none`; with `--json` a refusal under <code>.
 _promote_needs_person() {
-  printf '%s\n' "$1" >&2
+  if [ "$_PROMOTE_JSON" = 1 ]; then
+    _promote_refuse "$1" "$2"
+  fi
+  printf '%s\n' "$2" >&2
   return 3
 }
 
@@ -186,6 +228,13 @@ _promote_one() {
   local id="$1" commit_arg="$2" title="$3" body_file="$4"
   local who="task promote" t=$'\t' flow base staging dir have_ws=0 branch tbase run level="" runner=0
   _task_valid_id "$id" || _promote_refuse usage "invalid task id: $id"
+  _PROMOTE_URL=""
+  _PROMOTE_ALREADY_OPEN=0
+  _PROMOTE_PUSHED=0
+  _PROMOTE_TESTED=""
+  _PROMOTE_IN_BASE=0
+  _PROMOTE_MERGE_OUTCOME=""
+  _PROMOTE_MERGE_REASON=""
 
   # 1. The flow.
   _promote_flow "$who"
@@ -213,17 +262,17 @@ _promote_one() {
   if [ "$have_ws" = 1 ]; then
     task_state_var run "$id" autopilot
     [ "$run" != on ] \
-      || _promote_refuse failed "$who: $id runs on autopilot, which never promotes; stop it, or let the person say prepare for prod"
+      || _promote_refuse autopilot-running "$who: $id runs on autopilot, which never promotes; stop it, or let the person say prepare for prod"
   fi
   if [ "$have_ws" = 0 ] && jig_on_ci_runner; then
     runner=1
   fi
-  if [ "$runner" = 0 ]; then
+  if [ "$runner" = 0 ] && [ "$_PROMOTE_BY_HUMAN" != 1 ]; then
     level=$(jig_agent_git) || _promote_refuse failed "$who: invalid agent.git: $level (expected none|commit|push|pr|merge)"
     case "$level" in
       pr | merge) ;;
       *)
-        _promote_needs_person "$who: agent.git is $level in this clone; opening the pull request into $base is the person's. Nothing was pushed."
+        _promote_needs_person git-level "$who: agent.git is $level in this clone; opening the pull request into $base is the person's. Nothing was pushed."
         return 3 ;;
     esac
   fi
@@ -241,6 +290,7 @@ _promote_one() {
   _promote_tested_commit "$who" "$commit_arg" "$base" "$staging"
   csha=$_PROMOTE_CSHA
   base_sha=$_PROMOTE_BASE_SHA
+  _PROMOTE_TESTED=$csha
   printf '%s: tested commit %s of %s\n' "$who" "$(git -C "$JIG_PROJECT" rev-parse --short "$csha")" "$staging"
 
   # 7. The tip: what the pull request will carry once pushed.
@@ -264,6 +314,7 @@ _promote_one() {
   fi
   if git -C "$JIG_PROJECT" merge-base --is-ancestor "$tip" "$base_sha" 2>/dev/null; then
     printf '%s: %s is already in %s; nothing to promote\n' "$who" "$branch" "$base"
+    _PROMOTE_IN_BASE=1
     return 0
   fi
 
@@ -366,7 +417,7 @@ Close it first: it comes from this same branch, so jig task ship refuses while i
   if [ -n "$conflicts" ]; then
     open_url=$(_promote_open_url "$branch" "$base")
     [ -z "$open_url" ] || printf 'pr %s (already open)\n' "$open_url"
-    _promote_needs_person "$who: $branch conflicts with $base in:
+    _promote_needs_person base-conflict "$who: $branch conflicts with $base in:
 $(printf '%s\n' "$conflicts" | sed 's/^/  /')
 Nothing was pushed. Merge $base into the task branch and resolve it in the task's checkout
 (git switch $branch && git merge origin/$base), commit, and run jig task promote $id again: it pushes the merge and opens the pull request."
@@ -431,7 +482,7 @@ EOF
   # (adr-20261026-a-task-that-raises-the-version-is-a-release).
   local pm may=0 draft=0
   pm=$(jig_promote_merge) || pm=human
-  if [ "$runner" = 1 ] || [ "$level" = merge ]; then
+  if [ "$runner" = 1 ] || [ "$level" = merge ] || [ "$_PROMOTE_BY_HUMAN" = 1 ]; then
     may=1
   fi
   if [ "$pm" = auto ] && [ "$may" = 1 ] && [ "$r_level" = major ]; then
@@ -442,8 +493,21 @@ EOF
   # 12. Send: the base merges already made on the task branch, then the pull
   # request into the base branch, found by head and base together.
   jig_ship_sends_no_commit "a promotion commits nothing; it pushes only merges of the base already on the branch"
+  # The forge is asked for before the revision is claimed and before anything
+  # is pushed, so `forge-unavailable` never arrives after a push went out.
+  _promote_kind_once
+  if [ "$_PROMOTE_KIND" = none ]; then
+    if [ "$push" = 1 ]; then
+      _promote_needs_person forge-unavailable "$who: no forge available; push $branch to the remote first, then open the pull request from $branch into $base by hand. Nothing was pushed."
+    else
+      _promote_needs_person forge-unavailable "$who: no forge available; open the pull request from $branch into $base by hand. Nothing was pushed."
+    fi
+    return 3
+  fi
+  _promote_claim "$who"
   if [ "$push" = 1 ]; then
     jig_ship_push "$who" "$branch"
+    _PROMOTE_PUSHED=1
   fi
   local staging_rows staging_url="" staging_title="" body
   staging_rows=$(_promote_pr_rows "$branch" "$staging" all)
@@ -476,14 +540,24 @@ EOF
       printf '\n%s\n' "$release_line"
     fi
   } > "$body"
-  jig_ship_pr "$who" "$branch" "$base" "$body" "$title" "$body" "$draft" 1
+  local pr_out
+  pr_out=$(mktemp "${TMPDIR:-/tmp}/jig-promote-pr.XXXXXX")
+  jig_cleanup_add "$pr_out"
+  jig_ship_pr "$who" "$branch" "$base" "$body" "$title" "$body" "$draft" 1 > "$pr_out"
+  cat "$pr_out"
   url=$JIG_SHIP_URL
+  # No forge at all was refused above; this is a forge that answered without
+  # an https address.
   case "$url" in
     https://*) ;;
     *)
-      _promote_needs_person "$who: no forge available; open the pull request from $branch into $base by hand"
+      _promote_needs_person forge-unavailable "$who: no forge available; open the pull request from $branch into $base by hand"
       return 3 ;;
   esac
+  _PROMOTE_URL=$url
+  if grep -q '(already open)' "$pr_out" 2>/dev/null; then
+    _PROMOTE_ALREADY_OPEN=1
+  fi
   if [ "$have_ws" = 1 ]; then
     _task_rewrite_state "$dir" promote_url "$url"
   fi
@@ -515,6 +589,8 @@ _promote_merge() {
   local r_file="$9" r_old="${10}" r_new="${11}" why kind
   if [ "$pm" != auto ]; then
     printf "%s: the merge is the person's (git.promote_merge: %s)\n" "$who" "$pm"
+    _PROMOTE_MERGE_OUTCOME=person
+    _PROMOTE_MERGE_REASON="git.promote_merge: $pm"
     return 0
   fi
   _promote_kind_once
@@ -558,6 +634,8 @@ _promote_kind() {
 # _promote_not_on <why> — the last line when auto-merge stays off.
 _promote_not_on() {
   printf "auto-merge not switched on: %s; the merge is the person's\n" "$1"
+  _PROMOTE_MERGE_OUTCOME=not-switched-on
+  _PROMOTE_MERGE_REASON=$1
 }
 
 # _promote_auto_state <url> — what the forge says of the pull request at
@@ -646,8 +724,12 @@ _promote_auto_settled() {
   _promote_auto_state "$1"
   if [ "$_PROMOTE_PR_STATE" = merged ]; then
     printf 'merged %s\n' "$1"
+    _PROMOTE_MERGE_OUTCOME=merged
+    _PROMOTE_MERGE_REASON="the forge merged it at once: its checks had already passed"
   elif [ "$_PROMOTE_PR_AUTO" = on ]; then
     printf "auto-merge on %s: it merges with a merge commit once %s's required checks pass\n" "$1" "$2"
+    _PROMOTE_MERGE_OUTCOME=auto-merge-on
+    _PROMOTE_MERGE_REASON="it merges with a merge commit once $2's required checks pass"
   else
     _promote_not_on "the forge did not confirm it"
   fi
@@ -661,6 +743,8 @@ _promote_auto_known() {
   case "$_PROMOTE_PR_STATE" in
     merged)
       printf 'merged %s\n' "$url"
+      _PROMOTE_MERGE_OUTCOME=merged
+      _PROMOTE_MERGE_REASON="the pull request is merged"
       return 1 ;;
     open) ;;
     *)
@@ -680,6 +764,8 @@ _promote_auto_known() {
   fi
   if [ "$_PROMOTE_PR_AUTO" = on ]; then
     printf 'auto-merge on %s (already on)\n' "$url"
+    _PROMOTE_MERGE_OUTCOME=auto-merge-already-on
+    _PROMOTE_MERGE_REASON="auto-merge was already on"
     return 1
   fi
   return 0

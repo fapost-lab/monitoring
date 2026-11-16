@@ -23,6 +23,10 @@ _HK_WT_LINE=""      # what _hk_worktree_retire did, as a --verbose line
 _HK_WT_NOTE=""      # ... and as a note in the grouped report
 _HK_BASE_LOG=""     # "<base>\t<ref>\t<epoch>\t<sha>" reflog of every task base's refs, newest first, read once per run
 _HK_WRONG_NOTE=""   # why the last task was flagged wrong-base, as a note in the grouped report
+_HK_KEEP_NOTE=""    # why the last closed task without a branch counts as started, as a note in the grouped report
+_HK_ROADMAP_OPEN="" # "<spec><TAB><id>" per unchecked roadmap item of every spec in this checkout; read once per run, on the first never-started candidate
+_HK_ROADMAP_UNSEEN="" # " <spec> ..." whose open epic has no ref here, so its current roadmap cannot be read; with _HK_ROADMAP_OPEN
+_HK_ROADMAP_READ=0  # 1 once _HK_ROADMAP_OPEN has been read
 _HK_DEFAULT_BASE="" # git.base_branch, read once per run
 _HK_STAGING_BRANCH="" # git.staging_branch on a sound staging flow, empty otherwise; read once per run
 _HK_STAGING=""      # "<task><TAB>on|behind" for the tasks on the staging branch (jig_staging_states), once per run
@@ -126,7 +130,7 @@ cmd_housekeeping() {
   fi
 
   local needs_consolidation=0 wrong_base=0 archive_refused=0 found=0 keep_branches="" archive_err
-  local reason state_file tid st paused archived_from archived_reason age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire
+  local reason state_file tid st paused archived_from archived_reason age branch base_commit task_base remote remote_pair via landed released decision action flags dest facts wt retire started
 
   # Worktrees tasks were started in, from git's own list, read once per run.
   # A task's worktree goes when the task is closed and its branch landed on its
@@ -187,9 +191,21 @@ EOF
         archived_reason=$(task_state_get "$tid" archived_reason)
       fi
 
+      # A closed task is `started` unless nothing ever marked a branch for it:
+      # no recorded branch or base commit, no ref at the template name, and no
+      # pull request from it in the forge's list (a forge that failed keeps it;
+      # with none in use, the refs alone decide). Anything less
+      # certain counts as started, and _HK_KEEP_NOTE says why it stays.
+      # (adr-20261114-a-closed-task-never-started-goes-to-trash)
+      started=true
+      _HK_KEEP_NOTE=""
+      if [ "$st" = consolidated ] && [ -z "$branch" ] && [ -z "$base_commit" ]; then
+        _hk_never_started "$tid" && started=false
+      fi
+
       decision=$(housekeeping_decide \
         "$st" "$remote" "$paused" "$age" "$abandoned_ttl_days" "$stale_after_days" "$released" \
-        "$archived_from" "$archived_reason")
+        "$archived_from" "$archived_reason" "$started")
       action=${decision%% *}
       flags=${decision#* }
       [ "$flags" = "$decision" ] && flags=""
@@ -400,7 +416,7 @@ _hk_queue_prune() {
 # --- policy ------------------------------------------------------------------
 
 # housekeeping_decide <status> <remote> <paused> <age_days> <abandoned_ttl_days>
-#                     <stale_after_days> [released] [archived_from] [archived_reason]
+#                     <stale_after_days> [released] [archived_from] [archived_reason] [started]
 # Print "<action> [flags]" where action is purge|preserve|archive and flags is a
 # comma-separated subset of needs-consolidation, abandoned?, base-unreleased,
 # STALE_CANDIDATE. `released` (default true) is false for a task merged into a
@@ -408,6 +424,9 @@ _hk_queue_prune() {
 # closed and merged, it is kept rather than purged (ADR-0040).
 # `archived_from` and `archived_reason` are an archived task's state keys of
 # those names; they decide whether its merge still asks for consolidation.
+# `started` (default true) is false for a task that never had a branch: a
+# closed one has no change whose landing could be unknown, so the person's
+# close is the decision and its workspace is purged rather than kept forever.
 #
 # `archive` is for work nobody finished: an abandoned task past its TTL, or an
 # active/ready one untouched past stale_after with no flag and no pull request.
@@ -421,6 +440,7 @@ _hk_queue_prune() {
 housekeeping_decide() {
   local status="$1" remote="$2" paused="$3" age="$4" abandoned_ttl="$5" stale_after="$6"
   local released="${7:-true}" archived_from="${8:-}" archived_reason="${9:-}"
+  local started="${10:-true}"
   local action="preserve" flags="" settled=false
 
   # An archived task whose fate a person already decided — abandoned before it
@@ -437,6 +457,9 @@ housekeeping_decide() {
       else
         flags="base-unreleased"
       fi
+      ;;
+    consolidated:unknown)
+      if [ "$started" = false ]; then action="purge"; fi
       ;;
     active:merged|ready:merged)
       flags="needs-consolidation"
@@ -711,30 +734,15 @@ _hk_fetch() {
 # claims "up to date" without having actually heard so, and `jig status`
 # (_status_latest_release_available) treats "failed" exactly like "no file".
 _hk_check_latest_release() {
-  local dry="$1" runtime="$2" exe root rc best file tmp
+  local dry="$1" runtime="$2"
   if ! cfg_bool housekeeping.fetch true; then
     return 0
   fi
   if [ "$dry" = 1 ]; then
     return 0
   fi
-  file="$runtime/latest-release"
-  tmp="$file.tmp.$$"
-  jig_cleanup_add "$tmp"
   mkdir -p "$runtime" 2>/dev/null || return 0
-  if ! exe=$(jig_global_executable); then
-    return 0
-  fi
-  root="${exe%/scripts/jig}"
-  rc=0
-  best=$(jig_check_newest_release "$root" "$_JIG_RELEASE_CHECK_TIMEOUT") || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    printf 'latest=%s\nchecked_at=%s\n' "${best#v}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" \
-      && mv "$tmp" "$file"
-  else
-    printf 'failed\nchecked_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" \
-      && mv "$tmp" "$file"
-  fi
+  jig_release_check_record "$runtime/latest-release" || true
   return 0
 }
 
@@ -764,7 +772,10 @@ _hk_forge_init() {
       # A row needs a branch and a state; jig_glab_fields (common.sh) splits
       # glab's compact array and drops objects without a source branch. The
       # merge request's own web_url, not its author's, which comes first.
-      _HK_FORGE_PRS=$(glab mr list --all --output json 2>/dev/null \
+      # 100, GitLab's largest page, where glab's own default is 30: an upgrade
+      # merge request behind 30 newer ones would drop out of the forge cache,
+      # which this list replaces whole (GitHub's list asks for 200).
+      _HK_FORGE_PRS=$(glab mr list --all --per-page 100 --output json 2>/dev/null \
         | jig_glab_fields source_branch target_branch state sha web_url@/merge_requests/ detailed_merge_status \
         | awk -F '\t' '$3 != ""' \
         || printf '__failed__')
@@ -784,30 +795,41 @@ _hk_forge_init() {
   return 0
 }
 
-# _hk_forge_ci — `<head>\t<base>\t<ci>\t<mergeable>` for every open pull
-# request on GitHub, for the forge cache; nothing on another forge or when gh
+# _hk_forge_ci — one row per open pull request on GitHub, for the forge cache:
+#   `<head>\t<base>\t<ci>\t<mergeable>\t<head-commit>\t<url>\t<review>\t<waiting_for>`
+# `-` for a field the forge did not say; nothing on another forge or when gh
 # does not answer. <mergeable> is gh's word (MERGEABLE, CONFLICTING, UNKNOWN),
 # asked in the same call: the staging drift report names a promotion the forge
-# calls conflicting (jig_staging_drift).
+# calls conflicting (jig_staging_drift). <head-commit> and <url> let a pull
+# request older than the newest 200 the first list holds still get its row
+# (_hk_forge_cache_write). <review> is approved|changes|waiting|none, or `-`
+# when the forge's decision was not one jig_pr_approval_github_v knows;
+# <waiting_for> the reviewers still requested, comma-separated.
 #
 # A second list call, asked only when the cache is written. Asked in the first
 # call for all 200, the check rollup made it about six times slower (13 s and
 # 680 KB against 2 s, measured on this repository on 2026-10-15); for the open
-# ones alone it costs about 1 s. A merged or closed pull request's checks are
-# not asked. GitLab's list carries no pipeline, so its CI stays unknown rather
-# than cost a call per merge request.
+# ones alone it costs about 1 s, and the review fields (reviewDecision,
+# latestReviews, reviewRequests), asked in this same call, leave that as it was
+# (1.0 to 1.1 s, measured 2026-11-14). A merged or closed pull request's checks
+# and review are not asked. GitLab's list carries neither a pipeline nor an
+# approval, so its CI stays unknown rather than cost a call per merge request;
+# its reviews are asked one merge request at a time (_hk_forge_gitlab_reviews).
 #
 # The checks are read into one word the way `task ship` reads them
 # (_jig_ship_checks_github, common.sh, through `gh pr checks`): a check re-run
 # counts once, at its newest run, as gh keeps only that one per workflow and
 # name; a skipped or neutral check counts as neither, a cancelled one as
 # failed, anything unfinished as pending. red, pending, green, or none when no
-# check ran. gh's own --jq, not jq (ADR-0002).
+# check ran. gh's own --jq, not jq (ADR-0002); the filter hands over the
+# review's raw words and the decision is made in the shell, once, in
+# jig_pr_approval_github_v, where `task pr-status` and `task land` make it too.
 _hk_forge_ci() {
   [ "$_HK_FORGE_KIND" = github ] || return 0
+  local out h b c m oid url dec reviews pending rv w t=$'\t'
   # shellcheck disable=SC2016 # $c is the --jq expression's variable, not the shell's
-  jig_gh pr list --state open --limit 200 \
-    --json headRefName,baseRefName,statusCheckRollup,mergeable \
+  out=$(jig_gh pr list --state open --limit 200 \
+    --json headRefName,baseRefName,statusCheckRollup,mergeable,headRefOid,url,reviewDecision,latestReviews,reviewRequests \
     --jq '.[] | [.statusCheckRollup // []
           | group_by((.workflowName // "") + "/" + (.name // .context // ""))[]
           | max_by(.startedAt // .completedAt // "")
@@ -825,7 +847,84 @@ _hk_forge_ci() {
             if any($c[]; . == "fail") then "red"
             elif any($c[]; . == "pending") then "pending"
             elif any($c[]; . == "pass") then "green"
-            else "none" end)\t\(.mergeable // "")"' 2>/dev/null || true
+            else "none" end)\t\(.mergeable // "" | if . == "" then "-" else . end)\t\(.headRefOid // "" | if . == "" then "-" else . end)\t\(.url // "" | if . == "" then "-" else . end)\t\(.reviewDecision // "" | if . == "" then "-" else . end)\t\([.latestReviews[]?.state] | join(",") | if . == "" then "-" else . end)\t\([.reviewRequests[]? | (if .login then .login elif .slug then .slug else .name end) | select(. != null)] | join(",") | if . == "" then "-" else . end)"' 2>/dev/null) || return 0
+  # One row per line, read in this shell: no process per pull request. A row
+  # with no decision field (a shorter one) carries no review.
+  while IFS="$t" read -r h b c m oid url dec reviews pending; do
+    [ -n "$h" ] || continue
+    pending=${pending%$'\r'}
+    rv="-"
+    w="-"
+    if [ -n "$dec" ]; then
+      [ "$dec" != "-" ] || dec=""
+      [ "$reviews" != "-" ] || reviews=""
+      [ "$pending" != "-" ] || pending=""
+      jig_pr_approval_github_v rv "$dec" "$reviews" "$pending"
+      case "$rv" in
+        approved | changes | none) ;;
+        waiting) w=$pending ;;
+        *) rv="-" ;;
+      esac
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$b" "${c:--}" "${m:--}" "${oid:--}" "${url:--}" "$rv" "$w"
+  done <<EOF
+$out
+EOF
+  return 0
+}
+
+# _hk_forge_gitlab_reviews — `<head>\t<staging branch>\t<review>\t<waiting_for>\t<reviewed_at>`
+# for every open merge request into the staging branch, on a GitLab project on
+# the staging flow; nothing otherwise. GitLab's list carries no approvals, so
+# asking is one call of jig_pr_approval_v (approvals and the merge request
+# itself) per merge request, never for one that is not open into the staging
+# branch. <reviewed_at> is when that call was made. A merge request whose
+# cached row holds a review at the same head commit, asked less than
+# _HK_REVIEW_REUSE_SECS ago by its own <reviewed_at> (not the row's fetched_at,
+# which every run renews), is not asked again: its row and its old stamp are
+# carried forward, so a run over unchanged merge requests makes no call of its
+# own and a reused review is at most that old. Called before the cache is
+# written, so the cache read here is the previous run's.
+_HK_REVIEW_REUSE_SECS=900
+_hk_forge_gitlab_reviews() {
+  [ "$_HK_FORGE_KIND" = gitlab ] || return 0
+  local st rows h url sha rv pend t=$'\t' cache now now_iso at heard reuse
+  st=$(jig_staging_in_use) || return 0
+  [ -n "$st" ] || return 0
+  rows=$(printf '%s\n' "$_HK_FORGE_PRS" | awk -F '\t' -v st="$st" "$_HK_PR_STATE_AWK"'
+    $1 != "" && $2 == st && prstate($3) == "open" && $5 != "" { print $1 "\t" $5 "\t" $4 }')
+  [ -n "$rows" ] || return 0
+  cache=$(forgecache_read)
+  now=$(date -u +%s)
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  while IFS="$t" read -r h url sha; do
+    [ -n "$h" ] || continue
+    reuse=""
+    at=$now_iso
+    if [ -n "$cache" ] && [ -n "$sha" ] && [ "$sha" != "-" ]; then
+      forgecache_entry "$cache" "$h" "$st"
+      case "$_FORGECACHE_REVIEW" in
+        approved | changes | waiting | none)
+          if [ "$_FORGECACHE_COMMIT" = "$sha" ] && [ "$_FORGECACHE_STATE" = open ] && [ -n "$_FORGECACHE_REVIEWED_AT" ]; then
+            heard=$(jig_utc_epoch "$_FORGECACHE_REVIEWED_AT")
+            if [ -n "$heard" ] && [ $((now - heard)) -ge 0 ] && [ $((now - heard)) -lt "$_HK_REVIEW_REUSE_SECS" ]; then
+              reuse=1
+              rv=$_FORGECACHE_REVIEW
+              pend=$_FORGECACHE_WAITING
+              at=$_FORGECACHE_REVIEWED_AT
+            fi
+          fi ;;
+      esac
+    fi
+    [ -n "$reuse" ] || jig_pr_approval_v rv pend "$url"
+    case "$rv" in
+      approved | changes | none) printf '%s\t%s\t%s\t-\t%s\n' "$h" "$st" "$rv" "$at" ;;
+      waiting) printf '%s\t%s\t%s\t%s\t%s\n' "$h" "$st" "$rv" "${pend:--}" "$at" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  return 0
 }
 
 # _HK_PR_STATE_AWK — the awk function that reads a forge's word for a pull
@@ -842,49 +941,86 @@ _HK_PR_STATE_AWK='
 
 # _hk_forge_cache_write — keep what this run heard from the forge in the forge
 # cache (lib/forgecache.sh) for the reads that never ask it: one line per pull
-# request, `<head>\t<base>\t<state>\t<ci>\t<fetched_at>\t<head-commit>\t<url>\t<mergeable>`,
+# request, `<head>\t<base>\t<state>\t<ci>\t<fetched_at>\t<head-commit>\t<url>\t<mergeable>\t<review>\t<waiting_for>[\t<reviewed_at>]`,
 # the state normalised
-# as _hk_forge_state normalises it. Only after a list the forge answered: a run
-# without a forge or with a failed one leaves the last cache as it is, every
-# entry still carrying the time it was heard. Never fails the run.
+# as _hk_forge_state normalises it. An open pull request the open list has and
+# the list of all lacks (older than its newest 200) gets its own row after the
+# others. <review> and <waiting_for> are kept for open pull requests only: all
+# of them on GitHub, the ones into the staging branch on GitLab
+# (_hk_forge_ci, _hk_forge_gitlab_reviews). Only after a list the forge
+# answered: a run without a forge or with a failed one leaves the last cache as
+# it is, every entry still carrying the time it was heard. Never fails the run.
 _hk_forge_cache_write() {
-  local at rows ci
+  local at rows ci reviews
   case "$_HK_FORGE_KIND" in
     github | gitlab) ;;
     *) return 0 ;;
   esac
   forgecache_owned || return 0
   ci=$(_hk_forge_ci)
+  reviews=$(_hk_forge_gitlab_reviews)
   at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  # One stream, each line tagged with the list it came from: the checks first,
-  # so every pull request row can be joined to them in one pass.
+  # One stream, each line tagged with the list it came from: the checks first
+  # (C, GitHub's open list), then the reviews GitLab was asked for (R), so
+  # every pull request row can be joined to them in one pass.
   rows=$({
     printf '%s\n' "$ci" | awk '$0 != "" { print "C\t" $0 }'
+    printf '%s\n' "$reviews" | awk '$0 != "" { print "R\t" $0 }'
     printf '%s\n' "$_HK_FORGE_PRS" | awk '$0 != "" { print "P\t" $0 }'
   } | awk -F '\t' -v at="$at" "$_HK_PR_STATE_AWK"'
+    BEGIN { rat[""] = "" }
+    function word(r) { return r == "approved" || r == "changes" || r == "waiting" || r == "none" }
+    function row(h, b, s, c, hc, u, m, key,    r, w, x) {
+      if (c != "green" && c != "red" && c != "pending" && c != "none") c = "-"
+      if (hc !~ /^[0-9a-f]+$/) hc = "-"
+      if (u == "" || u ~ /[[:space:]]/ || u == "null") u = "-"
+      r = "-"; w = "-"
+      if (s == "open" && (key in rv) && word(rv[key])) {
+        r = rv[key]
+        if (r == "waiting" && wf[key] != "" && wf[key] != "-") w = wf[key]
+      }
+      x = ""
+      if (r != "-" && (key in rat) && rat[key] != "") x = "\t" rat[key]
+      print h "\t" b "\t" s "\t" c "\t" at "\t" hc "\t" u "\t" m "\t" r "\t" w x
+    }
+    function mword(w) {
+      w = tolower(w)
+      if (w == "conflicting" || w == "conflict") return "conflicting"
+      if (w == "mergeable") return "mergeable"
+      return "-"
+    }
     $1 == "C" {
-      if (NF >= 4 && !(($2 FS $3) in ci)) { ci[$2 FS $3] = $4; mg[$2 FS $3] = $5 }
+      if (NF >= 4 && !(($2 FS $3) in ci)) {
+        k = $2 FS $3
+        ci[k] = $4; mg[k] = $5; co[k] = $6; cu[k] = $7; rv[k] = $8; wf[k] = $9
+        order[++n] = k; ch[n] = $2; cb[n] = $3
+      }
+      next
+    }
+    $1 == "R" {
+      if (NF >= 4 && !(($2 FS $3) in rv)) { rv[$2 FS $3] = $4; wf[$2 FS $3] = $5; rat[$2 FS $3] = $6 }
       next
     }
     $1 == "P" && NF >= 4 && $2 != "" && $3 != "" {
       s = prstate($4)
       if (s == "") next
+      k = $2 FS $3
       c = "-"
-      if (s == "open" && (($2 FS $3) in ci)) c = ci[$2 FS $3]
-      if (c != "green" && c != "red" && c != "pending" && c != "none") c = "-"
-      h = $5; u = $6
-      if (h !~ /^[0-9a-f]+$/) h = "-"
-      if (u == "" || u ~ /[[:space:]]/ || u == "null") u = "-"
+      if (s == "open" && (k in ci)) { c = ci[k]; seen[k] = 1 }
       # Whether the forge can merge it: GitHub'"'"'s word from the checks
       # call, GitLab'"'"'s detailed_merge_status from the list; `-` for a pull
       # request that is not open and a word that says neither.
       m = "-"
-      if (s == "open") {
-        w = tolower(($2 FS $3) in mg ? mg[$2 FS $3] : $7)
-        if (w == "conflicting" || w == "conflict") m = "conflicting"
-        else if (w == "mergeable") m = "mergeable"
+      if (s == "open") m = mword((k in mg) ? mg[k] : $7)
+      row($2, $3, s, c, $5, $6, m, k)
+      next
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        if (k in seen) continue
+        row(ch[i], cb[i], "open", ci[k], co[k], cu[k], mword(mg[k]), k)
       }
-      print $2 "\t" $3 "\t" s "\t" c "\t" at "\t" h "\t" u "\t" m
     }') || return 0
   forgecache_write "$rows"
 }
@@ -929,7 +1065,7 @@ _hk_forge_state() {
 # evidence of an open PR. The housekeeping policy gives `open` and `unknown` the same
 # action, so this costs no behaviour and keeps the report honest.
 _hk_ancestry_state() {
-  local branch="$1" base_commit="${2:-}" base_name="${3:-}" base tip mb combined c
+  local branch="$1" base_commit="${2:-}" base_name="${3:-}" base tip
   [ -n "$base_name" ] || base_name=$(cfg git.base_branch main)
 
   # The task never had a branch of its own: it was worked on directly on the
@@ -988,45 +1124,12 @@ _hk_ancestry_state() {
     fi
   fi
 
-  # 1. Fast-forward or a real merge commit.
-  if git -C "$JIG_PROJECT" merge-base --is-ancestor "$tip" "$base" 2>/dev/null; then
+  # 1. Fast-forward or a real merge commit; 2. a squash merge, matched by the
+  # patch-id of the branch's combined diff, never commit by commit; 3. a
+  # rebase merge, every commit upstream by `git cherry` (jig_branch_in_base).
+  if jig_branch_in_base "$tip" "$base"; then
     printf 'merged\n'
     return 0
-  fi
-
-  mb=$(git -C "$JIG_PROJECT" merge-base "$base" "$tip" 2>/dev/null || printf '')
-  if [ -z "$mb" ]; then
-    printf 'unknown\n'
-    return 0
-  fi
-
-  # 2. Squash merge: the branch's whole contribution collapses into one commit
-  # on the base, so its patch-id matches the combined diff — not any single
-  # commit's. Comparing commit-by-commit is what gets this case wrong.
-  # Guarded: an unguarded pipeline assignment under `set -e` + `pipefail`
-  # would abort the whole run mid-loop, and every git call here silences its
-  # own stderr, so there would be no diagnostic to explain the silence.
-  combined=$(git -C "$JIG_PROJECT" diff "$mb" "$tip" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1) || combined=""
-  if [ -n "$combined" ]; then
-    while IFS= read -r c; do
-      [ -z "$c" ] && continue
-      if [ "$c" = "$combined" ]; then
-        printf 'merged\n'
-        return 0
-      fi
-    done < <(_hk_base_patch_ids "$mb" "$base")
-  fi
-
-  # 3. Rebase merge: every commit is upstream individually. `git cherry`
-  # marks those with `-`; a single `+` means something did not land.
-  local cherry plus
-  cherry=$(git -C "$JIG_PROJECT" cherry "$base" "$tip" 2>/dev/null || printf '')
-  if [ -n "$cherry" ]; then
-    plus=$(printf '%s\n' "$cherry" | grep -c '^+' || true)
-    if [ "$plus" = "0" ]; then
-      printf 'merged\n'
-      return 0
-    fi
   fi
 
   printf 'unknown\n'
@@ -1134,16 +1237,6 @@ EOF
   fi
 }
 
-# _hk_base_patch_ids <merge-base> <base> — patch-id of every commit the base
-# gained since the merge base, one per line.
-_hk_base_patch_ids() {
-  local mb="$1" base="$2" sha
-  while IFS= read -r sha; do
-    [ -z "$sha" ] && continue
-    git -C "$JIG_PROJECT" show "$sha" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1
-  done < <(git -C "$JIG_PROJECT" rev-list "$mb..$base" 2>/dev/null)
-}
-
 # _hk_resolve_ref <name> — print the first of <name> / origin/<name> that
 # resolves to a commit, or nothing.
 _hk_resolve_ref() {
@@ -1215,8 +1308,8 @@ _hk_branch_forge_merged() {
 #
 # Only in the clone's main checkout: a worktree borrows `tasks/`, finds no
 # workspace of its own, and would take every task's branch for an orphan.
-# Off with git.delete_merged_branches: false; nothing remote below agent.git
-# or autopilot.git push, without housekeeping.fetch, on a dry run, or without origin.
+# Off with git.delete_merged_branches: false; nothing remote below agent.git,
+# autopilot.git or agent.git_staging push, without housekeeping.fetch, on a dry run, or without origin.
 _hk_branch_sweep() {
   local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 heads="" b tip sha merged landed have_local have_track rsha out origin_go=()
   cfg_bool git.delete_merged_branches true || return 0
@@ -1225,11 +1318,12 @@ _hk_branch_sweep() {
   def_ref=$(jig_base_ref "$_HK_DEFAULT_BASE")
   [ -n "$def_ref" ] || return 0
   # origin is shared: housekeeping writes to it only for a person whose own
-  # agent may push (agent.git or autopilot.git at push or above, local-only
-  # keys), the same right `task ship` needs to put the branch there in the
-  # first place; a run that pushed under autopilot.git leaves a branch behind
-  # that agent.git alone would never sweep.
-  for lvl in "$(jig_agent_git 2>/dev/null || true)" "$(cfg autopilot.git "" 2>/dev/null || true)"; do
+  # agent may push (agent.git, autopilot.git or agent.git_staging at push or
+  # above, local-only keys), the same right `task ship` needs to put the
+  # branch there in the first place; a run that pushed under autopilot.git, or a task shipped
+  # at agent.git_staging, leaves a branch behind that agent.git alone would
+  # never sweep.
+  for lvl in "$(jig_agent_git 2>/dev/null || true)" "$(cfg autopilot.git "" 2>/dev/null || true)" "$(cfg agent.git_staging "" 2>/dev/null || true)"; do
     case "$lvl" in
       push | pr | merge) remote_rights=1 ;;
     esac
@@ -1762,12 +1856,15 @@ _hk_record() {
               group="waiting"
             else
               group="unknown"
-              note=$(_hk_unknown_reason "$branch" "$base_commit" "$base")
+              note=${_HK_KEEP_NOTE:-$(_hk_unknown_reason "$branch" "$base_commit" "$base")}
             fi
             ;;
           *)
             group="progress"
             if [ "$remote" = "open" ]; then note="pull request open"; fi
+            # Filed but never started (no branch, no base commit): nobody is
+            # working on it, so it is not in progress.
+            if [ -z "$branch" ] && [ -z "$base_commit" ] && [ "$st" = active ]; then group="filed"; note=""; fi
             ;;
         esac
         # Where the task's work is on the staging flow says more than "cannot
@@ -1852,6 +1949,123 @@ $_HK_STAGING
 EOF
 }
 
+# _hk_roadmap_open_read — every unchecked roadmap item of every spec in this
+# checkout into _HK_ROADMAP_OPEN, once per run, as "<spec><TAB><id>" lines. A
+# spec with an open epic that is not checked out here is read from the epic's
+# ref as well, as `spec plan` reads it (jig_spec_roadmap_ref): its items are filed
+# and checked there. An open epic with no ref here puts the spec in
+# _HK_ROADMAP_UNSEEN — its current roadmap cannot be read, so a task linked to
+# it stays.
+_hk_roadmap_open_read() {
+  local f spec id loc ref here rc
+  [ "$_HK_ROADMAP_READ" = 1 ] && return 0
+  _HK_ROADMAP_READ=1
+  _HK_ROADMAP_OPEN=""
+  _HK_ROADMAP_UNSEEN=" "
+  here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  for f in "$JIG_PROJECT/$JIG_AI_DIR"/specs/*/roadmap.md; do
+    [ -f "$f" ] || continue
+    spec=${f%/roadmap.md}
+    spec=${spec##*/}
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      _HK_ROADMAP_OPEN="${_HK_ROADMAP_OPEN}${spec}"$'\t'"${id}"$'\n'
+    done <<EOF
+$(jig_roadmap_open_ids "$f")
+EOF
+    rc=0
+    jig_spec_roadmap_ref_v loc "$spec" "$here" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      _HK_ROADMAP_UNSEEN="$_HK_ROADMAP_UNSEEN$spec "
+      continue
+    fi
+    [ -n "$loc" ] || continue
+    ref=${loc%%$'\t'*}
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      _HK_ROADMAP_OPEN="${_HK_ROADMAP_OPEN}${spec}"$'\t'"${id}"$'\n'
+    done <<EOF
+$(jig_git_show_path "$ref" "$JIG_AI_DIR/specs/$spec/roadmap.md" 2>/dev/null | jig_roadmap_open_ids -)
+EOF
+  done
+  return 0
+}
+
+# _hk_never_started <task> — exit 0 when a closed task without a recorded
+# branch or fork point shows no sign of ever having been started; otherwise
+# exit 1 with the reason it is kept in _HK_KEEP_NOTE. Kept: a commit message in
+# its workspace (a task closed before its commit, ADR-0030, may not have
+# landed); an unchecked roadmap item that names it — in this checkout, or on
+# the ref of a spec's open epic — or a `Spec:` link to a spec whose current
+# roadmap cannot be read here: none in this checkout, an open epic with no ref,
+# or a task.md linking to more than one spec (`spec plan` reads a closed task as
+# merged until `jig spec done` checks the item); a branch template that names
+# no branch for it; a ref or a pull request at its template branch name; a
+# forge that did not answer; and a triage task whose source is still here —
+# that source's next ship reads the triage workspace to file its findings only
+# once (adr-20261029-a-ship-hands-open-findings-to-one-triage-task).
+_hk_never_started() {
+  local tid="$1" dir tmpl src spec line rc=0
+  task_dir_v dir "$tid"
+  if [ -f "$dir/commit-message.md" ]; then
+    _HK_KEEP_NOTE="never started, but it holds a commit message, so its change may not have landed"
+    return 1
+  fi
+  _hk_roadmap_open_read
+  while IFS=$'\t' read -r spec line; do
+    if [ -n "$spec" ] && [ "$line" = "$tid" ]; then
+      _HK_KEEP_NOTE="never started, but its roadmap item in $spec is not checked"
+      return 1
+    fi
+  done <<EOF
+$_HK_ROADMAP_OPEN
+EOF
+  if [ -f "$dir/task.md" ]; then
+    jig_spec_link_v spec "$dir/task.md" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      _HK_KEEP_NOTE="never started, but its task.md does not link to one readable spec"
+      return 1
+    fi
+    if [ -n "$spec" ] && [ ! -f "$JIG_PROJECT/$JIG_AI_DIR/specs/$spec/roadmap.md" ]; then
+      _HK_KEEP_NOTE="never started, but its spec $spec is not in this checkout"
+      return 1
+    fi
+    case "${spec:+$_HK_ROADMAP_UNSEEN}" in
+      *" $spec "*)
+        _HK_KEEP_NOTE="never started, but the epic of its spec $spec is not here to read its roadmap from"
+        return 1
+        ;;
+    esac
+  fi
+  tmpl=$(_hk_task_branch_name "$tid")
+  if [ -z "$tmpl" ]; then
+    _HK_KEEP_NOTE="never started, but git.branch_template names no branch for it"
+    return 1
+  fi
+  if [ -n "$(_hk_resolve_ref "$tmpl")" ]; then
+    _HK_KEEP_NOTE="never started, but its branch $tmpl exists"
+    return 1
+  fi
+  if [ "$_HK_FORGE_TOKEN" = failed ]; then
+    _HK_KEEP_NOTE="never started, but the forge did not answer whether $tmpl had a pull request"
+    return 1
+  fi
+  # Any pull request from it, into whatever base and in whatever state:
+  # _hk_forge_state answers only for the task's own base and staging.
+  case $'\n'"$_HK_FORGE_PRS" in
+    *$'\n'"$tmpl"$'\t'*)
+      _HK_KEEP_NOTE="never started, but a pull request from $tmpl exists"
+      return 1
+      ;;
+  esac
+  task_state_var src "$tid" triage_of
+  if [ -n "$src" ] && _task_valid_id "$src" && [ -f "$(task_dir "$src")/state" ]; then
+    _HK_KEEP_NOTE="triage of $src, kept while $src is here"
+    return 1
+  fi
+  return 0
+}
+
 # _hk_unknown_reason <branch> <base_commit> <base> — why the remote state of a
 # consolidated task came out `unknown`, in words. It answers the question the
 # report exists for: this workspace is kept, so what would it take for it not
@@ -1926,18 +2140,19 @@ _hk_print_report() {
       else names[key] = names[key] SUBSEP $2
     }
     END {
-      split("needs removed archived waiting progress unknown expiring shelved skipped", groups, " ")
+      split("needs removed archived waiting progress filed unknown expiring shelved skipped", groups, " ")
       head["needs"] = "needs you (%d):"
       if (dry == 1) head["removed"] = "would remove (%d): would move to .ai/runtime/trash/" day "/"
       else head["removed"] = "removed (%d): moved to .ai/runtime/trash/" day "/, recoverable for " ttl " days"
       head["waiting"] = "waiting for merge (%d): consolidated, pull request still open"
       head["progress"] = "in progress (%d):"
+      head["filed"] = "filed, not started (%d):"
       head["unknown"] = "kept, cannot tell whether it landed (%d):"
       head["archived"] = "archived (%d): workspace kept, nothing was removed"
       head["expiring"] = "abandoned, waiting to go to the archive (%d):"
       head["shelved"] = "already in the archive (%d):"
       head["skipped"] = "skipped (%d): not a valid task id, left alone"
-      for (gi = 1; gi <= 9; gi++) {
+      for (gi = 1; gi <= 10; gi++) {
         g = groups[gi]
         if (!(g in count)) continue
         printf head[g] "\n", count[g]

@@ -901,42 +901,13 @@ _bootstrap_dangling() {
   return 0
 }
 
-# _bootstrap_winpid <pid> — the Windows process id behind the MSYS/Cygwin
-# process <pid>, or nothing when there is none to read.
-_bootstrap_winpid() {
-  cat "/proc/$1/winpid" 2>/dev/null || true
-}
-
-# _bootstrap_stop_tree <pid> — under Git Bash, end the Windows process tree of
-# <pid> before its group is signalled. MSYS delivers a signal only to its own
-# processes: a native program the command started — `php` under `composer`,
-# `docker` — never hears it and goes on running. `taskkill /T` walks the tree
-# by parent, so it runs first, while <pid> is still there to be its root.
-# Elsewhere, or with no taskkill or winpid, nothing: the group signal that
-# follows is the whole stop. MSYS rewrites `/T` into a path unless argument
-# conversion is off, as for _jig_junction.
-_bootstrap_stop_tree() {
-  local winpid
-  case "$(uname -s 2>/dev/null)" in
-    MINGW* | MSYS* | CYGWIN*) ;;
-    *) return 0 ;;
-  esac
-  command -v taskkill >/dev/null 2>&1 || return 0
-  winpid=$(_bootstrap_winpid "$1")
-  case "$winpid" in '' | *[!0-9]*) return 0 ;; esac
-  MSYS2_ARG_CONV_EXCL='*' taskkill /T /F /PID "$winpid" >/dev/null 2>&1 || true
-  return 0
-}
-
-# _bootstrap_setup_stop — the exit action that stops a `worktree.setup` still
-# running when Jig itself ends: its whole tree, as the timeout does.
-_JIG_SETUP_PID=""
-_bootstrap_setup_stop() {
-  [ -n "$_JIG_SETUP_PID" ] || return 0
-  _bootstrap_stop_tree "$_JIG_SETUP_PID"
-  kill -TERM -- "-$_JIG_SETUP_PID" 2>/dev/null || kill -TERM "$_JIG_SETUP_PID" 2>/dev/null || true
-  _JIG_SETUP_PID=""
-  return 0
+# _bootstrap_setup_run <tree-root> <id> <owner-root> <shared> <dangling> <cmd> — the
+# body of the background job: `worktree.setup` in the worktree, exec'd so the
+# command itself is the group's leader.
+_bootstrap_setup_run() {
+  cd "$1" || exit 1
+  JIG_TASK_ID="$2" JIG_OWNER_CHECKOUT="$3" JIG_SHARED="$4" JIG_DANGLING="$5" \
+    exec sh -c "$6"
 }
 
 # jig_bootstrap_setup <owner-root> <tree-root> <verb> <id> <shared> — run the
@@ -957,14 +928,8 @@ _bootstrap_setup_stop() {
 # both its outputs go to stderr: `task start` prints the worktree's path on
 # stdout, and that line is what agents read.
 #
-# Bounded by `worktree.setup_timeout`. The command runs in a process group of
-# its own (`set -m`), so that at the limit the whole group — `make`, the
-# `docker exec` under it, the `composer` under that — is sent SIGTERM, and
-# SIGKILL five seconds later; under Git Bash, where native programs hear no
-# signal, its Windows process tree is ended first (_bootstrap_stop_tree). A
-# process a container started inside itself may not get the signal; that
-# boundary is the container's. Rolled by hand like
-# jig_ls_remote_tags: no `timeout` is guaranteed to exist (ADR-0002).
+# Bounded by `worktree.setup_timeout`, through jig_run_bounded: at the limit
+# the command's whole process tree is stopped (common.sh says how).
 #
 # Never fatal, like the carry before it: the task is started either way and
 # `jig task bootstrap` runs it again. And since the command is the project's,
@@ -972,7 +937,7 @@ _bootstrap_setup_stop() {
 # know what those files are.
 jig_bootstrap_setup() {
   local owner_root="$1" tree_root="$2" verb="$3" id="$4" shared="$5"
-  local cmd limit secs dangling pid rc ticks=0 max_ticks waited monitor dirt
+  local cmd limit secs dangling rc dirt
   _JIG_SETUP_OUTCOME=""
   cmd=$(cfg worktree.setup)
   [ -n "$cmd" ] || return 0
@@ -987,47 +952,7 @@ jig_bootstrap_setup() {
   shared=${shared% }
 
   jig_info "$verb: running worktree.setup: $cmd"
-  monitor=0
-  case "$-" in *m*) monitor=1 ;; esac
-  set -m
-  (
-    cd "$tree_root" || exit 1
-    JIG_TASK_ID="$id" JIG_OWNER_CHECKOUT="$owner_root" JIG_SHARED="$shared" \
-      JIG_DANGLING="$dangling" exec sh -c "$cmd"
-  ) </dev/null >&2 &
-  pid=$!
-  [ "$monitor" = 1 ] || set +m
-  # A group of its own does not hear the terminal's Ctrl-C, which reaches only
-  # Jig; so whatever ends Jig ends the command with it.
-  _JIG_SETUP_PID=$pid
-  jig_on_exit '_bootstrap_setup_stop'
-
-  rc=""
-  if [ "$secs" -gt 0 ]; then
-    max_ticks=$((secs * 5))
-    while kill -0 "$pid" 2>/dev/null; do
-      if [ "$ticks" -ge "$max_ticks" ]; then
-        _bootstrap_stop_tree "$pid"
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-        waited=0
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 25 ]; do
-          sleep 0.2
-          waited=$((waited + 1))
-        done
-        kill -KILL -- "-$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        rc=timeout
-        break
-      fi
-      sleep 0.2
-      ticks=$((ticks + 1))
-    done
-  fi
-  if [ -z "$rc" ]; then
-    rc=0
-    wait "$pid" 2>/dev/null || rc=$?
-  fi
-  _JIG_SETUP_PID=""
+  jig_run_bounded rc "$secs" _bootstrap_setup_run "$tree_root" "$id" "$owner_root" "$shared" "$dangling" "$cmd" </dev/null >&2
 
   case "$rc" in
     0) _JIG_SETUP_OUTCOME=ok ;;

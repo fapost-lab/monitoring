@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# jig-session-end-hook — the runtime says a session is over, so the records it
+# made stop counting as work in progress
+# (adr-20260924-a-checkout-records-what-is-happening-in-it, amendment of 2026-11-16).
+#
+# Called by the runtime's own end-of-session hook, which the project connected:
+# Claude Code's `SessionEnd`. The runtime's JSON arrives on stdin; the two values
+# read from it are plain strings, `"session_id"` (which session ended) and `"cwd"`
+# (the checkout it worked in), both taken only when they hold no quote and no
+# backslash, so nothing in them needs decoding (ADR-0002 allows a `sed` reader
+# for Jig's own formats only). Without a session id in the payload the runtime's
+# adapter answers from the environment; without either, nothing is done.
+#
+# The records are marked `ended:`, never deleted (checkout.sh, jig_checkout_end).
+# Records of a session that never reaches this hook — killed, or a runtime with no
+# such hook — still lapse after `checkout.busy_ttl`.
+#
+# Like jig-session-hook and jig-notify-hook this exits 0 in every circumstance and
+# prints nothing, and it is a script of its own rather than `jig <command>`: the
+# dispatcher records every run as work going on in the checkout, and the end of a
+# session is not work.
+#
+# Deliberate exception to convention-shell's `set -eu` and `set -o pipefail`, for
+# the reason jig-session-hook gives: every giving-up path returns explicitly, and
+# `set -u` is the safety net.
+set -u
+
+main() {
+  local self dir payload cwd session project
+
+  payload=""
+  if [ ! -t 0 ]; then
+    payload=$(cat 2>/dev/null) || payload=""
+  fi
+  cwd=$(_hook_string "$payload" cwd)
+  [ -n "$cwd" ] || cwd=$PWD
+  session=$(_hook_string "$payload" session_id)
+
+  self="${BASH_SOURCE[0]}"
+  while [ -L "$self" ]; do
+    dir=$(cd "$(dirname "$self")" && pwd) || return 0
+    self=$(readlink "$self")
+    case "$self" in /*) ;; *) self="$dir/$self" ;; esac
+  done
+  dir=$(cd "$(dirname "$self")" && pwd) || return 0
+  [ -f "$dir/lib/common.sh" ] || return 0
+
+  # Read by the libraries below.
+  # shellcheck disable=SC2034
+  JIG_LIB="$dir/lib"
+  # shellcheck source=lib/common.sh
+  . "$dir/lib/common.sh" || return 0
+  jig_clear_git_location_env
+
+  [ -d "$cwd" ] || return 0
+  project=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+  project=$(cd -P "$project" 2>/dev/null && pwd -P) || return 0
+  [ -f "$project/.ai/config.yaml" ] || return 0
+  # shellcheck disable=SC2034
+  JIG_PROJECT="$project"
+  # shellcheck disable=SC2034
+  JIG_AI_DIR=".ai"
+
+  # shellcheck source=lib/config.sh
+  . "$dir/lib/config.sh" || return 0
+  # shellcheck source=lib/checkout.sh
+  . "$dir/lib/checkout.sh" || return 0
+  # The checkout is resolved from the process's own directory, so enter the one
+  # the payload named: the hook may run from the project root while the session
+  # worked in a task worktree.
+  cd "$project" || return 0
+  [ -n "$session" ] || session=$(jig_checkout_session)
+  [ -n "$session" ] || return 0
+  jig_checkout_end "$session"
+  return 0
+}
+
+# _hook_string <payload> <key> — the value of a top-level `"<key>": "<value>"`
+# when it holds no quote and no backslash; nothing otherwise.
+_hook_string() {
+  local p="$1" k="$2" v
+  case "$p" in
+    *"\"$k\""*) ;;
+    *) return 0 ;;
+  esac
+  p=${p#*"\"$k\""}
+  p="${p#"${p%%[![:space:]]*}"}"
+  case "$p" in
+    :*) p=${p#:} ;;
+    *) return 0 ;;
+  esac
+  p="${p#"${p%%[![:space:]]*}"}"
+  case "$p" in
+    '"'*) p=${p#'"'} ;;
+    *) return 0 ;;
+  esac
+  v=${p%%'"'*}
+  [ "$v" != "$p" ] || return 0
+  case "$v" in
+    '' | *\\*) return 0 ;;
+  esac
+  printf '%s\n' "$v"
+}
+
+main "$@" >/dev/null 2>&1
+exit 0

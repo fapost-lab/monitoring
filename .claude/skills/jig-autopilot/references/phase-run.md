@@ -72,7 +72,9 @@ Before each start, ask `jig queue next` as `jig-autopilot` §7 says: a higher-pr
 outside the phase holds the start, so a release's notes task gets its number first (`jig-release`
 §5) — attended, a question for the message of step 4; unattended,
 the wave in flight finishes and nothing new starts — and either way it is a stop recorded with
-`jig spec stop`. A task the queue names as taken by another session is never started.
+`jig spec stop`. A task the queue names as taken by another session is never started. A wave's
+task the queue would not name is started with `jig task start <id> --worktree --out-of-order
+--reason "phase <spec>/<n>"`; the plain start is refused.
 
 Then start a background subagent with the prompt below — a subagent of your runtime, never a
 separate session of the app (`jig-autopilot` §2 says why). A slot is held by an agent still
@@ -100,7 +102,10 @@ record the stop — the run has no journal, and this is what reaches the person'
 
 Every end of the loop that waits for the person is such a stop: questions, a `problem` row, the
 forge unreachable, and — unattended — a draft ending the run.
-After an answer, resume an attended task with `jig task autopilot <id> resume --answer "<the person's answer>"`.
+A stopped task holds no slot: the wave's next task may take it. An answer the person gave
+elsewhere is already recorded (`jig task autopilot <id> answer`); `jig queue next` names it under
+`resume first:`, and it resumes, with `jig task autopilot <id> resume`, before the wave starts
+anything new. After an answer in your session, resume an attended task with `jig task autopilot <id> resume --answer "<the person's answer>"`.
 For an already stopped unattended task with repairs still available, quote the actual answer and add
 `--by human`; a repair-limit stop remains a draft and cannot resume. When the person takes a stopped
 task on instead, at the repair limit too, quote their words with

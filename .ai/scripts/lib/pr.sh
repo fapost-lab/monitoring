@@ -15,11 +15,17 @@
 # on another host.
 # shellcheck shell=bash
 
-PR_USAGE="usage: jig pr fetch <url> | jig pr followup <n|url> [--login <login>] | jig pr draft <n|url> [--from <file>] | jig pr comments check <n|url> | jig pr comments post <n|url> --shown <hash> | jig pr list | jig pr cleanup <n|url>"
+PR_USAGE="usage: jig pr fetch <url> | jig pr reviewers [--base <branch>] [--json] | jig pr followup <n|url> [--login <login>] | jig pr draft <n|url> [--from <file>] | jig pr comments check <n|url> | jig pr comments post <n|url> --shown <hash> | jig pr list | jig pr cleanup <n|url>"
 
 cmd_pr() {
   local sub="${1:-}"
   if [ $# -gt 0 ]; then shift; fi
+  # `reviewers` reads this clone's own forge, not a fetched pull request, and
+  # with --json every refusal is an envelope: it runs the checks below itself.
+  if [ "$sub" = reviewers ]; then
+    _pr_reviewers "$@"
+    return
+  fi
   jig_require_repo
   _pr_refuse_inside_a_review_tree
   case "$sub" in
@@ -33,6 +39,104 @@ cmd_pr() {
     '') jig_fail usage "pr: a subcommand is required; $PR_USAGE" ;;
     *) jig_fail usage "pr: unknown subcommand: $sub; $PR_USAGE" ;;
   esac
+}
+
+# --- who may review a pull request this clone opens -------------------------------
+#
+# adr-20261113-reviewers-are-read-from-the-forge. `jig pr reviewers` lists the
+# people `jig task ship --reviewer` would offer for a pull request into <base>
+# (lib/reviewers.sh): the reviewers of the last merged ones, most frequent
+# first, or everyone the repository may ask. The one `--json` read that asks
+# the forge — asking it is what the read is for (schemas/json.md).
+
+# Set by _pr_reviewers when `--json` is among the arguments.
+_PR_REVIEWERS_JSON=""
+
+_pr_reviewers() {
+  local arg
+  _PR_REVIEWERS_JSON=""
+  for arg in "$@"; do
+    [ "$arg" != --json ] || _PR_REVIEWERS_JSON=1
+  done
+  # shellcheck source=lib/reviewers.sh
+  . "$JIG_LIB/reviewers.sh"
+  if [ -n "$_PR_REVIEWERS_JSON" ]; then
+    # shellcheck source=lib/json.sh
+    . "$JIG_LIB/json.sh"
+    json_run _pr_reviewers_main "$@"
+    return
+  fi
+  _pr_reviewers_main "$@"
+}
+
+# _pr_reviewer_fields <line> — a `<login>\t<name>\t<reviews>` line into the
+# caller's login, name and count: split by hand, since `read` would merge the
+# two tabs around an empty name.
+_pr_reviewer_fields() {
+  local rest
+  login=${1%%$'\t'*}
+  rest=${1#*$'\t'}
+  name=${rest%%$'\t'*}
+  count=${rest#*$'\t'}
+}
+
+_pr_reviewers_main() {
+  local base="" line login name count out="" sep="" text
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) shift ;;
+      --base)
+        case "${2:-}" in '' | -*) jig_fail usage "pr reviewers: --base requires a value" ;; esac
+        base="$2"
+        shift 2 ;;
+      *) jig_fail usage "pr reviewers: unknown argument: $1; $PR_USAGE" ;;
+    esac
+  done
+  jig_require_repo
+  _pr_refuse_inside_a_review_tree
+  if [ -z "$base" ]; then
+    base=$(jig_staging_in_use 2>/dev/null) || base=$(cfg git.base_branch main)
+  fi
+  [ "$(jig_forge_kind 2>/dev/null || true)" != github ] || jig_gh_prepare "pr reviewers"
+  jig_reviewers_candidates "$base" \
+    || jig_fail forge-unavailable "pr reviewers: the forge could not be asked: $_RV_WHY"
+  if [ -n "$_PR_REVIEWERS_JSON" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      _pr_reviewer_fields "$line"
+      json_quote "$login"; out="$out$sep{\"login\":$_JSON"
+      json_str_or_null "$name"; out="$out,\"name\":$_JSON"
+      json_int_or_null "$count"; out="$out,\"reviews\":$_JSON}"
+      sep=","
+    done <<EOF
+$_RV_LINES
+EOF
+    json_quote "$base"; text="{\"base\":$_JSON"
+    json_quote "$_RV_SOURCE"; text="$text,\"source\":$_JSON"
+    json_quote "$_RV_SELF"; text="$text,\"author\":$_JSON"
+    printf '%s,"candidates":[%s]}\n' "$text" "$out"
+    return 0
+  fi
+  if [ -z "$_RV_LINES" ]; then
+    printf 'nobody this repository may ask for a review, besides %s\n' "$_RV_SELF"
+    return 0
+  fi
+  if [ "$_RV_SOURCE" = history ]; then
+    printf 'reviewers of the last merged pull requests into %s, most frequent first:\n' "$base"
+  else
+    printf 'nobody reviewed the last merged pull requests into %s; everyone this repository may ask:\n' "$base"
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _pr_reviewer_fields "$line"
+    printf '  %s' "$login"
+    [ -z "$name" ] || printf ' (%s)' "$name"
+    [ -z "$count" ] || printf ' — %s review(s)' "$count"
+    printf '\n'
+  done <<EOF
+$_RV_LINES
+EOF
+  printf 'request them with: jig task ship <id> --reviewer <login or name> (repeat for each)\n'
 }
 
 # --- git, with nothing of the head's run ------------------------------------------

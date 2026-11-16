@@ -21,7 +21,8 @@ Classify, file and start the task with `jig-task` (or resume one that is filed).
 It prints `autopilot: on (unattended)` when this clone set `autopilot.unattended: true`: then
 the run asks nothing, and §5 replaces §3. Say in one line what will happen: the class, the
 route and its depth as `jig task route <id>` names them, any stage its `delegate:` lines hand to
-a helper, and where the run will end by the `autopilot git:` line `start` printed — merged at
+a helper, and where the run will end by the `autopilot git:` lines `start` printed (a second,
+`autopilot git on <staging>:`, is the level for a pull request into the staging branch) — merged at
 `merge`, an open pull request at `pr`, pushed for CI to land at either under
 `git.staging_land: external`, or "ready for your commit" at `none`. Offer to
 open the status page with `.ai/scripts/jig status --open`, where the human can watch the run
@@ -56,7 +57,8 @@ entered. End the session there — say the task is paused at their request and h
   `start_session`). A run goes on in turns an event began — a helper finishing, CI — and a
   runtime may refuse to start a session in a turn the person did not begin, leaving only a card
   for them to click. An `executor:` process (above) is not a session either. Without subagents,
-  see phase-run.md, "A runtime without subagents".
+  see phase-run.md, "A runtime without subagents". The one session the app may open is a set
+  run's task, which is a run and not a helper (§7, "A session per task").
 - **The full set is CI's under `verify.full_run: ci`.** Verify with `jig verify`, never with
   `--full` or the stack's runner unfiltered; `full set left to CI` is not a gap to fill.
 - **Each repair costs one attempt.** A repair is one loop of fixing after a blocking finding or
@@ -71,6 +73,10 @@ entered. End the session there — say the task is paused at their request and h
   refuses, the refusal is the process working: go back to the stage it names. A refusal that
   says `the route of <id> is missing:` names a stage of the route that left no record — the
   gate, a review receipt, verify's `status ready` — and the command that records it.
+  A refusal by the project's `hooks.<gate>` is a gate too: when it names something the task's
+  work left undone, doing it is a repair. A hook stopped at `hooks.timeout` is a refusal the task's
+  work cannot satisfy: a stop (§3, §5), never a repair or a retry. Never run `jig task waive`: a waiver is a person's, and
+  the script refuses it while the run is on.
 
 ## 3. Stop only here
 
@@ -86,6 +92,7 @@ In an unattended run there are no stops: §5. Otherwise, on a stop, record it, t
 | `repair` exited 3 | How to proceed: another approach, dismissing the finding (a P0/P1 only with them), dropping the task, or taking it over (§5, "A person takes the task over") |
 | Re-classification to T3 or T4 | The gate for the new design. Up to T2, continue and say so in the report |
 | A decision nobody made | The decision: a product choice not settled in `task.md`, the spec or knowledge. Never guess one |
+| A gate hook refused and the task's work cannot satisfy it | A waiver with their reason (`jig task waive <id> <gate> <path> --reason <text>`), or a fix to the hook |
 | A destructive operation | Permission, or another way |
 
 A reason says **what you need from the human**, and nothing about the state of the task. It is
@@ -112,6 +119,11 @@ After the human answers, quote their answer:
 It resets the repair count: the human gave the run a new direction. The answer goes into the
 report as given, so never resume without one; in the pull request it gets an English gloss
 (§4). Continue from the stage you stopped in.
+
+A stopped run holds no slot (§7). An answer that arrives while you work on something else, or in
+another session — `jig status` lists every run waiting, with its question — is recorded, not
+acted on: `jig task autopilot <id> answer --answer "<their words>"`. Whoever has a free slot resumes
+it with `jig task autopilot <id> resume`, which takes the recorded answer.
 
 ## 4. End
 
@@ -145,6 +157,7 @@ request or its body, write it in the commit message and the hand-back instead.
 | The gate of a T3/T4 task, or a re-classification into one | Write the design as usual, then `jig task gate <id> approved --by agent`, `jig task autopilot <id> approve --reason "<what was approved>"`, and in `task.md` (`jig task artifact append <id> task --from -`): "Human gate — approved by the agent (unattended)". The approve reason, in English, says what was approved and names the ADR or knowledge holding the detail; it is the design's only trace in the pull request, which never carries `design.md` |
 | A decision nobody made | The most cautious option that is easiest to undo. `jig task autopilot <id> decide --reason "<what you chose, and why>"` |
 | A destructive operation | Never. Find another way or leave that part out, and say so with `decide --reason` |
+| A gate hook refused and the task's work cannot satisfy it | Never waive. `stop --reason` naming the hook, then `jig task ship <id> --message-file <file> --draft` (a draft runs no hook), its body starting `Not finished: hooks.<gate> refused: <why>`. The run stays `stopped`; a person waives it and resumes with `--by human` |
 | `repair` exited 3 | The run ends unfinished: stage what there is and run `jig task ship <id> --message-file <file> --draft`. The body starts with `Not finished: <why>`, in English like the rest of it. A draft is never merged — under `git.staging_land: external` it is committed and not pushed, since CI lands whatever is pushed; the run stays `stopped`, and the status page shows it waiting. `resume` is refused after the repair limit, including with `--by human`; a person who takes the task on is the one other ending (below) |
 | The class turns out lower | Lower it with `jig task set <id> class <Tn> --reason "<why>"`, except out of T3/T4 below T3: the script refuses that unattended, so keep the route. `end` comes after the knowledge decision, never to start a fresh run |
 
@@ -183,7 +196,8 @@ not; exit 3 on review is a stop when attended, and an unattended run is told to 
 `landed …` or `not landed: …`, `end --reason "<that line>"` and do not close the task: it is
 **parked** — waiting for review or for "prepare for prod" — and the run is over. Never land it
 `--without-review` unless the person said so, never approve its pull request, never run
-`jig task promote`; `autopilot start` and `stage` refuse a parked task, and only a person's
+`jig task promote`. `--by human` is a person's form, for the person or their UI; the agent never
+passes it. `autopilot start` and `stage` refuse a parked task, and only a person's
 `jig task resume <id>` takes it back for a fix. With
 `git.staging_land: external` it prints `stopped at push: … CI lands …` instead: also finished, with
 no pull request; end with `--reason "pushed: CI lands it on <staging>"`.
@@ -219,8 +233,17 @@ ask:
 .ai/scripts/jig queue next
 ```
 
+- **`slots:` says whether a slot is free.** A run that stopped for a person holds none: record the
+  stop, put its question to the person, and go on with the next task. Nothing waiting is ever a
+  reason to stop the set, however many wait.
+- **`resume first:` goes before `next:`.** An answered run resumes on the next free slot, before
+  any new task, in the order the line names; never by taking a slot from a run that is on. Resume it
+  with `jig task autopilot <id> resume` and continue from the stage it stopped in.
+
 - **It names a task of the set**, or one outside it with no higher priority than the set's next:
-  start the set's next.
+  start the set's next. When that is not the task it names, the plain start is refused: use
+  `jig task start <id> --out-of-order --reason "<the set the person named>"`. The same holds after
+  the person's choice, or an unattended `decide`, below.
 - **It names a task outside the set with a higher priority** (a lower number; a task without one
   comes last): start neither silently. Name it to the person and ask whether to take it or keep to
   the set — §3's "a decision nobody made". Unattended: `jig task autopilot <id> decide --reason`
@@ -228,3 +251,24 @@ ask:
   when you hand back. Never take someone else's T3/T4 task to approve its gate as the agent.
 - **A task it names as taken by another session** is not free, in the set or out of it: never
   start it; skip it and name it when you hand back.
+
+**A session per task (Claude Code desktop only).** Where the runtime can open a session, and the
+person asked in words for the set to run in sessions (`start_session`, `initiation: user_asked`),
+each task of a set may get one. Per task: `jig task start <id> --worktree`, then a fresh session
+with `cwd` the task's worktree, `use_worktree: false` and `wake_when_done: true`, briefed with the
+task id and "run it on autopilot": it begins at §1 itself. Count the sessions you opened as
+building, since `slots:` sees a run only once its session has started it. The coordinator keeps
+§7's queue reading; the sidebar shows who waits, and a stopped session's last message is its
+question. Such a session executes a filed Jig task with its route, workspace and consolidation, so
+it does not break the `spawn_task` row of `AGENTS.md`.
+
+- **Only the turn the person began may open sessions.** A start the app refuses stays a card for
+  the person: do not start that task's run; name it when you hand back.
+- **An answer goes into the session that holds the run.** The person answers in the session, or you
+  forward their answer there (`send_message`) and the session runs `resume`. Do not record `answer`
+  for it yourself, and if `resume first:` lists it anyway, forward the answer, do not resume it here.
+- **Archive its session once the task is `consolidated`**, when the person asked for that: the app
+  asks them on each call. Otherwise, and at `pr`, where the set is handed back before the merge,
+  name the session when you hand back.
+
+Other runtimes, and phase runs (phase-run.md), ignore this: subagents, one session.

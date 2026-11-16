@@ -70,6 +70,8 @@ do not pick a task yourself.
 The same holds wherever a next task is offered — a suggested next step, a choice of buttons, after a
 ship, on leaving an autopilot run: ask `queue next` again and offer first what it names. Another task
 goes ahead of it only when you say so in words: its priority against the named one's, and why.
+A free slot is filled by what `queue next` names; a `jig task start` refusal is never bypassed
+without saying the reason to the person in words, and the same reason goes into `--reason`.
 
 When the person asks to set priorities or to order the tasks, follow
 [task priority](references/priority.md): the answer is written to the queue, not listed in the chat.

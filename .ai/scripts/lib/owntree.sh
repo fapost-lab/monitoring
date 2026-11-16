@@ -294,6 +294,51 @@ _ot_level() {
   OT_LEVEL=$value
 }
 
+# The sentences of three refusals a write makes, one place each, because the actions
+# table asks the same questions of local refs before the command runs
+# (ot_spec_drop_refusal) and must say what the command says.
+# shellcheck disable=SC2016 # the backticks are literal
+_ot_msg_git_not_allowed() {
+  printf '%s: agent.git is none in this clone, so Jig commits nothing; set it with `jig config set --local agent.git commit` (or higher), or make the change in an agent session' "$1"
+}
+
+# _ot_msg_checked_out <who> <branch> <holder>
+_ot_msg_checked_out() {
+  printf '%s: %s is checked out in %s, and Jig never moves a checkout; finish the work there, or switch that checkout to another branch, then try again' "$1" "$2" "$3"
+}
+
+# _ot_msg_other_commits <who> <branch> <has-origin>
+_ot_msg_other_commits() {
+  local how="push or merge them yourself"
+  [ "$3" = 1 ] || how="merge them yourself"
+  printf "%s: %s has commits that no write of Jig's made and origin does not have, and Jig does not publish them; %s, or move them to another branch, then try again" "$1" "$2" "$how"
+}
+
+# _ot_msg_still_waits <who> <branch> <its-base> <pr-or-empty> <base> <target> — a write
+# that waits to go into another base than this edit's.
+# shellcheck disable=SC2016 # the backticks are literal
+_ot_msg_still_waits() {
+  local pr=""
+  [ -z "$4" ] || pr=" ($4)"
+  printf '%s: %s still waits to go into %s%s, and this edit goes into %s; merge or close what waits first (`jig writes ship %s` carries it on), then try again' "$1" "$2" "$3" "$pr" "$5" "$6"
+}
+
+# _ot_msg_epics_many <who> <roadmap-path> — a roadmap with more than one Epic: line.
+_ot_msg_epics_many() {
+  printf '%s: %s declares more than one epic; keep one Epic: line' "$1" "$2"
+}
+
+# _ot_msg_epic_name_rejected <who> <epic> — an open epic whose name git rejects.
+_ot_msg_epic_name_rejected() {
+  printf '%s: git rejects the epic'"'"'s name: %s' "$1" "$2"
+}
+
+# _ot_msg_epic_missing <who> <spec> <epic> — an open epic that has no ref here or on origin.
+# shellcheck disable=SC2016 # the backticks are literal
+_ot_msg_epic_missing() {
+  printf '%s: %s is built on %s, which is neither here nor on origin; cut it with `jig spec epic %s`, or fetch it' "$1" "$2" "$3" "$2"
+}
+
 # ot_begin <who> <target> <revision> — the checks that cost nothing and the lock.
 # Refused with nothing done: `agent.git` none (git-not-allowed), a revision already
 # overtaken (stale-revision), another write running (write-busy). An empty <revision>
@@ -307,7 +352,7 @@ ot_begin() {
   _OT_PROJECT="$JIG_PROJECT"
   _ot_level "$OT_WHO"
   if [ "$OT_LEVEL" = none ]; then
-    jig_fail git-not-allowed "$OT_WHO: agent.git is none in this clone, so Jig commits nothing; set it with \`jig config set --local agent.git commit\` (or higher), or make the change in an agent session"
+    jig_fail git-not-allowed "$(_ot_msg_git_not_allowed "$OT_WHO")"
   fi
   if [ -n "$OT_EXPECTED" ]; then
     [ "$(jig_revision_read)" = "$OT_EXPECTED" ] \
@@ -641,7 +686,8 @@ ot_judge() {
 # Nothing moves here. A branch that has to catch up leaves _OT_FF_TO and _OT_FF_FROM,
 # and a tracking ref origin no longer backs leaves _OT_STALE_REF: ot_commit moves the one,
 # inside the tree that holds the branch, and removes the other, so a refusal before then
-# has left every ref where it was, and the next write sees what this one saw.
+# has left every ref where it was, and the next write sees what this one saw — except
+# after ot_take_in_base, which moves the one to origin's tip before its merge.
 _OT_START=""
 _OT_FF_TO=""
 _OT_FF_FROM=""
@@ -662,7 +708,7 @@ _ot_resolve() {
     || jig_die "$OT_WHO: git rejects the branch name: $branch"
   holder=$(_ot_holder "$branch")
   if [ -n "$holder" ]; then
-    jig_fail branch-checked-out "$OT_WHO: $branch is checked out in $holder, and Jig never moves a checkout; finish the work there, or switch that checkout to another branch, then try again"
+    jig_fail branch-checked-out "$(_ot_msg_checked_out "$OT_WHO" "$branch" "$holder")"
   fi
 
   ot_judge "$branch" "$base"
@@ -679,8 +725,8 @@ _ot_resolve() {
       _OT_START=$(_ot_sha "$OT_BASE_REF") ;;
     *)
       if [ -n "$OT_R_BASE" ] && [ "$OT_R_BASE" != "$base" ]; then
-        [ "$_OT_J" != top ] || [ -z "$OT_R_PR" ] || pr=" ($OT_R_PR)"
-        jig_fail write-still-waits "$OT_WHO: $branch still waits to go into $OT_R_BASE$pr, and this edit goes into $base; merge or close what waits first (\`jig writes ship $OT_TARGET\` carries it on), then try again"
+        [ "$_OT_J" != top ] || pr=$OT_R_PR
+        jig_fail write-still-waits "$(_ot_msg_still_waits "$OT_WHO" "$branch" "$OT_R_BASE" "$pr" "$base" "$OT_TARGET")"
       fi
       [ "$_OT_J" != spent ] || _OT_PR_SPENT=1
       _ot_plan_move "$_OT_J_TIP" "$_OT_J_LOCAL" ;;
@@ -734,9 +780,7 @@ ot_refuse_what_is_not_jigs() {
         local_sha=""
       fi
       if [ -n "$local_sha" ]; then
-        how="push or merge them yourself"
-        [ "$has_origin" = 1 ] || how="merge them yourself"
-        jig_fail branch-has-other-commits "$OT_WHO: $1 has commits that no write of Jig's made and origin does not have, and Jig does not publish them; $how, or move them to another branch, then try again"
+        jig_fail branch-has-other-commits "$(_ot_msg_other_commits "$OT_WHO" "$1" "$has_origin")"
       fi
     fi
   fi
@@ -766,7 +810,8 @@ _ot_plan_move() {
 # branch that exists the tree is on it, and one git says is taken elsewhere is the race
 # _ot_holder could not see. One that has to catch up stays where it is until ot_commit,
 # while the tree's files and index already show what it will be at: validation reads
-# that, and a refusal leaves no ref moved.
+# that, and a refusal leaves no ref moved. ot_take_in_base, when a writer calls it, moves
+# or cuts the branch to origin's tip before its merge instead.
 _OT_CUT=""
 ot_open() {
   local path out rc=0
@@ -860,6 +905,50 @@ $out"
   fi
   OT_COMMIT=$(_ot_sha "refs/heads/$OT_BRANCH")
   jig_record_changed
+}
+
+# ot_take_in_base — merge the base, as OT_BASE_REF reads it, into the tree, uncommitted
+# (adr-20261115-the-decisions-branch-takes-in-the-base). For a writer whose change needs
+# what reached the base after its waiting branch was cut. The tree keeps holding the
+# branch, so git still refuses a checkout of it meanwhile and hooks see the real branch.
+# A branch that has to catch up with origin is brought to origin's tip first, inside the
+# tree, and one only on origin is cut there: that ref moves before the commit, but only to
+# what origin already holds, so nothing is lost — as when a commit is refused after a
+# fast-forward. The merge is left in the index and files: validation reads the merged
+# state, and ot_commit makes it one merge commit, its parents the tip and the base. The
+# base is origin's when origin is known, so nothing that is not Jig's leaves with it.
+# OT_TOOK_IN <- the base's commit taken in, empty when the tip had it already. Returns 1
+# when the merge conflicts, with nothing merged and _OT_CONFLICTS naming the files.
+OT_TOOK_IN=""
+_OT_CONFLICTS=""
+ot_take_in_base() {
+  local base out rc=0
+  OT_TOOK_IN=""
+  _OT_CONFLICTS=""
+  base=$(_ot_sha "$OT_BASE_REF")
+  [ -n "$base" ] || jig_die "$OT_WHO: $OT_BASE_REF names no commit to take in"
+  # The tree holds the branch; its index and files are at _OT_FF_TO already (ot_open).
+  if [ -n "$_OT_FF_TO" ]; then
+    git -C "$OT_TREE" update-ref HEAD "$_OT_FF_TO" "$_OT_FF_FROM" 2>/dev/null \
+      || jig_die "$OT_WHO: could not move $OT_BRANCH to $_OT_FF_TO"
+    _OT_FF_TO=""
+  fi
+  if [ -n "$_OT_CUT" ]; then
+    out=$(git -C "$OT_TREE" switch -q -c "$OT_BRANCH" 2>&1) \
+      || jig_die "$OT_WHO: could not cut $OT_BRANCH: $out"
+    _OT_CUT=""
+  fi
+  out=$(git -C "$OT_TREE" merge -q --no-commit --no-ff "$base" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    _OT_CONFLICTS=$(git -C "$OT_TREE" -c core.quotepath=off diff --name-only --diff-filter=U 2>/dev/null)
+    git -C "$OT_TREE" merge --abort >/dev/null 2>&1 || true
+    [ -n "$_OT_CONFLICTS" ] || jig_die "$OT_WHO: could not take $OT_BASE in: $out"
+    return 1
+  fi
+  # The tip had the base already: nothing taken in, and the write goes on as it was.
+  git -C "$OT_TREE" rev-parse --verify --quiet MERGE_HEAD >/dev/null 2>&1 || return 0
+  # shellcheck disable=SC2034 # read by knowledge.sh for its commit message
+  OT_TOOK_IN=$base
 }
 
 # _ot_capture <command...> — run a ship step that may die, in a subshell from the
@@ -1170,4 +1259,217 @@ ot_answer_text() {
   printf 'pull request: %s\n' "${OT_PR:-none}"
   if [ "$OT_MERGED" = 1 ]; then printf 'merged: yes\n'; else printf 'merged: no\n'; fi
   [ -z "$OT_NOTE" ] || printf 'note: %s\n' "$OT_NOTE"
+}
+
+# --- whether `jig spec drop` would be taken --------------------------------------
+
+# ot_spec_drop_refusal <task-id> [state|all] — why `jig spec drop <task-id> --json`
+# would refuse, in OT_SD_MSG (the command's own sentence, empty when nothing
+# refuses) and the code it refuses with in OT_SD_CODE (empty: `failed`). The one guard of
+# that command and of the table's `drop-item` row (adr-20261015): `state` is what the
+# command asks of the task and the level before it fetches or opens a tree; `all` adds
+# what it would find in the clone's local refs — the roadmap on the base (the default
+# branch, or the open epic), the spec's own branch when this clone has it, who holds that
+# branch and whether it carries commits no write made — and is the table's. Local
+# reads only: no fetch, no ls-remote. `all` may refuse less than the command (it cannot
+# see origin's answer), never more.
+OT_SD_MSG=""
+OT_SD_CODE=""
+ot_spec_drop_refusal() {
+  local tid="$1" depth="${2:-all}" tdir st from sid rc=0 level rel default ref text line base branch holder has_origin
+  local default_ref rec_base_ref=""
+  OT_SD_MSG="" OT_SD_CODE=""
+  # No path is built from a name that is not an id (RULES.md).
+  if ! jig_valid_id "$tid"; then
+    OT_SD_CODE="usage"
+    OT_SD_MSG="spec drop: invalid task id: $tid"
+    return 0
+  fi
+  tdir="$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks/$tid"
+  if [ ! -f "$tdir/task.md" ]; then
+    OT_SD_CODE="not-found"
+    OT_SD_MSG="spec drop: unknown task: $tid (no $JIG_AI_DIR/workspace/tasks/$tid/task.md)"
+    return 0
+  fi
+  # Read in this shell (jig_task_state_var): the table asks this of every task it
+  # lists, and a live task is answered here without starting a process.
+  jig_task_state_var st "$tid" status
+  jig_task_state_var from "$tid" archived_from
+  case "$st:$from" in
+    abandoned:* | archived:abandoned) ;;
+    *)
+      OT_SD_CODE="wrong-status"
+      OT_SD_MSG="spec drop: $tid is ${st:-unknown}; abandon it first: jig task abandon $tid --reason <text>"
+      return 0 ;;
+  esac
+  jig_spec_link_v sid "$tdir/task.md" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    OT_SD_MSG="spec drop: $tid links to more than one spec in its task.md"
+    return 0
+  fi
+  if [ -z "$sid" ]; then
+    OT_SD_CODE="not-found"
+    OT_SD_MSG="spec drop: $tid is not linked to a spec"
+    return 0
+  fi
+  if ! jig_agent_git_v level; then
+    OT_SD_MSG="spec drop: invalid agent.git: $level (expected none|commit|push|pr|merge)"
+    return 0
+  fi
+  if [ "$level" = none ]; then
+    OT_SD_CODE="git-not-allowed"
+    OT_SD_MSG=$(_ot_msg_git_not_allowed "spec drop")
+    return 0
+  fi
+  [ "$depth" = all ] || return 0
+
+  rel="$JIG_AI_DIR/specs/$sid/roadmap.md"
+  cfg_v default git.base_branch main
+  base=$default
+  jig_base_ref_v ref "$default"
+  default_ref=$ref
+  text=$(jig_git_show_path "$ref" "$rel" 2>/dev/null) || text=""
+  rc=0
+  line=$(printf '%s\n' "$text" | jig_spec_epic -) || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    OT_SD_MSG=$(_ot_msg_epics_many "spec item" "$rel")
+    return 0
+  fi
+  case "$line" in
+    *' open')
+      base=${line% open}
+      if ! git check-ref-format --branch "$base" >/dev/null 2>&1; then
+        OT_SD_MSG=$(_ot_msg_epic_name_rejected "spec item" "$base")
+        return 0
+      fi
+      jig_base_ref_v ref "$base"
+      if [ -z "$ref" ]; then
+        OT_SD_CODE="epic-missing"
+        OT_SD_MSG=$(_ot_msg_epic_missing "spec item" "$sid" "$base")
+        return 0
+      fi
+      text=$(jig_git_show_path "$ref" "$rel" 2>/dev/null) || text="" ;;
+  esac
+
+  # The branch the write goes on: the record's, else the spec's own.
+  branch="spec/$sid"
+  local recorded=0 tip remote_tip
+  if ot_record_read "spec:$sid"; then
+    branch=$OT_R_BRANCH
+    recorded=1
+  fi
+  tip=$(_ot_sha "refs/heads/$branch")
+  if [ -n "$tip" ]; then
+    # As ot_judge reads the tip: origin's when it is ahead of the local branch.
+    remote_tip=$(_ot_sha "refs/remotes/origin/$branch")
+    if [ -n "$remote_tip" ] && _ot_ancestor "$tip" "$remote_tip"; then
+      tip=$remote_tip
+    fi
+    holder=$(_ot_holder "$branch")
+    if [ -n "$holder" ]; then
+      OT_SD_CODE="branch-checked-out"
+      OT_SD_MSG=$(_ot_msg_checked_out "spec drop" "$branch" "$holder")
+      return 0
+    fi
+    # A write that still waits for another base (an epic opened or finished since):
+    # the command refuses to stack on it (_ot_resolve). Judged here from the record and
+    # local refs as ot_judge judges it: not merged or ended by the record's word, and
+    # not landed, which is its tip in the base this edit goes into, in the default
+    # branch or in the base the record names, or every path it touched reading the same
+    # there (a squash merge). A write that landed in its own base waits for nothing, so
+    # the row does not hold it. (_ot_resolve adds the pull request's word, for a write
+    # that is on top; this row does not ask the forge.) A forge that closed it since is
+    # not seen, so the row may withhold what the command would take, never the other way
+    # round. A squash merge is read only for a write with no pull request recorded:
+    # ot_judge asks touched_equal after the forge, and a pull request the forge merged
+    # without this tip (a local commit above what was pushed) is spent there, so with one
+    # recorded the row, which asks no forge, would offer what the command refuses.
+    if [ "$recorded" = 1 ] && [ -n "$OT_R_BASE" ] && [ "$OT_R_BASE" != "$base" ] \
+      && [ "$OT_R_MERGED" != 1 ] && [ -z "$OT_R_ENDED" ]; then
+      jig_base_ref_v rec_base_ref "$OT_R_BASE"
+      if ! { _ot_ancestor "$tip" "$ref" \
+        || { [ -n "$default_ref" ] && _ot_ancestor "$tip" "$default_ref"; } \
+        || { [ -n "$rec_base_ref" ] && _ot_ancestor "$tip" "$rec_base_ref"; } \
+        || { [ -z "$OT_R_PR" ] && ot_touched_equal "$tip" "$ref"; } \
+        || { [ -z "$OT_R_PR" ] && [ -n "$rec_base_ref" ] && ot_touched_equal "$tip" "$rec_base_ref"; }; }; then
+        OT_SD_CODE="write-still-waits"
+        OT_SD_MSG=$(_ot_msg_still_waits "spec drop" "$branch" "$OT_R_BASE" "$OT_R_PR" "$base" "spec:$sid")
+        return 0
+      fi
+    fi
+    if _ot_sd_other_commits "$branch" "$ref" "$default_ref"; then
+      OT_SD_CODE="branch-has-other-commits"
+      has_origin=0
+      ! git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1 || has_origin=1
+      OT_SD_MSG=$(_ot_msg_other_commits "spec drop" "$branch" "$has_origin")
+      return 0
+    fi
+    text=$(jig_git_show_path "refs/heads/$branch" "$rel" 2>/dev/null) || text=""
+    ot_spec_drop_roadmap_check "$sid" "$tid" "$branch" - <<<"$text"
+    [ -z "$OT_SD_MSG" ] || return 0
+  fi
+  # The base's own copy, which the write is cut from or caught up to.
+  text=$(jig_git_show_path "$ref" "$rel" 2>/dev/null) || text=""
+  ot_spec_drop_roadmap_check "$sid" "$tid" "$base" - <<<"$text"
+}
+
+# ot_spec_drop_roadmap_check <spec> <task-id> <where> <roadmap|-> — what the roadmap
+# says of the task: OT_SD_CODE and OT_SD_MSG as above, from the one reader of the
+# grammar (jig_spec_drop_rewrite). <where> names the branch it was read on. A roadmap
+# that is empty or missing is not there. Reads only.
+# shellcheck disable=SC2034 # read by spec.sh and task.sh
+ot_spec_drop_roadmap_check() {
+  local sid="$1" tid="$2" where="$3" rc=0 body=""
+  OT_SD_MSG="" OT_SD_CODE=""
+  if [ "$4" = - ]; then
+    body=$(cat)
+    if [ -z "$body" ]; then
+      OT_SD_CODE="not-found"
+      OT_SD_MSG=$(_ot_sd_no_roadmap "$sid" "$where")
+      return 0
+    fi
+    jig_spec_drop_rewrite - "$tid" "" /dev/null >/dev/null <<<"$body" || rc=$?
+  else
+    jig_spec_drop_rewrite "$4" "$tid" "" /dev/null >/dev/null || rc=$?
+  fi
+  case "$rc" in
+    0) ;;
+    3)
+      OT_SD_CODE="not-found"
+      OT_SD_MSG="spec drop: no item in the roadmap of $sid on $where names $tid; read it again" ;;
+    4)
+      OT_SD_CODE="already-closed"
+      OT_SD_MSG="spec drop: every item in the roadmap of $sid on $where that names $tid is closed already" ;;
+    *) OT_SD_MSG="spec drop: could not read the roadmap of $sid on $where" ;;
+  esac
+}
+
+# _ot_sd_other_commits <branch> <base-ref> <default-ref> — the local branch carries
+# commits that no write of Jig's made, as far as local refs can tell: its tip is not the
+# record's, and something it holds is neither in the base, the default branch, nor
+# origin's last-seen copy of it, and it is not a squash merge of them. What
+# ot_refuse_what_is_not_jigs refuses, asked of what is here (it asks origin itself). The
+# refs come resolved, once for the whole row (either may be empty).
+_ot_sd_other_commits() {
+  local tip own refs=() r
+  tip=$(_ot_sha "refs/heads/$1")
+  [ -n "$tip" ] || return 1
+  if [ "$OT_R_BRANCH" = "$1" ] && [ "$OT_R_COMMIT" = "$tip" ]; then
+    return 1
+  fi
+  for r in "$2" "$3"; do
+    [ -z "$r" ] || refs+=("$r")
+  done
+  own=$(_ot_sha "refs/remotes/origin/$1")
+  [ -z "$own" ] || refs+=("$own")
+  [ -n "$(git -C "$JIG_PROJECT" rev-list -1 "$tip" --not ${refs[@]+"${refs[@]}"} 2>/dev/null)" ] || return 1
+  if [ -n "$2" ] && ot_touched_equal "$tip" "$2"; then
+    return 1
+  fi
+  return 0
+}
+
+# _ot_sd_no_roadmap <spec> <where> — the sentence for a spec with no roadmap to read.
+_ot_sd_no_roadmap() {
+  printf 'spec drop: no roadmap of %s on %s; a spec only in a working tree is not reachable until it is committed, and one only on an unpushed base until it is pushed' "$1" "$2"
 }

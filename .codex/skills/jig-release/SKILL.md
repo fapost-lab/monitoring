@@ -74,8 +74,9 @@ ship the declaration and cut the epic as `jig-idea` §8 says.
 ## 5. The notes
 
 When every task going in has merged — into the default branch, or into the release epic with the
-latest default branch merged into the epic — start the notes task from the freshest base and give
-it the most urgent number of the release (its lowest). It writes the notes as
+latest default branch merged into the epic — give the notes task the most urgent number of the
+release (its lowest) with `jig queue set <notes> --priority <n>`, then start it from the freshest
+base; `jig task start` refuses a task the queue's advice outranks. It writes the notes as
 [release notes](references/release-notes.md) says, raises the version, and records the commit of
 the default branch its notes describe:
 

@@ -605,6 +605,24 @@ _doctor_check_agent_git() {
   fi
 }
 
+# Whether `agent.git_staging` is usable: not shadowed by a project-layer value
+# that is never read, and not an unrecognised word (jig_staging_git_v never
+# falls back to agent.git for one). Silent while it is unset or valid: a
+# warning only where something is wrong.
+_doctor_check_agent_git_staging() {
+  local ignored value
+  ignored=$(jig_config_project_ignored | cut -f1)
+  if jig_has_line agent.git_staging "$ignored"; then
+    _doctor_warn "agent.git_staging" "set in $JIG_AI_DIR/config.yaml, ignored there" \
+      "move it to $JIG_AI_DIR/config.local.yaml"
+  fi
+  value=$(cfg agent.git_staging "")
+  if [ -n "$value" ] && ! _cfg_agent_git_level "$value"; then
+    _doctor_warn "agent.git_staging" "invalid value: $value (expected none|commit|push|pr|merge)" \
+      "set agent.git_staging to none, commit, push, pr or merge in $JIG_AI_DIR/config.local.yaml"
+  fi
+}
+
 # Whether the runtime the project's checks would meet on this machine is one
 # the project asks for (hostruntime.sh answers, from composer.json,
 # package.json and .python-version). Asked only where the checks run on the
@@ -680,6 +698,7 @@ cmd_doctor() {
       _doctor_check_config_keys
       _doctor_check_git_flow
       _doctor_check_agent_git
+      _doctor_check_agent_git_staging
       _doctor_check_host_runtime
     else
       _doctor_warn "project" "not initialised" "jig init"

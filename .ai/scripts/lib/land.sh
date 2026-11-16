@@ -21,6 +21,54 @@ _LAND_RC=0
 # origin that keeps moving.
 _LAND_PUSHES=3
 
+# A person's landing (`jig task land <id> --by human`, adr-20261114-a-persons-pull-request-action-does-not-read-agent-git):
+# 1 when the person pressed the button, not the agent. The git level is then not
+# read (the caller did not), an unattended run's silence is not applied (the
+# person is the one who answers), a conflict is never started as a direct merge
+# (that is the agent's) and a refusal is a coded one (jig_fail).
+_LAND_BY_HUMAN=0
+
+# The revision a person's landing claims right before it first sends anything
+# to the forge (jig_revision_claim); empty: no claim.
+_LAND_EXPECTED=""
+
+# The failure code beside each refusal land_task leaves as a `not landed:` line
+# (schemas/json.md, "Failure codes"), empty when it landed; and, when it did,
+# `landed` or `already-landed`.
+_LAND_CODE=""
+_LAND_OUTCOME=""
+
+# _land_refuse <code> <message> — end the landing before anything was sent:
+# a coded refusal for a person's landing, jig_die for the agent's, whose texts
+# and exit codes are what they always were.
+_land_refuse() {
+  if [ "$_LAND_BY_HUMAN" = 1 ]; then
+    jig_fail "$1" "$2"
+  fi
+  jig_die "$2"
+}
+
+# _land_nobody_answers <id> — an unattended run waits for nobody; a person who
+# pressed the button is somebody.
+_land_nobody_answers() {
+  [ "$_LAND_BY_HUMAN" != 1 ] || return 1
+  _task_nobody_answers "$1"
+}
+
+# _land_claim <who> — claim the revision a person's landing was asked against,
+# right before the first thing goes to the forge: a stale one stops here, with
+# nothing sent.
+_land_claim() {
+  local who="$1" rc=0
+  [ "$_LAND_BY_HUMAN" = 1 ] && [ -n "$_LAND_EXPECTED" ] || return 0
+  jig_revision_claim "$_LAND_EXPECTED" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) jig_fail stale-revision "$who: the clone changed since revision $_LAND_EXPECTED; read again and retry" ;;
+    *) jig_die "$who: cannot claim the clone revision in $(jig_revision_dir)" ;;
+  esac
+}
+
 # land_tree_path <id> — the temporary worktree a direct merge of <id> is made
 # in: `.land-<id>` under git.worktree_root, beside the task worktrees
 # (ADR-0029) and outside `.git/`, so the agent edits it with its ordinary
@@ -219,34 +267,50 @@ land_abort() {
 # land now by `git.staging_review`. Sets _LAND_RC and returns 1 when it may not
 # (S7 or S8 said); 0 when it may.
 _land_approval_gate() {
-  local who="$1" id="$2" pr="$3" without="$4" review approval why
+  local who="$1" id="$2" pr="$3" without="$4" review approval pending why
   review=$(jig_staging_review) || review=ask
   if [ "$review" = none ]; then
     printf '%s: landing %s without an approval: git.staging_review is none\n' "$who" "$pr"
     _LAND_WITHOUT="git.staging_review is none"
     return 0
   fi
-  approval=$(jig_pr_approval "$pr")
+  jig_pr_approval_v approval pending "$pr"
   [ "$approval" != approved ] || return 0
   case "$approval" in
     changes) why="changes requested" ;;
+    waiting)
+      if [ -n "$pending" ]; then
+        _jig_list_words_v why "$pending"
+        why="waiting for $why"
+      else
+        why="waiting for more approvals"
+      fi ;;
     none) why="no review" ;;
     *) why="the forge cannot say" ;;
   esac
   if [ "$without" = 1 ]; then
     printf '%s: landing %s without an approval (%s), at the person'"'"'s word (--without-review)\n' "$who" "$pr" "$why"
     _LAND_WITHOUT="at the person's word"
-    : > "$(_land_without_file "$id")"
+    # Kept for the conflict stop and its `--resolved`: a person's landing has neither.
+    [ "$_LAND_BY_HUMAN" = 1 ] || : > "$(_land_without_file "$id")"
     return 0
   fi
   if [ "$review" = require ]; then
     printf 'not landed: %s is not approved (%s) and git.staging_review is require; %s waits for review\n' "$pr" "$why" "$id"
     _LAND_RC=0
+    _LAND_CODE=not-approved
     return 1
   fi
-  if _task_nobody_answers "$id"; then
+  if _land_nobody_answers "$id"; then
     printf 'not landed: %s is not approved (%s) and an unattended run waits; %s waits for review\n' "$pr" "$why" "$id"
     _LAND_RC=0
+    _LAND_CODE=not-approved
+    return 1
+  fi
+  if [ "$_LAND_BY_HUMAN" = 1 ]; then
+    printf 'not landed: %s is not approved (%s); land it without review, or wait for review\n' "$pr" "$why"
+    _LAND_RC=0
+    _LAND_CODE=not-approved
     return 1
   fi
   printf '%s: %s is not approved (%s). Ask the person: land without review — jig task land %s --without-review — or wait for review (the pull request stays open)\n' "$who" "$pr" "$why" "$id"
@@ -266,26 +330,35 @@ _LAND_WITHOUT=""
 # 3 a person decides, 5 a conflict waits in the temporary tree.
 land_task() {
   local who="$1" id="$2" without="$3" resolved="$4" note="$5"
-  local staging flow base base_branch land branch pr state failed sha local_tip ahead
+  local staging flow base base_branch land branch pr state failed sha local_tip ahead why
   _LAND_RC=0
   _LAND_WITHOUT=""
+  _LAND_CODE=""
+  _LAND_OUTCOME=""
 
   # The flow, the branch and the pull request: all local reads.
   if ! staging=$(jig_staging_in_use); then
     flow=$(jig_git_flow) || true
-    jig_die "$who: $id is not on the staging flow (git.flow: $flow); a task in this project lands with jig task ship"
+    _land_refuse wrong-flow "$who: $id is not on the staging flow (git.flow: $flow); a task in this project lands with jig task ship"
   fi
   base=$(jig_task_base "$id")
   base_branch=$(cfg git.base_branch main)
   [ "$base" = "$base_branch" ] \
-    || jig_die "$who: $id is cut from $base, not $base_branch; the staging flow does not apply to it"
+    || _land_refuse wrong-flow "$who: $id is cut from $base, not $base_branch; the staging flow does not apply to it"
   land=$(jig_staging_land) || land="pr"
   branch=$(task_state_get "$id" branch)
   [ "$land" != external ] \
-    || jig_die "$who: git.staging_land is external, so CI lands ${branch:-task/$id} on $staging; Jig merges nothing there"
-  [ -n "$branch" ] || jig_die "$who: $id has not been started (no branch); run jig task start $id first"
+    || _land_refuse wrong-flow "$who: git.staging_land is external, so CI lands ${branch:-task/$id} on $staging; Jig merges nothing there"
+  [ -n "$branch" ] || _land_refuse not-shipped "$who: $id has not been started (no branch); run jig task start $id first"
   pr=$(task_state_get "$id" pr_url)
-  [ -n "$pr" ] || jig_die "$who: $id has no pull request into $staging; run jig task ship $id first"
+  [ -n "$pr" ] || _land_refuse no-pull-request "$who: $id has no pull request into $staging; run jig task ship $id first"
+  # A pull request a ship opened into another branch — the base, for a task
+  # that changes the flow itself — is not landed here, whoever asks
+  # (adr-20261114-landing-on-staging-has-its-own-git-level).
+  local into record_into=""
+  into=$(task_state_get "$id" pr_into)
+  [ -z "$into" ] || [ "$into" = "$staging" ] \
+    || { _task_other_branch_text_v why "$who" "$id" "$pr" "$into" "$staging" "$base_branch"; _land_refuse wrong-flow "$why"; }
   if [ "$resolved" = 1 ]; then
     if [ -z "$note" ] || [ ! -s "$note" ] || ! grep -q '[^[:space:]]' "$note"; then
       jig_die "$who: --resolved needs --note-file with how each conflict was resolved; it goes into the merge commit and the pull request"
@@ -293,8 +366,8 @@ land_task() {
   fi
   if [ "$without" = 1 ]; then
     [ "$(jig_staging_review || true)" != require ] \
-      || jig_die "$who: --without-review: git.staging_review is require, so $pr waits for an approval"
-    ! _task_nobody_answers "$id" \
+      || _land_refuse review-required "$who: --without-review: git.staging_review is require, so $pr waits for an approval"
+    ! _land_nobody_answers "$id" \
       || jig_die "$who: --without-review: nobody answers in an unattended run, so $pr waits for review"
   fi
 
@@ -302,10 +375,10 @@ land_task() {
   # conflict is resolved — only where it could be given now: `ask`, and
   # somebody answers.
   if [ "$without" = 0 ] && [ -f "$(_land_without_file "$id")" ] \
-    && [ "$(jig_staging_review || true)" = ask ] && ! _task_nobody_answers "$id"; then
+    && [ "$(jig_staging_review || true)" = ask ] && ! _land_nobody_answers "$id"; then
     without=1
   fi
-  if [ "$without" = 1 ]; then
+  if [ "$without" = 1 ] && [ "$_LAND_BY_HUMAN" != 1 ]; then
     _LAND_WORD_ID=$id
     _LAND_KEEP_WORD=0
     jig_on_exit '_land_word_end'
@@ -318,12 +391,38 @@ land_task() {
     jig_gh_require "$who"
   fi
 
+  # A pull request a ship of an older Jig opened has no recorded `pr_into`:
+  # the forge says where it goes, and the answer is recorded. One into any
+  # other branch is not landed, and one the forge cannot place is not either.
+  if [ -z "$into" ]; then
+    local kind
+    kind=$(jig_forge_kind 2>/dev/null || true)
+    # shellcheck source=lib/prdo.sh
+    . "$JIG_LIB/prdo.sh"
+    _PRDO_WHY=""
+    if [ -z "$kind" ] || ! _prdo_view "$kind" "$pr" || [ -z "$_PRDO_BASE" ]; then
+      _land_refuse forge-unavailable "$who: the forge could not say which branch $pr goes into${_PRDO_WHY:+ ($_PRDO_WHY)}; nothing was merged. Run again"
+    fi
+    into=$_PRDO_BASE
+    # Recorded at once for the agent, whose landing claims no revision; a
+    # person's landing writes nothing before its claim stands, so theirs is
+    # recorded after it, when the merge is sent.
+    if [ "$_LAND_BY_HUMAN" = 1 ]; then
+      record_into=$into
+    else
+      _task_rewrite_state "$(task_dir "$id")" pr_into "$into"
+    fi
+    [ "$into" = "$staging" ] \
+      || { _task_other_branch_text_v why "$who" "$id" "$pr" "$into" "$staging" "$base_branch"; _land_refuse wrong-flow "$why"; }
+  fi
+
   state=$(jig_pr_state "$pr")
   case "$state" in
     merged)
       printf '%s is already on %s (%s merged)\n' "$id" "$staging" "$pr"
+      _LAND_OUTCOME=already-landed
       return 0 ;;
-    closed) jig_die "$who: $pr is closed; ship $id again to open a new pull request into $staging" ;;
+    closed) _land_refuse pull-request-closed "$who: $pr is closed; ship $id again to open a new pull request into $staging" ;;
   esac
 
   # What leaves this machine from here is a merge, never a commit of the
@@ -333,20 +432,20 @@ land_task() {
   # The task's own gates, as before any merge.
   local refusal
   refusal=$(_task_ship_refusal "$id" 0) || exit 1
-  [ -z "$refusal" ] || jig_die "$who: ${refusal#task ship: }"
+  [ -z "$refusal" ] || _land_refuse not-ready "$who: ${refusal#task ship: }"
 
   # Origin as it is now: the staging branch, the task's branch and its base.
   jig_git_origin_account "$who" read
   if ! failed=$(jig_fetch_fresh "$staging" "$branch" "$base"); then
-    jig_die "$who: could not fetch $failed from origin; a merge into $staging needs it fresh. Nothing was merged; run again"
+    _land_refuse forge-unavailable "$who: could not fetch $failed from origin; a merge into $staging needs it fresh. Nothing was merged; run again"
   fi
   sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}" 2>/dev/null) \
-    || jig_die "$who: origin has no $branch; run jig task ship $id first"
+    || _land_refuse not-shipped "$who: origin has no $branch; run jig task ship $id first"
   local_tip=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>/dev/null || true)
   if [ -n "$local_tip" ] && [ "$local_tip" != "$sha" ]; then
     ahead=$(git -C "$JIG_PROJECT" rev-list --count "$sha..$local_tip" 2>/dev/null || printf '0')
     [ "$ahead" -eq 0 ] \
-      || jig_die "$who: $branch has $ahead commit(s) origin does not; only what was shipped lands. Run jig task ship $id first"
+      || _land_refuse not-shipped "$who: $branch has $ahead commit(s) origin does not; only what was shipped lands. Run jig task ship $id first"
   fi
 
   # The clean-branch rule: nothing of the staging branch the base did not bring.
@@ -363,6 +462,9 @@ land_task() {
   fi
   # A conflict already waiting for the agent is said again, not started over.
   if [ -n "$(_land_merge_head "$tree" 2>/dev/null)" ] && _land_tree_registered "$tree"; then
+    if [ "$_LAND_BY_HUMAN" = 1 ]; then
+      _land_refuse conflict "$who: $id conflicts with $staging and the agent is resolving it in $tree; the agent lands it: jig task land $id"
+    fi
     _land_stop_conflict "$who" "$id" "$tree" "$staging" 0
     return 0
   fi
@@ -370,14 +472,22 @@ land_task() {
   case "$(jig_pr_mergeable "$pr")" in
     draft)
       printf 'not landed: %s is a draft; a draft is never landed\n' "$pr"
+      _LAND_CODE=draft
       return 0 ;;
     unknown)
       printf 'not landed: the forge could not say whether %s merges cleanly into %s; run jig task land %s again\n' "$pr" "$staging" "$id"
+      _LAND_CODE=mergeable-unknown
       return 0 ;;
     clean)
+      _land_claim "$who"
+      [ -z "$record_into" ] || _task_rewrite_state "$(task_dir "$id")" pr_into "$record_into"
       _land_on_forge "$who" "$id" "$pr" "$sha" "$staging"
       return 0 ;;
   esac
+  # A person's landing never starts the direct merge: no temporary tree, nothing sent.
+  if [ "$_LAND_BY_HUMAN" = 1 ]; then
+    _land_refuse conflict "$who: the pull request conflicts with $staging; the agent lands it: jig task land $id, which merges it in a temporary tree and resolves the conflict"
+  fi
   # A conflict: the direct merge.
   : > "$(_land_conflicts_file "$id")"
   _land_start_merge "$who" "$id" "$tree" "$staging" "$sha"
@@ -408,7 +518,7 @@ land_clean_branch_refusal() {
   # against it, and the ship refuses that itself before it sends anything
   # (jig_ship_require_commits), as land's fetch does.
   [ -n "$staging_ref" ] \
-    || jig_die "$who: cannot tell whether $br carries commits of $staging: there is no $staging here or on origin; fetch it and run again"
+    || _land_refuse carries-staging "$who: cannot tell whether $br carries commits of $staging: there is no $staging here or on origin; fetch it and run again"
   [ -n "$base_ref" ] || return 0
   if [ "$tip" = HEAD ]; then
     file=$(git -C "$JIG_PROJECT" rev-parse --git-path MERGE_HEAD 2>/dev/null) || file=""
@@ -420,7 +530,7 @@ land_clean_branch_refusal() {
     fi
   fi
   if ! carried=$(jig_branch_carries_staging "$tip" "$base_ref" "$staging_ref" ${heads[@]+"${heads[@]}"}); then
-    jig_die "$who: cannot tell whether $br carries commits of $staging: $tip, ${base_ref:-$base} or $staging_ref names no commit here"
+    _land_refuse carries-staging "$who: cannot tell whether $br carries commits of $staging: $tip, ${base_ref:-$base} or $staging_ref names no commit here"
   fi
   [ -n "$carried" ] || return 0
   n=$(printf '%s\n' "$carried" | awk 'NF { n++ } END { print n + 0 }')
@@ -429,9 +539,9 @@ $(printf '%s\n' "$carried" | awk 'NF { print; exit }')
 EOF
   [ "$merge" != "the merge in progress" ] || merge="the merge in progress, not committed yet"
   if [ "$merge" = - ]; then
-    jig_die "$who: $br is $what, not $base: $n commit(s) of its first-parent line are on $staging's own. A task branch stays clean until it reaches $base: only $base and clean task branches may be merged into it. Rebuild it from its own commits on $base and ship again; a conflict with $staging is resolved on $staging when the task lands"
+    _land_refuse carries-staging "$who: $br is $what, not $base: $n commit(s) of its first-parent line are on $staging's own. A task branch stays clean until it reaches $base: only $base and clean task branches may be merged into it. Rebuild it from its own commits on $base and ship again; a conflict with $staging is resolved on $staging when the task lands"
   fi
-  jig_die "$who: $br carries $n commit(s) that $base does not have, through a merge of $what into the branch ($merge). A task branch stays clean until it reaches $base: only $base and clean task branches may be merged into it. Rebuild it without that merge (its own commits on $base) and ship again; a conflict with $staging is resolved on $staging when the task lands"
+  _land_refuse carries-staging "$who: $br carries $n commit(s) that $base does not have, through a merge of $what into the branch ($merge). A task branch stays clean until it reaches $base: only $base and clean task branches may be merged into it. Rebuild it without that merge (its own commits on $base) and ship again; a conflict with $staging is resolved on $staging when the task lands"
 }
 
 # _land_on_forge <who> <id> <pr> <sha> <staging> — the clean case: the forge
@@ -445,12 +555,13 @@ _land_on_forge() {
   jig_ship_merge "$who" "$pr" "$sha" merge-commit > "$out"
   while IFS= read -r line; do
     case "$line" in
-      "not merged: "*) printf 'not landed: %s\n' "${line#not merged: }" ;;
+      "not merged: "*) printf 'not landed: %s\n' "${line#not merged: }"; _LAND_CODE=$JIG_SHIP_NOT_MERGED_CODE ;;
       "merged "*) ;;
       *) printf '%s\n' "$line" ;;
     esac
   done < "$out"
   if [ "$JIG_SHIP_MERGED" = 1 ]; then
+    _LAND_OUTCOME=landed
     printf 'landed %s on %s (merged on the forge)\n' "$pr" "$staging"
     [ -z "$_LAND_WITHOUT" ] || _land_comment "$who" "$id" "$pr" "$staging" ""
   fi
@@ -499,12 +610,14 @@ _land_push() {
     if [ "$kind" != stale ]; then
       printf 'not landed: origin refused the push to %s: %s. Nothing was forced; %s stays open. The merge with the resolution is in %s: a person pushes it with their own rights or lands the pull request on the forge; jig task land %s --abort removes it\n' \
         "$staging" "$(_jig_ship_first_line "$out")" "$pr" "$tree" "$id"
+      _LAND_CODE=forge-refused
       _LAND_RC=3
       return 0
     fi
     if [ "$try" -ge "$_LAND_PUSHES" ]; then
       _land_tree_remove "$tree"
       printf 'not landed: %s moved under %s pushes in a row; %s stays open; run jig task land %s again\n' "$staging" "$_LAND_PUSHES" "$pr" "$id"
+      _LAND_CODE=forge-refused
       _LAND_RC=3
       return 0
     fi
@@ -521,6 +634,7 @@ _land_push() {
     _land_commit "$who" "$id" "$tree" "$staging"
   done
   merged=$(git -C "$tree" rev-parse HEAD)
+  _LAND_OUTCOME=landed
   _land_tree_remove "$tree"
   # Origin's staging branch, as this push left it.
   git -C "$JIG_PROJECT" update-ref "refs/remotes/origin/$staging" "$merged" 2>/dev/null || true

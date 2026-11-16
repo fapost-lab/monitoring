@@ -9,6 +9,11 @@
 # (Git Bash on Windows copies) a copy carrying a .jig-global marker, which is
 # how a later run knows the copy is Jig's to replace or remove.
 #
+# Removing it is how a person turns it off. Beside each skill it places, Jig
+# leaves a record (.jig-pr-review.placed in the same skills directory); a
+# record with no skill beside it means the person removed the skill, and no
+# later run puts it back until the record is deleted too.
+#
 # Sourced by scripts/lib/self-update.sh and by install.sh from the checkout it
 # just installed, before any other library exists for it, so it uses nothing
 # but bash and the commands git needs anyway: no common.sh helper.
@@ -16,6 +21,26 @@
 
 JIG_GLOBAL_SKILL=jig-pr-review
 JIG_GLOBAL_SKILL_MARKER=.jig-global
+JIG_GLOBAL_SKILL_RECORD=.jig-pr-review.placed
+
+# jig_global_skill_record <path> — the record that says Jig placed the skill at
+# <path>: a file beside it, in the same skills directory, never inside it — a
+# record inside would go with the skill it is meant to outlive.
+jig_global_skill_record() {
+  printf '%s/%s\n' "$(dirname "$1")" "$JIG_GLOBAL_SKILL_RECORD"
+}
+
+# _jig_global_skill_remember <path> — write the record for <path>, once. A
+# record that cannot be written costs only the opt-out, never the skill.
+_jig_global_skill_remember() {
+  local record
+  record=$(jig_global_skill_record "$1")
+  [ -f "$record" ] && return 0
+  printf '%s\n' \
+    "Jig placed $JIG_GLOBAL_SKILL in this directory." \
+    "Remove $JIG_GLOBAL_SKILL and Jig will not put it back; delete this file too to have it placed again." \
+    > "$record" 2>/dev/null || true
+}
 
 # jig_global_skill_targets — one line per runtime present for this user: the
 # path the skill goes to. Nothing for a runtime whose own directory is absent:
@@ -109,7 +134,9 @@ _jig_global_skill_copy() {
 # jig_global_skill_place <source> <version> — place or refresh the skill for
 # every runtime present. One line per path on stdout: `pr-review skill:
 # <what> <path>`. Never fails the caller: a path it cannot write is reported
-# and the next one tried, and foreign content is left exactly as it was.
+# and the next one tried, and foreign content is left exactly as it was. A
+# path that is empty while its record is there was emptied by the person:
+# it is reported and left empty.
 jig_global_skill_place() {
   local source="$1" version="$2" path owner dir
   [ -d "$source/skills/$JIG_GLOBAL_SKILL" ] || return 0
@@ -119,20 +146,28 @@ jig_global_skill_place() {
     dir=$(dirname "$path")
     case "$owner" in
       link)
+        _jig_global_skill_remember "$path"
         printf 'pr-review skill: linked %s\n' "$path"
         ;;
       foreign)
         printf 'pr-review skill: left alone %s (not installed by Jig)\n' "$path"
         ;;
       none|copy)
+        if [ "$owner" = none ] && [ -f "$(jig_global_skill_record "$path")" ]; then
+          printf 'pr-review skill: removed by you, left out %s (delete %s to have it placed again)\n' \
+            "$path" "$(jig_global_skill_record "$path")"
+          continue
+        fi
         if ! mkdir -p "$dir" 2>/dev/null; then
           printf 'pr-review skill: could not create %s\n' "$dir"
           continue
         fi
         if [ "$owner" = none ] && _jig_global_skill_links_work "$dir" \
           && ln -s "$source/skills/$JIG_GLOBAL_SKILL" "$path" 2>/dev/null; then
+          _jig_global_skill_remember "$path"
           printf 'pr-review skill: linked %s\n' "$path"
         elif _jig_global_skill_copy "$source" "$path" "$version"; then
+          _jig_global_skill_remember "$path"
           printf 'pr-review skill: copied %s (%s)\n' "$path" "$version"
         else
           printf 'pr-review skill: could not write %s\n' "$path"
