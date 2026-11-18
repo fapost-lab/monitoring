@@ -1306,12 +1306,21 @@ _hk_branch_forge_merged() {
 # together, in one lease push after the loop (jig_branches_leave_origin): a
 # run makes two network calls however many branches it deletes (issue #317).
 #
+# A branch that has not landed is still swept when it is a superseded upgrade
+# branch (adr-20261117-a-superseded-upgrade-branch-leaves-without-landing):
+# `jig/upgrade-<v>[-<n>]` whose manifest records <v> while the base already
+# carries a newer Jig, and whose every commit is Jig's own upgrade commit
+# (_hk_superseded_upgrade). It goes without a landing, here at any agent.git
+# level and on origin with the same rights as a merged one; its open pull
+# request is closed with a comment first, only at agent.git pr or above. A
+# commit that is not Jig's keeps the branch, named, local and origin alike.
+#
 # Only in the clone's main checkout: a worktree borrows `tasks/`, finds no
 # workspace of its own, and would take every task's branch for an orphan.
 # Off with git.delete_merged_branches: false; nothing remote below agent.git,
 # autopilot.git or agent.git_staging push, without housekeeping.fetch, on a dry run, or without origin.
 _hk_branch_sweep() {
-  local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 heads="" b tip sha merged landed have_local have_track rsha out origin_go=()
+  local dry="$1" keep="$2" lvl def_ref remote_ok=0 remote_rights=0 pr_rights=0 heads="" b tip sha merged landed have_local have_track rsha out origin_go=()
   cfg_bool git.delete_merged_branches true || return 0
   [ "$(jig_config_clone_root)" = "$JIG_PROJECT" ] || return 0
   _JIG_RECORDED_READ=0
@@ -1326,6 +1335,9 @@ _hk_branch_sweep() {
   for lvl in "$(jig_agent_git 2>/dev/null || true)" "$(cfg autopilot.git "" 2>/dev/null || true)" "$(cfg agent.git_staging "" 2>/dev/null || true)"; do
     case "$lvl" in
       push | pr | merge) remote_rights=1 ;;
+    esac
+    case "$lvl" in
+      pr | merge) pr_rights=1 ;;
     esac
   done
   # Named here, in this shell: the branch deletions below run in `$(...)`.
@@ -1354,7 +1366,12 @@ _hk_branch_sweep() {
         landed=1
       fi
     fi
-    [ "$landed" = 1 ] || continue
+    if [ "$landed" != 1 ]; then
+      case "$b" in
+        jig/upgrade-*) _hk_superseded_upgrade "$dry" "$b" "$def_ref" "$remote_ok" "$remote_rights" "$pr_rights" "$heads" ;;
+      esac
+      continue
+    fi
     have_local=0
     have_track=0
     git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$b" && have_local=1
@@ -1409,6 +1426,183 @@ _hk_branch_sweep() {
   return 0
 }
 
+# _hk_superseded_upgrade <dry> <branch> <base-ref> <remote-ok> <remote-rights> <pr-rights> <heads>
+# — the sweep's path for an upgrade branch that has not landed: delete it,
+# here and on origin, when the base carries a newer Jig and only Jig's own
+# upgrade commits are on it (jig_upgrade_superseded and
+# jig_upgrade_commits_are_jigs, common.sh). Runs in the sweep's shell: origin's
+# deletion is added to the sweep's `origin_go`, which its one lease push after
+# the loop carries out. Each copy is judged by its own commits; a commit that
+# is not Jig's keeps both, with a line that names it.
+#
+# Here: `update-ref -d` with the checked tip as the old value, so a branch
+# that moved since is not deleted. On origin: only where ls-remote saw the
+# branch at a commit this clone has fetched, and only when the forge, asked
+# about this branch alone (_hk_open_prs_of), answers which pull requests are
+# open from it and onto it: the run's list holds only the newest ones, and no
+# row there is no evidence that none is open — while deleting the head of an
+# open pull request on GitHub closes it with no comment. One stacked on it
+# keeps the branch. Its own open pull request is closed first, with a
+# comment, only at agent.git pr or above and only while the pull request is at
+# origin's commit; otherwise the branch stays, and the line says what stopped
+# it. Never closes with --delete-branch: the deleting is the lease push's. A
+# dry run reads the forge, never writes it, and writes no log.
+_hk_superseded_upgrade() {
+  local dry="$1" b="$2" def_ref="$3" remote_ok="$4" remote_rights="$5" pr_rights="$6" heads="$7"
+  local tip have label what local_kept=0 trk rsha rows url first psha text stacked base="$_HK_DEFAULT_BASE" ok line
+  tip=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$b^{commit}" 2>/dev/null || true)
+  if [ -n "$tip" ] && have=$(jig_upgrade_superseded "$b" "$tip" "$def_ref"); then
+    label=$(jig_upgrade_version_at "$tip")
+    if jig_upgrade_commits_are_jigs "$def_ref" "$tip" "$label"; then
+      if [ "$dry" = 1 ]; then
+        printf 'would delete superseded branch %s\n' "$b"
+      elif git -C "$JIG_PROJECT" update-ref -d "refs/heads/$b" "$tip" >/dev/null 2>&1; then
+        git -C "$JIG_PROJECT" config --remove-section "branch.$b" >/dev/null 2>&1 || true
+        _hk_branch_say "$b" "housekeeping: deleted superseded branch $b (was ${tip:0:7}): $base carries Jig $have"
+      else
+        local_kept=1
+        _hk_branch_say "$b" "housekeeping: kept branch $b: it moved while it was being deleted"
+      fi
+    else
+      local_kept=1
+      what=$(_hk_not_jigs_what)
+      line="housekeeping: kept branch $b: superseded by Jig $have on $base, but $what; delete it yourself once nothing on it is needed"
+      if [ "$dry" = 1 ]; then printf '%s\n' "$line"; else _hk_branch_say "$b" "$line"; fi
+    fi
+  fi
+  [ "$local_kept" = 0 ] || return 0
+  [ "$remote_rights" = 1 ] || return 0
+
+  if [ "$dry" = 1 ]; then
+    cfg_bool housekeeping.fetch true || return 0
+    rsha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$b^{commit}" 2>/dev/null || true)
+    [ -n "$rsha" ] || return 0
+  else
+    [ "$remote_ok" = 1 ] || return 0
+    rsha=$(printf '%s\n' "$heads" | awk -v r="refs/heads/$b" '$2 == r && !found { print $1; found = 1 }')
+    [ -n "$rsha" ] || return 0
+    trk=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$b^{commit}" 2>/dev/null || true)
+    if [ "$trk" != "$rsha" ]; then
+      # Only a branch that would otherwise qualify by its name is worth a line.
+      [ -n "$(jig_upgrade_branch_version "$b")" ] || return 0
+      _hk_branch_say "$b" "housekeeping: kept branch $b on origin: superseded, but origin's copy is not fetched here, so what is on it cannot be checked"
+      return 0
+    fi
+  fi
+  have=$(jig_upgrade_superseded "$b" "$rsha" "$def_ref") || return 0
+  label=$(jig_upgrade_version_at "$rsha")
+  if ! jig_upgrade_commits_are_jigs "$def_ref" "$rsha" "$label"; then
+    what=$(_hk_not_jigs_what)
+    # The local line said it already when both copies are the same commit.
+    if [ "$tip" != "$rsha" ]; then
+      line="housekeeping: kept branch $b on origin: superseded by Jig $have on $base, but $what; delete it yourself once nothing on it is needed"
+      if [ "$dry" = 1 ]; then printf '%s\n' "$line"; else _hk_branch_say "$b" "$line"; fi
+    fi
+    return 0
+  fi
+  if ! rows=$(_hk_open_prs_of "$b" head) || ! stacked=$(_hk_open_prs_of "$b" base); then
+    line="housekeeping: kept branch $b on origin: the forge did not say whether a pull request is open on it"
+    if [ "$dry" = 1 ]; then printf '%s\n' "$line"; else _hk_branch_say "$b" "$line"; fi
+    return 0
+  fi
+  if [ -n "$stacked" ]; then
+    line="housekeeping: kept branch $b on origin: a pull request is stacked on it"
+    if [ "$dry" = 1 ]; then printf '%s\n' "$line"; else _hk_branch_say "$b" "$line"; fi
+    return 0
+  fi
+  if [ -n "$rows" ]; then
+    first=$(printf '%s\n' "$rows" | awk -F '\t' 'NR == 1 { print $2 }')
+    if [ "$pr_rights" != 1 ]; then
+      line="housekeeping: kept branch $b on origin: its pull request $first is open; closing it needs agent.git pr or above"
+      if [ "$dry" = 1 ]; then printf '%s\n' "$line"; else _hk_branch_say "$b" "$line"; fi
+      return 0
+    fi
+    ok=1
+    while IFS="$(printf '\t')" read -r psha url; do
+      [ "$psha" = "$rsha" ] || ok=0
+    done <<EOF
+$rows
+EOF
+    if [ "$ok" != 1 ]; then
+      line="housekeeping: kept branch $b on origin: its pull request $first is not at the checked commit"
+      if [ "$dry" = 1 ]; then printf '%s\n' "$line"; else _hk_branch_say "$b" "$line"; fi
+      return 0
+    fi
+    if [ "$dry" = 1 ]; then
+      while IFS="$(printf '\t')" read -r psha url; do
+        [ -z "$url" ] || printf 'would close pull request %s\n' "$url"
+      done <<EOF
+$rows
+EOF
+    else
+      text="Superseded: $base already carries Jig $have, newer than this upgrade ($(jig_upgrade_branch_version "$b")). Closed by Jig housekeeping, which also deletes the branch; restore it from this pull request if anything on it is still needed."
+      while IFS="$(printf '\t')" read -r psha url; do
+        if ! _hk_close_pull_request "$b" "$url" "$text"; then
+          _hk_branch_say "$b" "housekeeping: kept branch $b on origin: its pull request $url could not be closed"
+          return 0
+        fi
+        printf 'housekeeping: closed pull request %s: superseded by Jig %s\n' "$url" "$have"
+        _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=close-pr"
+      done <<EOF
+$rows
+EOF
+    fi
+  fi
+  if [ "$dry" = 1 ]; then
+    printf 'would delete superseded branch %s on origin, if it is still at the checked commit\n' "$b"
+    return 0
+  fi
+  origin_go+=("$b" "$rsha")
+}
+
+# _hk_open_prs_of <branch> <head|base> — the open pull requests (merge
+# requests) from <branch> (head) or onto it (base), asked of the forge for this
+# branch alone, one `<head-commit>\t<url>` per line; nothing when none is
+# open. Exit 1 when the run has no forge that answered, or this question fails:
+# then nothing is known, and the caller keeps the branch.
+_hk_open_prs_of() {
+  local out flag
+  case "$_HK_FORGE_KIND" in
+    github)
+      [ "$2" = head ] && flag=--head || flag=--base
+      out=$(jig_gh pr list "$flag" "$1" --state open --limit 100 \
+        --json headRefName,baseRefName,headRefOid,url \
+        --jq '.[] | "\(.headRefName)\t\(.baseRefName)\t\(.headRefOid)\t\(.url)"' 2>/dev/null) || return 1
+      ;;
+    gitlab)
+      [ "$2" = head ] && flag=--source-branch || flag=--target-branch
+      out=$(glab mr list "$flag" "$1" --per-page 100 --output json 2>/dev/null) || return 1
+      out=$(printf '%s\n' "$out" | jig_glab_fields source_branch target_branch sha web_url@/merge_requests/)
+      ;;
+    *) return 1 ;;
+  esac
+  # The forge's filter, asked again here: the head or base must be <branch> exactly.
+  printf '%s\n' "$out" | awk -F '\t' -v b="$1" -v w="$2" '
+    $1 == "" { next }
+    (w == "head" && $1 == b) || (w == "base" && $2 == b) { print $3 "\t" $4 }'
+}
+
+# _hk_not_jigs_what — in words, what jig_upgrade_commits_are_jigs found that is
+# not Jig's (JIG_UPGRADE_NOT_JIGS).
+_hk_not_jigs_what() {
+  if [ -n "$JIG_UPGRADE_NOT_JIGS" ]; then
+    printf "commit %s on it is not Jig's upgrade\n" "${JIG_UPGRADE_NOT_JIGS:0:7}"
+  else
+    printf "it holds no commit of Jig's upgrade\n"
+  fi
+}
+
+# _hk_close_pull_request <branch> <url> <comment> — close the open pull request
+# (merge request) of <branch> with a comment, on the forge the run asked.
+# Closing only: the branch is deleted by the sweep's own push, never by the forge.
+_hk_close_pull_request() {
+  case "$_HK_FORGE_KIND" in
+    github) jig_gh pr close "$2" --comment "$3" >/dev/null 2>&1 ;;
+    gitlab) glab mr note "$1" -m "$3" >/dev/null 2>&1 && glab mr close "$1" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 # _hk_branch_say <branch> <lines> — print what jig_branch_leave or
 # jig_branches_leave_origin said about <branch>, and log each outcome.
 _hk_branch_say() {
@@ -1417,6 +1611,7 @@ _hk_branch_say() {
     [ -n "$line" ] || continue
     printf '%s\n' "$line"
     case "$line" in
+      *": deleted superseded branch $b "*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=delete" ;;
       *": deleted branch $b on origin") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=delete" ;;
       *": deleted branch $b") _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=local action=delete" ;;
       *": kept branch $b on origin"*) _hk_log "$(date -u +%Y-%m-%dT%H:%M:%SZ) branch=$b where=origin action=keep" ;;

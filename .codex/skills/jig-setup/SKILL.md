@@ -55,6 +55,12 @@ their own file is answered by `config unset` too — say that the key then answe
    `none` — it leaves the change for you to commit (default); `commit`; `push`; `pr` — it
    commits, pushes and opens the pull request, and you review and merge there; `merge` — see
    below. Recommend `pr` when `gh` or `glab` is installed and signed in, else `commit`.
+   **1a. Upgrades** (`upgrade.merge`), asked right after it. "When Jig upgrades this project's Jig,
+   may it merge its own pull request once CI is green, whatever you chose above?" `agent` — it
+   builds the upgrade in its own tree, pushes it, opens the pull request and merges it on green CI,
+   never past branch protection (default); `human` — it follows question 1 and never merges. Say
+   what it changes: your checkout is not touched either way. Recommend the default, `human` for
+   someone who wants to read every upgrade.
 2. **Merging** — only if they want more than `pr`. Before asking, explain: with `merge` the
    agent also merges its own pull request once CI ran and every check passed, never past
    branch protection or a required review, never a draft; the change then goes wherever the

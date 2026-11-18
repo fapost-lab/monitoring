@@ -5,8 +5,9 @@ description: Bring a project's copy of Jig up to the version on this machine —
 
 # jig-upgrade — one project, up to date
 
-`jig upgrade` does the work and ships it on a branch of its own, as far as `agent.git` allows
-([upgrading](https://jig.fapost.in/upgrading)). What it leaves is yours: the tool on the machine,
+`jig upgrade` does the work in Jig's own tree, ships it on a branch of its own and, with
+`upgrade.merge: agent` (the default), merges it on green CI; with `human` it goes as far as
+`agent.git` allows ([upgrading](https://jig.fapost.in/upgrading)). What it leaves is yours: the tool on the machine,
 a refusal to resolve, and the steps a release asks for by hand.
 
 ## 1. Look
@@ -40,9 +41,10 @@ project runs the newest Jig, and you stop.
 ```
 
 Each line of `would_stop` names its remedy; the remedy is the one that line names, not one you
-pick. Do it yourself only where it touches nothing of anyone else's: `jig verify` running here —
-wait for it and look again. The others are the person's: uncommitted changes, a started task's
-branch checked out here, the `.gitattributes` lines (the team's file). Quote the line and wait.
+pick. Where the run works in Jig's own tree only the `.gitattributes` lines can appear. Otherwise,
+do it yourself only where it touches nothing of anyone else's: `jig verify` running here — wait for
+it and look again. The others are the person's: uncommitted changes, a started task's branch
+checked out here, the `.gitattributes` lines (the team's file). Quote the line and wait.
 Their yes allows the remedy that line names and nothing more; stashing or committing their
 changes is never yours, yes or no. On autopilot without questions, stop there and report it.
 
@@ -55,8 +57,10 @@ changes is never yours, yes or no. On autopilot without questions, stop there an
 `outcome`: `upgraded` or `linked` — go on; `staged` — the change waits for the person's commit
 (`git commit -F .ai/runtime/upgrade/message`, as the run printed): name it and go on;
 `incomplete` — run it once more on the same branch, and report if it is still incomplete;
-`nothing-to-do` — done. `git` says how far it went: the pull request and whether it was merged.
-Never push, open or merge it yourself: the run did all that `agent.git` allows.
+`nothing-to-do` — done. `git` says how far it went: the pull request, whether it was merged
+(`merged`; else `not_merged.reason`), and what became of the base here (`base`). When it was not
+merged, running it again carries the open pull request on; never merge it yourself. Never push,
+open or merge it yourself: the run did all that the settings allow.
 
 A refusal is `error.code`: `upgrade-blocked` — back to §3; `failed` — report its message as it is.
 A failure after the commit leaves the commit and the branch; the push or pull request is then the
@@ -70,5 +74,6 @@ a tool a check needs) — do it when the person's request covers it, otherwise n
 
 ## 6. Report
 
-From and to, the pull request and whether it merged, each manual step and whether you did it,
+From and to, the pull request and whether it merged (or why not), what became of the base branch
+(`next:` lines; the person's own branch takes the upgrade when it next merges the base), each manual step and whether you did it,
 and what is still the person's. Several projects: one at a time, each in its own checkout.

@@ -360,10 +360,27 @@ ot_begin() {
   fi
   _OT_HEADS_STATE=""
   _OT_HELD_STATE=""
+  ot_lock_and_sweep "$OT_WHO"
+}
+
+# ot_lock_and_sweep <who> — the level-free start every user of Jig's tree shares: take
+# the clone's lock (refused write-busy), sweep a tree a killed run left, and see to it
+# that whatever ends the command gives the tree and the lock back (ot_close). A write
+# calls it through ot_begin, after its own checks; `jig upgrade` calls it directly, since
+# the rules of a write's level (`none` refuses) are not its own.
+ot_lock_and_sweep() {
+  OT_WHO="$1"
+  _OT_PROJECT="$JIG_PROJECT"
   # shellcheck disable=SC2016 # evaluated at exit, by design
   jig_on_exit '_ot_close'
   _ot_lock_acquire "$OT_WHO"
   ot_sweep
+}
+
+# ot_close — give the tree and the lock back now, before a long wait. Safe to call
+# again: the exit handler does.
+ot_close() {
+  _ot_close
 }
 
 # ot_fetch <branch>... — bring what is compared up to date; a failed fetch says so and
@@ -804,19 +821,14 @@ _ot_plan_move() {
   fi
 }
 
-# ot_open <wanted-branch> <base> — resolve the branch and add the tree. A branch that does
-# not exist yet is not cut here: the tree stands detached at its start until ot_commit,
-# so that a refusal in validation leaves no branch for `spec new` to trip over. On a
-# branch that exists the tree is on it, and one git says is taken elsewhere is the race
-# _ot_holder could not see. One that has to catch up stays where it is until ot_commit,
-# while the tree's files and index already show what it will be at: validation reads
-# that, and a refusal leaves no ref moved. ot_take_in_base, when a writer calls it, moves
-# or cuts the branch to origin's tip before its merge instead.
-_OT_CUT=""
-ot_open() {
-  local path out rc=0
-  _ot_resolve "$1" "$2"
-  _OT_CUT=$_OT_START
+# ot_tree_add <start> <branch> — add Jig's tree under the lock this run holds: detached
+# at <start> when it is given, else on the existing <branch>. Sets OT_TREE. What stands at
+# the path now is not this run's to use or to remove: a working tree is another writer's
+# (write-busy), and anything else is what a write that did not finish left and git will
+# not take, which no retry clears (tree-in-the-way). The one place the rules of the tree's
+# path live, for a write (ot_open) and for `jig upgrade`.
+ot_tree_add() {
+  local start="$1" branch="$2" path out rc=0
   path=$(_ot_tree_path "$JIG_PROJECT") || jig_die "$OT_WHO: cannot find the git directory"
   mkdir -p "${path%/*}" || jig_die "$OT_WHO: cannot create ${path%/*}"
   # ot_begin swept under this lock. What stands here now is not this run's to use or to
@@ -828,10 +840,10 @@ ot_open() {
     fi
     jig_fail tree-in-the-way "$OT_WHO: $path is what an unfinished write left, and git will not remove it; delete that directory, then try again"
   fi
-  if [ -n "$_OT_START" ]; then
-    out=$(git -C "$JIG_PROJECT" worktree add -q --detach "$path" "$_OT_START" 2>&1) || rc=$?
+  if [ -n "$start" ]; then
+    out=$(git -C "$JIG_PROJECT" worktree add -q --detach "$path" "$start" 2>&1) || rc=$?
   else
-    out=$(git -C "$JIG_PROJECT" worktree add -q "$path" "$OT_BRANCH" 2>&1) || rc=$?
+    out=$(git -C "$JIG_PROJECT" worktree add -q "$path" "$branch" 2>&1) || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     case "$out" in
@@ -843,12 +855,28 @@ ot_open() {
   if [ "$rc" -ne 0 ] && [ ! -f "$path/.git" ]; then
     case "$out" in
       *"already"*"checked out"* | *"already used by worktree"*)
-        jig_fail branch-checked-out "$OT_WHO: $OT_BRANCH was checked out elsewhere just now; try again: $out" ;;
+        jig_fail branch-checked-out "$OT_WHO: $branch was checked out elsewhere just now; try again: $out" ;;
     esac
-    jig_die "$OT_WHO: could not add a tree for $OT_BRANCH: $out"
+    jig_die "$OT_WHO: could not add a tree for $branch: $out"
   fi
   _OT_TREE_MADE=$path
   OT_TREE=$(cd -P "$path" && pwd -P) || jig_die "$OT_WHO: cannot resolve $path"
+}
+
+# ot_open <wanted-branch> <base> — resolve the branch and add the tree. A branch that does
+# not exist yet is not cut here: the tree stands detached at its start until ot_commit,
+# so that a refusal in validation leaves no branch for `spec new` to trip over. On a
+# branch that exists the tree is on it, and one git says is taken elsewhere is the race
+# _ot_holder could not see. One that has to catch up stays where it is until ot_commit,
+# while the tree's files and index already show what it will be at: validation reads
+# that, and a refusal leaves no ref moved. ot_take_in_base, when a writer calls it, moves
+# or cuts the branch to origin's tip before its merge instead.
+_OT_CUT=""
+ot_open() {
+  local out
+  _ot_resolve "$1" "$2"
+  _OT_CUT=$_OT_START
+  ot_tree_add "$_OT_START" "$OT_BRANCH"
   if [ -n "$_OT_FF_TO" ]; then
     out=$(git -C "$OT_TREE" read-tree -m -u HEAD "$_OT_FF_TO" 2>&1) \
       || jig_die "$OT_WHO: could not bring the tree to $_OT_FF_TO: $out"
