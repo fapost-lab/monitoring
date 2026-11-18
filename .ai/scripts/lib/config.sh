@@ -22,7 +22,7 @@
 # answer
 # *only* from this list, never falling back to the project layer the way every
 # other key here does.
-JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.git_staging agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
+JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_ttl housekeeping.abandoned_ttl housekeeping.stale_after checkout.busy_ttl verify.busy_ttl git.worktree_root git.delete_merged_branches agent.git autopilot.git agent.git_staging agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge upgrade.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
 
 # Keys whose project-layer value `cfg` never reads at all: only the local
 # file and the default answer. A key belongs here, rather than merely in
@@ -47,6 +47,12 @@ JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_t
 # release — an epic's final pull request, or a task that raises the version
 # (adr-20261026-a-task-that-raises-the-version-is-a-release): who merges one
 # is the owner's choice, not the project's (ADR-0040's amendment of 2026-10-04).
+# `upgrade.merge` says whether `jig upgrade` carries its own pull request to the
+# merge on this person's behalf, whatever `agent.git` says. It is a right to act,
+# so a committed value would hand it to every contributor, which is what
+# adr-20260921-agent-git-rights-are-a-local-setting refuses; a team that wants a
+# person to read upgrades keeps that in the forge's branch protection, which a
+# merge by Jig never bypasses.
 # `run.exec` says where this machine runs the project's checks — a container
 # on one laptop, the host on a colleague's — and a committed value would send
 # every contributor's checks to one person's environment
@@ -76,7 +82,7 @@ JIG_CFG_LOCAL_KEYS="housekeeping.cadence housekeeping.fetch housekeeping.trash_t
 # (adr-20261110-a-clone-names-its-github-account).
 # `jig_config_project_ignored` reports a project-layer value here so it does
 # not silently do nothing.
-JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.git_staging agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
+JIG_CFG_LOCAL_ONLY_KEYS="agent.git autopilot.git agent.git_staging agent.ci_timeout autopilot.unattended autopilot.parallel route.depth release.merge upgrade.merge run.exec run.path claude.implement_model claude.review_model codex.implement_model codex.review_model executor.implement_runtime executor.review_runtime executor.implement_model executor.review_model notify.telegram.token notify.telegram.chat_id notify.autopilot notify.interactive github.account"
 
 # Path of the config file for the current project (JIG_PROJECT must be set).
 jig_config_file() { printf '%s/%s/config.yaml\n' "$JIG_PROJECT" "$JIG_AI_DIR"; }
@@ -283,6 +289,7 @@ autopilot.unattended|false|boolean|true,false|Whether an autopilot run asks noth
 autopilot.parallel|2|number||How many tasks autopilot builds at once, 1 to 16; a run stopped for a person holds none.
 route.depth|full|choice|full,lean|How much of its route a task runs.
 release.merge|agent|choice|agent,human|Who merges a release in an unattended run.
+upgrade.merge|agent|choice|agent,human|Whether jig upgrade merges its own pull request on green CI, whatever agent.git says.
 knowledge.require_frontmatter|true|boolean|true,false|Whether jig knowledge check fails on a document without frontmatter.
 verify.full_run|local|choice|local,ci|Whether a plain jig verify runs everything or only what changed.
 verify.busy_ttl|30m|duration||How long a verify run counts as live; 0 never waits.
@@ -779,6 +786,29 @@ _cfg_release_merge() {
   esac
 }
 
+# jig_upgrade_merge — print upgrade.merge: `agent` (the default) lets `jig
+# upgrade` ship its pull request at level `merge` and merge it on green CI
+# whatever `agent.git` says; `human` leaves every step to `agent.git`, and
+# never merges. Exit 1 with `human` printed for anything else: a mistake in the
+# setting never merges.
+jig_upgrade_merge() {
+  local value
+  value=$(cfg upgrade.merge agent)
+  if _cfg_upgrade_merge "$value"; then
+    printf '%s\n' "$value"
+  else
+    printf 'human\n'
+    return 1
+  fi
+}
+
+_cfg_upgrade_merge() {
+  case "$1" in
+    agent | human) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # jig_route_depth — print route.depth, how much of a class's route this
 # person runs (`full`, the default, or `lean`), and exit 0; for anything else
 # print the value read and exit 1, like jig_agent_git. Every reader takes an
@@ -963,7 +993,7 @@ _cfg_parallel() {
 #   jig_ci_timeout;
 # - autopilot.parallel: the check of jig_autopilot_parallel;
 # - route.depth: the check of jig_route_depth;
-# - release.merge: `agent` or `human`;
+# - release.merge and upgrade.merge: `agent` or `human`;
 # - git.worktree_root: any path _cfg_read gives back unchanged;
 # - run.exec: `auto`, `host` or a command prefix of plain words — runenv.sh
 #   splits it on blanks and interprets nothing, so a quote, `$`, backtick or
@@ -1030,6 +1060,10 @@ jig_config_value_problem() {
       ;;
     release.merge)
       _cfg_release_merge "$value" \
+        || { printf 'not agent or human\n'; return 1; }
+      ;;
+    upgrade.merge)
+      _cfg_upgrade_merge "$value" \
         || { printf 'not agent or human\n'; return 1; }
       ;;
     run.exec)

@@ -93,81 +93,15 @@ _refresh_fetch() {
   _JIG_NET_DEADLINE=""
 }
 
-# _refresh_checked_out_at <branch> — the worktree <branch> is checked out in, or nothing.
-# A list git could not give is answered `?`: the base may be checked out, and stays.
-_refresh_checked_out_at() {
-  local list
-  list=$(git -C "$JIG_PROJECT" worktree list --porcelain 2>/dev/null) || { printf '?\n'; return 0; }
-  printf '%s\n' "$list" | awk -v want="branch refs/heads/$1" '
-    /^worktree / { wt = substr($0, 10) }
-    $0 == want { print wt; exit }'
-}
-
-# _refresh_base — fast-forward the base to origin's, the only move it ever makes:
-# `merge --ff-only` where it is checked out here (git itself refuses to touch changes a
-# fast-forward would overwrite), `git branch -f` where it is checked out nowhere — git
-# refuses that for a branch any worktree has checked out, or is rebasing or bisecting;
-# elsewhere, ahead, diverged or missing, nothing moves.
+# _refresh_base — fast-forward the base to origin's (jig_base_fast_forward,
+# common.sh: the one way the base moves, also after a merge `jig upgrade` made).
 _refresh_base() {
-  local base="$_REFRESH_BASE" local_sha origin_sha here out
-  origin_sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$base^{commit}" 2>/dev/null) || origin_sha=""
-  local_sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base^{commit}" 2>/dev/null) || local_sha=""
-  _REFRESH_FROM=$local_sha
-  _REFRESH_TO=$local_sha
-  if [ -z "$origin_sha" ] || [ -z "$local_sha" ]; then
-    _REFRESH_OUTCOME=missing
-    if [ -z "$origin_sha" ]; then
-      _REFRESH_MSG="origin/$base is not known here"
-    else
-      _REFRESH_MSG="there is no branch $base here"
-    fi
-    return 0
-  fi
-  if [ "$local_sha" = "$origin_sha" ]; then
-    _REFRESH_OUTCOME=up-to-date
-    return 0
-  fi
-  if ! git -C "$JIG_PROJECT" merge-base --is-ancestor "$local_sha" "$origin_sha" 2>/dev/null; then
-    _REFRESH_OUTCOME=diverged
-    _REFRESH_MSG="$base here has commits origin/$base does not have, so it cannot be fast-forwarded"
-    return 0
-  fi
-  here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet HEAD 2>/dev/null) || here=""
-  if [ "$here" = "refs/heads/$base" ]; then
-    # merge.autoStash off: refresh never stashes (a person's config may say otherwise).
-    if out=$(git -C "$JIG_PROJECT" -c merge.autoStash=false merge --ff-only -q "$origin_sha" 2>&1); then
-      _REFRESH_OUTCOME=fast-forwarded
-      _REFRESH_TO=$origin_sha
-    else
-      _REFRESH_OUTCOME=blocked-by-changes
-      _REFRESH_MSG=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d')
-      [ -n "$_REFRESH_MSG" ] || _REFRESH_MSG="git refused to fast-forward $base over the changes in this checkout"
-    fi
-    return 0
-  fi
-  _REFRESH_WHERE=$(_refresh_checked_out_at "$base")
-  if [ "$_REFRESH_WHERE" = "?" ]; then
-    _REFRESH_WHERE=""
-    _REFRESH_OUTCOME=checked-out-elsewhere
-    _REFRESH_MSG="git could not list this clone's worktrees, so $base may be checked out in one; nothing was changed"
-    return 0
-  fi
-  if [ -n "$_REFRESH_WHERE" ]; then
-    _REFRESH_OUTCOME=checked-out-elsewhere
-    _REFRESH_MSG="$base is checked out in $_REFRESH_WHERE; it moves there, with \`jig refresh\` run in it"
-    return 0
-  fi
-  if [ "$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base^{commit}" 2>/dev/null)" != "$local_sha" ]; then
-    _REFRESH_OUTCOME=diverged
-    _REFRESH_MSG="$base moved while it was being fast-forwarded; nothing was changed"
-  elif out=$(git -C "$JIG_PROJECT" branch -f "$base" "$origin_sha" 2>&1); then
-    _REFRESH_OUTCOME=fast-forwarded
-    _REFRESH_TO=$origin_sha
-  else
-    _REFRESH_OUTCOME=checked-out-elsewhere
-    _REFRESH_MSG=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d')
-    [ -n "$_REFRESH_MSG" ] || _REFRESH_MSG="git refused to move $base"
-  fi
+  jig_base_fast_forward "$_REFRESH_BASE"
+  _REFRESH_OUTCOME=$JIG_BASE_FF_OUTCOME
+  _REFRESH_FROM=$JIG_BASE_FF_FROM
+  _REFRESH_TO=$JIG_BASE_FF_TO
+  _REFRESH_MSG=$JIG_BASE_FF_MSG
+  _REFRESH_WHERE=$JIG_BASE_FF_WHERE
 }
 
 # _refresh_writes — close the writes in Jig's own tree that are over, as `jig writes

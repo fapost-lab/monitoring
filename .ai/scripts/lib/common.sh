@@ -4641,6 +4641,110 @@ jig_ship_leave() {
   jig_branch_leave "$who" "$b" "$sha"
 }
 
+# --- moving the base branch (jig refresh, jig upgrade) ------------------------
+#
+# One function, so that `jig refresh` and a `jig upgrade` that merged its own pull
+# request never disagree on how the base moves. Results in JIG_BASE_FF_OUTCOME
+# (fast-forwarded, up-to-date, missing, diverged, blocked-by-changes,
+# checked-out-elsewhere), JIG_BASE_FF_FROM, JIG_BASE_FF_TO, JIG_BASE_FF_MSG and
+# JIG_BASE_FF_WHERE; called in the caller's shell, never in `$()`.
+# shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+JIG_BASE_FF_OUTCOME=""
+# shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+JIG_BASE_FF_FROM=""
+# shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+JIG_BASE_FF_TO=""
+# shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+JIG_BASE_FF_MSG=""
+# shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+JIG_BASE_FF_WHERE=""
+
+# jig_branch_worktree <branch> — the worktree <branch> is checked out in, or nothing.
+# A list git could not give is answered `?`: the base may be checked out, and stays.
+jig_branch_worktree() {
+  local list
+  list=$(git -C "$JIG_PROJECT" worktree list --porcelain 2>/dev/null) || { printf '?\n'; return 0; }
+  printf '%s\n' "$list" | awk -v want="branch refs/heads/$1" '
+    /^worktree / { wt = substr($0, 10) }
+    $0 == want { print wt; exit }'
+}
+
+# jig_base_fast_forward <base> — fast-forward the base to origin's, the only move it ever makes:
+# `merge --ff-only` where it is checked out here (git itself refuses to touch changes a
+# fast-forward would overwrite), `git branch -f` where it is checked out nowhere — git
+# refuses that for a branch any worktree has checked out, or is rebasing or bisecting;
+# elsewhere, ahead, diverged or missing, nothing moves.
+jig_base_fast_forward() {
+  local base="$1" local_sha origin_sha here out
+  JIG_BASE_FF_OUTCOME=""
+  JIG_BASE_FF_MSG=""
+  JIG_BASE_FF_WHERE=""
+  origin_sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$base^{commit}" 2>/dev/null) || origin_sha=""
+  local_sha=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base^{commit}" 2>/dev/null) || local_sha=""
+  # shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+  JIG_BASE_FF_FROM=$local_sha
+  JIG_BASE_FF_TO=$local_sha
+  if [ -z "$origin_sha" ] || [ -z "$local_sha" ]; then
+    JIG_BASE_FF_OUTCOME=missing
+    if [ -z "$origin_sha" ]; then
+      JIG_BASE_FF_MSG="origin/$base is not known here"
+    else
+      JIG_BASE_FF_MSG="there is no branch $base here"
+    fi
+    return 0
+  fi
+  if [ "$local_sha" = "$origin_sha" ]; then
+    JIG_BASE_FF_OUTCOME=up-to-date
+    return 0
+  fi
+  if ! git -C "$JIG_PROJECT" merge-base --is-ancestor "$local_sha" "$origin_sha" 2>/dev/null; then
+    JIG_BASE_FF_OUTCOME=diverged
+    JIG_BASE_FF_MSG="$base here has commits origin/$base does not have, so it cannot be fast-forwarded"
+    return 0
+  fi
+  here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet HEAD 2>/dev/null) || here=""
+  if [ "$here" = "refs/heads/$base" ]; then
+    # merge.autoStash off: refresh never stashes (a person's config may say otherwise).
+    if out=$(git -C "$JIG_PROJECT" -c merge.autoStash=false merge --ff-only -q "$origin_sha" 2>&1); then
+      JIG_BASE_FF_OUTCOME=fast-forwarded
+      # shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+      JIG_BASE_FF_TO=$origin_sha
+    else
+      JIG_BASE_FF_OUTCOME=blocked-by-changes
+      JIG_BASE_FF_MSG=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d')
+      [ -n "$JIG_BASE_FF_MSG" ] || JIG_BASE_FF_MSG="git refused to fast-forward $base over the changes in this checkout"
+    fi
+    return 0
+  fi
+  JIG_BASE_FF_WHERE=$(jig_branch_worktree "$base")
+  if [ "$JIG_BASE_FF_WHERE" = "?" ]; then
+    JIG_BASE_FF_WHERE=""
+    # shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+    JIG_BASE_FF_OUTCOME=checked-out-elsewhere
+    JIG_BASE_FF_MSG="git could not list this clone's worktrees, so $base may be checked out in one; nothing was changed"
+    return 0
+  fi
+  if [ -n "$JIG_BASE_FF_WHERE" ]; then
+    # shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+    JIG_BASE_FF_OUTCOME=checked-out-elsewhere
+    JIG_BASE_FF_MSG="$base is checked out in $JIG_BASE_FF_WHERE; it moves there, with \`jig refresh\` run in it"
+    return 0
+  fi
+  if [ "$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base^{commit}" 2>/dev/null)" != "$local_sha" ]; then
+    JIG_BASE_FF_OUTCOME=diverged
+    JIG_BASE_FF_MSG="$base moved while it was being fast-forwarded; nothing was changed"
+  elif out=$(git -C "$JIG_PROJECT" branch -f "$base" "$origin_sha" 2>&1); then
+    JIG_BASE_FF_OUTCOME=fast-forwarded
+    # shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+    JIG_BASE_FF_TO=$origin_sha
+  else
+    # shellcheck disable=SC2034 # read by refresh.sh and upgrade.sh
+    JIG_BASE_FF_OUTCOME=checked-out-elsewhere
+    JIG_BASE_FF_MSG=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d')
+    [ -n "$JIG_BASE_FF_MSG" ] || JIG_BASE_FF_MSG="git refused to move $base"
+  fi
+}
+
 # --- specification links ------------------------------------------------------
 
 # jig_spec_link <task.md> — the spec id a task links to, or nothing.
@@ -6700,3 +6804,87 @@ jig_verify_busy_holder() {
   printf '%s %s\n' "$age" "$checkout"
 }
 
+
+# --- upgrade branches (shared by upgrade, status and housekeeping) -----------
+
+# jig_upgrade_version_at <ref> — the Jig version the manifest records at <ref>;
+# nothing when <ref> or its manifest does not exist.
+jig_upgrade_version_at() {
+  jig_git_show_path "$1" "$JIG_AI_DIR/manifest" 2>/dev/null \
+    | sed -n 's/^jig\.version:[[:space:]]*//p' | head -n 1 || true
+}
+
+# jig_upgrade_branch_version <branch> — the version `jig/upgrade-<to>[-<n>]` is
+# named for; nothing when the name holds no release version.
+jig_upgrade_branch_version() {
+  local v="${1#jig/upgrade-}"
+  if jig_release_version "v$v" >/dev/null 2>&1; then
+    printf '%s\n' "$v"
+    return 0
+  fi
+  jig_release_version "v${v%-*}" 2>/dev/null || true
+}
+
+# jig_upgrade_manifest_paths_at <ref> — the paths the manifest at <ref> records.
+jig_upgrade_manifest_paths_at() {
+  jig_git_show_path "$1" "$JIG_AI_DIR/manifest" 2>/dev/null \
+    | awk '{ sub(/\r$/, "") } body { if ($0 != "") { sub(/^[^ ]* /, ""); print } next } $0 == "---" { body = 1 }' || true
+}
+
+# The first commit jig_upgrade_commits_are_jigs found that is not Jig's; empty
+# when it passed, or when the branch had no commit over the base. Set in the
+# caller's shell, so call that function outside `$(...)`.
+JIG_UPGRADE_NOT_JIGS=""
+
+# jig_upgrade_commits_are_jigs <base-ref> <branch-ref> <label> — the branch has at least one
+# commit over the base, and every one is a commit `jig upgrade` wrote: a single parent,
+# the subject `Upgrade Jig <from> -> <label>`, and every path it touches one the manifest
+# records (before or after), the manifest itself, or AGENTS.md. A person's commit that
+# merely borrows the subject, or carries a file of their own, is not. On failure
+# JIG_UPGRADE_NOT_JIGS names the first commit that is not Jig's.
+# shellcheck disable=SC2034 # JIG_UPGRADE_NOT_JIGS is read by housekeeping.sh
+jig_upgrade_commits_are_jigs() {
+  local sha any=0 allowed subject parents stray ok=1
+  JIG_UPGRADE_NOT_JIGS=""
+  allowed=$(mktemp "${TMPDIR:-/tmp}/jig-upgrade-allowed.XXXXXX")
+  jig_cleanup_add "$allowed"
+  { jig_upgrade_manifest_paths_at "$1"; jig_upgrade_manifest_paths_at "$2"
+    printf '%s\n' "$JIG_AI_DIR/manifest" AGENTS.md; } > "$allowed"
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    any=1
+    subject=$(git -C "$JIG_PROJECT" log -1 --format=%s "$sha")
+    case "$subject" in
+      "Upgrade Jig "*" -> $3") ;;
+      *) ok=0; JIG_UPGRADE_NOT_JIGS=$sha; break ;;
+    esac
+    parents=$(git -C "$JIG_PROJECT" rev-list --parents -1 "$sha" | wc -w | tr -d ' ')
+    if [ "$parents" != 2 ]; then ok=0; JIG_UPGRADE_NOT_JIGS=$sha; break; fi
+    stray=$(git -C "$JIG_PROJECT" -c core.quotepath=off diff-tree --no-commit-id --name-only -r "$sha^" "$sha" \
+      | grep -Fxv -f "$allowed" || true)
+    if [ -n "$stray" ]; then ok=0; JIG_UPGRADE_NOT_JIGS=$sha; break; fi
+  done <<EOF2
+$(git -C "$JIG_PROJECT" rev-list "$1..$2" 2>/dev/null)
+EOF2
+  [ "$any" = 1 ] && [ "$ok" = 1 ]
+}
+
+# jig_upgrade_superseded <branch> <ref> <base-ref> — exit 0, printing the Jig
+# version the base carries, when upgrade branch <branch> (its tip <ref>) is
+# overtaken: the name holds the release <v>, the manifest at <ref> records the
+# same release, and the manifest at <base-ref> records a strictly newer one.
+# Exit 1, printing nothing, otherwise. Whether the branch holds only Jig's
+# commits is jig_upgrade_commits_are_jigs' question
+# (adr-20261117-a-superseded-upgrade-branch-leaves-without-landing).
+jig_upgrade_superseded() {
+  local v at have
+  v=$(jig_upgrade_branch_version "$1")
+  [ -n "$v" ] || return 1
+  at=$(jig_upgrade_version_at "$2")
+  [ -n "$at" ] || return 1
+  [ "$(jig_version_core "$at")" = "$v" ] || return 1
+  have=$(jig_upgrade_version_at "$3")
+  [ -n "$have" ] || return 1
+  jig_version_newer "$(jig_version_core "$have")" "$v" || return 1
+  printf '%s\n' "$have"
+}

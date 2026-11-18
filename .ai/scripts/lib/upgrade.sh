@@ -960,23 +960,25 @@ _upgrade_handoff() {
 # _upgrade_stop_reasons <source> — why a real run must not start here, one
 # reason per line; nothing when it may. Asked before anything is touched.
 _upgrade_stop_reasons() {
-  local source="$1" cur tracked eol lines name exit_hint ttl dir holder checkout
+  local source="$1" path="${2:-checkout}" cur tracked eol lines name exit_hint ttl dir holder checkout to
+  to=$(_upgrade_source_version "$source")
 
   # 1. Uncommitted work: the rule of `task start` — tracked changes block,
   #    untracked files do not. A repeat on the upgrade's own branch is the
   #    exception: its changes are the interrupted run's, and repeating it is
   #    how that run is finished (adr-20260926-an-interrupted-upgrade-is-
   #    repeated-not-rolled-back).
+  #    Only the repeat of this very version is exempt: an older upgrade's
+  #    branch is somebody's unfinished work, not this run's. A run in Jig's own
+  #    tree (<path> tree) touches no checkout, so reasons 1, 3 and 4 do not
+  #    apply to it.
   cur=$(_upgrade_current_branch)
-  case "$cur" in
-    "$_UPGRADE_BRANCH_PREFIX"*) ;;
-    *)
-      tracked=$(git -C "$JIG_PROJECT" status --porcelain 2>/dev/null | grep -v '^??' || true)
-      if [ -n "$tracked" ]; then
-        printf '%s\n' "the working tree has uncommitted changes; commit them, stash them (\`git stash\`), or finish the task they belong to, then run \`jig upgrade\` again"
-      fi
-      ;;
-  esac
+  if [ "$path" != tree ] && ! _upgrade_own_branch "$cur" "$to"; then
+    tracked=$(git -C "$JIG_PROJECT" status --porcelain 2>/dev/null | grep -v '^??' || true)
+    if [ -n "$tracked" ]; then
+      printf '%s\n' "the working tree has uncommitted changes; commit them, stash them (\`git stash\`), or finish the task they belong to, then run \`jig upgrade\` again"
+    fi
+  fi
 
   # 2. Line endings: with core.autocrlf=true and nothing pinning Jig's files to
   #    LF, a clone checks them out with CRLF, and every hash in the manifest
@@ -1016,7 +1018,7 @@ _upgrade_stop_reasons() {
   #    back on the base; in a worktree of its own the task already has one,
   #    that command cannot hand this tree the base (git keeps a branch in one
   #    worktree at a time), and the upgrade belongs in the main checkout.
-  if cfg_bool git.branch_per_task true; then
+  if [ "$path" != tree ] && cfg_bool git.branch_per_task true; then
     while read -r name _; do
       [ -n "$name" ] || continue
       if [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
@@ -1031,17 +1033,46 @@ _upgrade_stop_reasons() {
   # 4. A `jig verify` running in this checkout: replacing the scripts it is
   #    executing turned one run into 34 false failures on 2026-09-26. A run
   #    in another worktree of the clone executes its own files, not these.
+  if [ "$path" != tree ] && holder=$(_upgrade_verify_here); then
+    printf '%s\n' "\`jig verify\` is running in this checkout (for $(jig_checkout_ago "${holder%% *}")); run the upgrade when it has finished"
+  fi
+  return 0
+}
+
+# _upgrade_verify_here — a `jig verify` runs in this very checkout: prints
+# `<age in seconds> <checkout>` and succeeds, else fails. A run in another
+# worktree of the clone executes its own files, not these.
+_upgrade_verify_here() {
+  local ttl dir holder checkout
   ttl=$(jig_verify_busy_ttl)
   if [ "$ttl" -gt 0 ] && dir=$(jig_verify_busy_dir) && [ -n "$dir" ]; then
     holder=$(jig_verify_busy_holder "$dir" "$ttl") || holder=""
     if [ -n "$holder" ]; then
       checkout=${holder#* }
       if _upgrade_same_dir "$checkout" "$JIG_PROJECT"; then
-        printf '%s\n' "\`jig verify\` is running in this checkout (for $(jig_checkout_ago "${holder%% *}")); run the upgrade when it has finished"
+        printf '%s\n' "$holder"
+        return 0
       fi
     fi
   fi
-  return 0
+  return 1
+}
+
+# _upgrade_own_branch <branch> <to> — <branch> is the upgrade branch of this
+# very version: `jig/upgrade-<to>` or `jig/upgrade-<to>-<n>`. A run repeats on
+# that one; an upgrade branch of another version is not its to continue
+# (telescope: 0.46.0 was staged on `jig/upgrade-0.41.0`).
+_upgrade_own_branch() {
+  local rest
+  case "$1" in
+    "$_UPGRADE_BRANCH_PREFIX$2") return 0 ;;
+    "$_UPGRADE_BRANCH_PREFIX$2"-*)
+      rest=${1#"$_UPGRADE_BRANCH_PREFIX$2"-}
+      case "$rest" in '' | *[!0-9]*) return 1 ;; esac
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 # _upgrade_preflight <source> <dry-run> — refuse a real run, changing nothing,
@@ -1050,7 +1081,7 @@ _upgrade_stop_reasons() {
 # (ADR-0017), so it never refuses.
 _upgrade_preflight() {
   local reasons r
-  reasons=$(_upgrade_stop_reasons "$1")
+  reasons=$(_upgrade_stop_reasons "$1" "${3:-checkout}")
   [ -n "$reasons" ] || return 0
   if [ "$2" = 1 ]; then
     while IFS= read -r r; do
@@ -1070,16 +1101,18 @@ $(printf '%s\n' "$reasons" | sed 's/^/  - /')"
 #
 # Cut from the base branch, never from the current one: standing on a task's
 # branch, an upgrade cut from it would ride into that task's pull request. The
-# base is freshened and chosen the way `task start` chooses it. Already on an
-# upgrade branch, the run stays there. No branch at all when the project works
+# base is freshened and chosen the way `task start` chooses it. Already on the
+# upgrade branch of this version, the run stays there; on another version's, it
+# does not. No branch at all when the project works
 # on one branch by choice (`git.branch_per_task: false`) or has no commit yet.
 _upgrade_open_branch() {
   local to="$1" label="${2:-$1}" base start name based n=2
   _UPGRADE_PREV=$(_upgrade_current_branch)
   [ -n "$_UPGRADE_PREV" ] || _UPGRADE_PREV=$(git -C "$JIG_PROJECT" rev-parse --short HEAD 2>/dev/null || true)
-  case "$_UPGRADE_PREV" in
-    "$_UPGRADE_BRANCH_PREFIX"*) _UPGRADE_BRANCH="$_UPGRADE_PREV"; return 0 ;;
-  esac
+  if _upgrade_own_branch "$_UPGRADE_PREV" "$to"; then
+    _UPGRADE_BRANCH="$_UPGRADE_PREV"
+    return 0
+  fi
   cfg_bool git.branch_per_task true || return 0
   git -C "$JIG_PROJECT" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 0
   base=$(cfg git.base_branch main)
@@ -1269,6 +1302,7 @@ _upgrade_finish() {
   _upgrade_self_check 0 || rc=$?
   _upgrade_config_note 0
   _UPGRADE_J_LEVEL=$level
+  _UPGRADE_LEVEL_KEY=agent.git
   if [ "$rc" != 0 ]; then
     _UPGRADE_J_OUTCOME=incomplete
     _upgrade_out "upgrade: not committed, because the install is not complete; run \`jig upgrade\` again${_UPGRADE_BRANCH:+ on $_UPGRADE_BRANCH}"
@@ -1343,7 +1377,8 @@ _upgrade_finish() {
   fi
   # jig_ship_pr registers the body it cuts with the same exit cleanup.
   jig_ship_pr "upgrade" "$_UPGRADE_BRANCH" "$base" "$msg"
-  if [ "$level" = merge ] && [ -n "$JIG_SHIP_URL" ]; then
+  # `upgrade.merge: human` never merges, on any path.
+  if [ "$level" = merge ] && [ -n "$JIG_SHIP_URL" ] && [ "$_UPGRADE_MERGE_BY" != human ]; then
     sha=$(git -C "$JIG_PROJECT" rev-parse HEAD)
     jig_ship_merge "upgrade" "$JIG_SHIP_URL" "$sha" any
     # A merged upgrade leaves no branch behind: back on the base, the branch
@@ -1435,6 +1470,461 @@ _upgrade_next() {
   fi
 }
 
+# --- the upgrade in Jig's own tree ---------------------------------------------
+#
+# Where the project has a first commit, works on a branch per task, has an
+# origin, and the upgrade is to be pushed, the run builds the upgrade in Jig's
+# own tree (`<git-common-dir>/jig/tree`, the one a write in lib/owntree.sh
+# uses) and never touches the person's checkout: no branch is cut there, no
+# file changes, and what is uncommitted or started in it is nothing the run
+# asks about. It is not a write in that sense — it takes the clone's lock and
+# the tree, and leaves no record under `.ai/runtime/writes/` and claims no
+# revision. The branch is cut only at the commit. The tree and the lock go
+# before the wait for CI, as `jig writes ship` gives them back, so a click does
+# not hold them for half an hour.
+#
+# `upgrade.merge: agent` (the default) makes every step that leaves the machine
+# run at level `merge` whatever `agent.git` says: the upgrade is one
+# reproducible commit, checked by CI and taken back by a revert, not a judgment
+# call of the agent inside the person's checkout. `human` leaves every step to
+# `agent.git`, and never merges.
+
+# Set while a run works this way: the checkout it was started in, and the tree.
+_UPGRADE_MAIN=""
+_UPGRADE_TREE=""
+# The run ended inside _upgrade_tree_begin (a repeat carried on, or a branch
+# that holds what is not Jig's), and _upgrade_run has nothing left to do.
+_UPGRADE_DONE=0
+# Where the run worked (tree|checkout), and the framework paths the project gitignores
+# that made a run fall back from the tree to the checkout.
+_UPGRADE_PATH=checkout
+_UPGRADE_IGNORED=""
+# The branch name the commit will cut.
+_UPGRADE_NAME=""
+# The level every step of the run ships at, the key it was read from, and who
+# merges.
+_UPGRADE_EFF_LEVEL=""
+_UPGRADE_LEVEL_KEY=""
+_UPGRADE_MERGE_BY=""
+# What the run reports beyond the commit: the base's fate after a merge, why a
+# merge did not happen, the older upgrade branches a merge superseded.
+_UPGRADE_J_BASE=""
+_UPGRADE_J_NOT_MERGED_CODE=""
+_UPGRADE_J_NOT_MERGED_REASON=""
+_UPGRADE_J_SUPERSEDED=""
+
+# _upgrade_effective — the level the upgrade's steps ship at:
+# _UPGRADE_EFF_LEVEL and the key it came from (_UPGRADE_LEVEL_KEY), and who
+# merges (_UPGRADE_MERGE_BY). `upgrade.merge: agent` is `merge` whatever
+# `agent.git` says; an invalid `upgrade.merge` reads as `human`, so a mistake
+# never merges. Called in the caller's shell, never in `$()`.
+_upgrade_effective() {
+  local by lvl
+  lvl=$(jig_agent_git) || lvl=none
+  by=$(jig_upgrade_merge) || true
+  _UPGRADE_MERGE_BY=$by
+  if [ "$by" = agent ]; then
+    _UPGRADE_EFF_LEVEL=merge
+    _UPGRADE_LEVEL_KEY=upgrade.merge
+  else
+    _UPGRADE_EFF_LEVEL=$lvl
+    _UPGRADE_LEVEL_KEY=agent.git
+  fi
+}
+
+# _upgrade_use_tree — a real run here is built in Jig's own tree: there is a
+# first commit, a branch per task, an origin, and a level that pushes.
+_upgrade_use_tree() {
+  _upgrade_effective
+  cfg_bool git.branch_per_task true || return 1
+  git -C "$JIG_PROJECT" rev-parse --verify --quiet HEAD >/dev/null 2>&1 || return 1
+  git -C "$JIG_PROJECT" remote get-url origin >/dev/null 2>&1 || return 1
+  case "$_UPGRADE_EFF_LEVEL" in
+    push | pr | merge) return 0 ;;
+  esac
+  return 1
+}
+
+# _upgrade_swap_project <dir> — the run's JIG_PROJECT is <dir> from here, and
+# what was read of the other is forgotten.
+_upgrade_swap_project() {
+  JIG_PROJECT=$1
+  _cfg_cache_drop
+}
+
+# _upgrade_stage_union <source> <profiles> <adapters> — build the tree the source would
+# install (_UPGRADE_STAGE) and the union of its paths and the manifest's
+# (_UPGRADE_UNION_FILE). A second call builds anew; the first pair goes with the exit
+# cleanup.
+_upgrade_stage_union() {
+  _UPGRADE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/jig-upgrade-stage.XXXXXX")
+  jig_cleanup_add -d "$_UPGRADE_STAGE"
+  _upgrade_build_staged "$1" "$_UPGRADE_STAGE" "$2" "$3"
+
+  _UPGRADE_UNION_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-upgrade-union.XXXXXX")
+  jig_cleanup_add "$_UPGRADE_UNION_FILE"
+  { (cd "$_UPGRADE_STAGE" && find . -type f | sed 's|^\./||'); manifest_paths; } | sort -u > "$_UPGRADE_UNION_FILE"
+}
+
+# _upgrade_tree_fall_back <source> <to> <label> <ignored> — give Jig's tree and the lock
+# back, say why, and go on in the checkout: its preflight, and its branch.
+_upgrade_tree_fall_back() {
+  local ignored
+  ignored=$(printf '%s\n' "$4" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')
+  ot_close
+  _upgrade_swap_project "$_UPGRADE_MAIN"
+  _UPGRADE_TREE=""
+  _UPGRADE_PATH=checkout
+  _UPGRADE_IGNORED=$4
+  _upgrade_out "note: this project's .gitignore ignores framework files the upgrade places ($ignored), so a commit made in Jig's tree could not carry them; the upgrade works in your checkout instead"
+  _upgrade_preflight "$1" 0 checkout
+  _upgrade_open_branch "$2" "$3"
+}
+
+# _upgrade_tree_begin <to> <label> — the start of a run in the tree: the clone's
+# lock, a fresh base, the branch name this version takes, and the tree standing
+# detached at the base, with JIG_PROJECT pointed at it. The current branch of
+# the checkout is never read for anything but the lines that say where the
+# person stands afterwards. A repeat of an upgrade already on a branch of its
+# own ends here (_UPGRADE_DONE 1).
+_upgrade_tree_begin() {
+  local to="$1" label="$2" base start name based n=2 ref out heads="" heads_known=0 here=0 there=0
+  base=$(cfg git.base_branch main)
+  _UPGRADE_MAIN=$JIG_PROJECT
+  _UPGRADE_PREV=$(_upgrade_current_branch)
+  [ -n "$_UPGRADE_PREV" ] || _UPGRADE_PREV=$(git -C "$JIG_PROJECT" rev-parse --short HEAD 2>/dev/null || true)
+  # shellcheck source=lib/owntree.sh
+  . "$JIG_LIB/owntree.sh"
+  ot_lock_and_sweep upgrade
+
+  jig_fetch_branches upgrade "$base"
+  if git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$base^{commit}" >/dev/null 2>&1; then
+    start="refs/remotes/origin/$base"
+  elif git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base^{commit}" >/dev/null 2>&1; then
+    start="refs/heads/$base"
+  else
+    jig_die "upgrade: no branch $base here or on origin to cut the upgrade from; set git.base_branch to your main branch. Nothing was changed"
+  fi
+  based=$(jig_git_show_path "$start" "$JIG_AI_DIR/manifest" 2>/dev/null \
+    | sed -n 's/^jig\.version:[[:space:]]*//p' | head -n 1) || based=""
+
+  # What origin holds under this version's names decides the free name too, as for a
+  # write (adr-20261104): a second clone upgrading while the first one's pull request
+  # waits must not cut the same name. Without an answer, the refs this clone has.
+  jig_git_origin_account upgrade read
+  if out=$(jig_net jig_git_origin ls-remote --heads origin "refs/heads/$_UPGRADE_BRANCH_PREFIX$to*" 2>/dev/null); then
+    heads_known=1
+    heads=$(printf '%s\n' "$out" | sed -n 's|^[0-9a-f]*[[:space:]]*refs/heads/||p')
+  fi
+  name="$_UPGRADE_BRANCH_PREFIX$to"
+  while :; do
+    here=0
+    there=0
+    if git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$name"; then here=1; fi
+    if [ "$heads_known" = 1 ]; then
+      if jig_has_line "$name" "$heads"; then there=1; fi
+    elif git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/remotes/origin/$name"; then
+      there=1
+    fi
+    [ "$here$there" != 00 ] || break
+    ref="refs/heads/$name"
+    if [ "$here" = 0 ]; then
+      # Only origin has it: read it in, to judge it as a local one.
+      jig_net jig_git_origin fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 \
+        || jig_die "upgrade: origin holds $name and it could not be fetched, so whether it is this upgrade's cannot be told; check the remote, then run \`jig upgrade\` again. Nothing was changed"
+      ref="refs/remotes/origin/$name"
+    fi
+    if [ "$based" != "$label" ] \
+      && ! git -C "$JIG_PROJECT" merge-base --is-ancestor "$ref" "$start" 2>/dev/null; then
+      _upgrade_unmerged "$to" "$label" "$name" "$base" "$based" "$ref"
+      return 0
+    fi
+    name="$_UPGRADE_BRANCH_PREFIX$to-$n"
+    n=$((n + 1))
+  done
+  _UPGRADE_NAME=$name
+
+  ot_tree_add "$start" ""
+  _UPGRADE_TREE=$OT_TREE
+  [ -f "$_UPGRADE_TREE/$JIG_AI_DIR/manifest" ] \
+    || jig_die "upgrade: $base holds no Jig install ($JIG_AI_DIR/manifest), so there is nothing to upgrade there; nothing was changed"
+  _upgrade_swap_project "$_UPGRADE_TREE"
+  _UPGRADE_PATH=tree
+}
+
+# _upgrade_unmerged <to> <label> <branch> <base> <based> <ref> — <ref> is the branch here,
+# or origin's copy when only origin has it (made here only once it is judged Jig's); an upgrade to this
+# version already waits on <branch>, unmerged. Under `upgrade.merge: human` that
+# is the refusal it always was. Under `agent` the run carries it on — pushes it
+# (a no-op when origin holds its tip), opens its pull request when none is open, waits
+# for CI and merges — but only a branch that carries nothing that is not Jig's
+# (jig_upgrade_commits_are_jigs). With commits Jig did not write the run merges nothing
+# for `upgrade.merge`: a person's own `agent.git: merge` is the only grant that
+# covers them, and without it the refusal is `branch-has-other-commits`, nothing sent.
+_upgrade_unmerged() {
+  local to="$1" label="$2" name="$3" base="$4" based="$5" ref="$6" tip msg pr url=""
+  [ "$_UPGRADE_MERGE_BY" = agent ] || _upgrade_refuse_unmerged "$to" "$name" "$base"
+  # The carry-on works on the waiting branch and touches nothing in the checkout.
+  _UPGRADE_PATH=tree
+  _UPGRADE_IGNORED=""
+  _UPGRADE_DONE=1
+  _UPGRADE_J_MODE=copy
+  _UPGRADE_J_DRY=0
+  _UPGRADE_J_FROM=$based
+  _UPGRADE_J_TO=$label
+  _UPGRADE_J_LEVEL=$_UPGRADE_EFF_LEVEL
+  tip=$(git -C "$JIG_PROJECT" rev-parse "$ref")
+  if ! jig_upgrade_commits_are_jigs "$(jig_base_ref "$base")" "$ref" "$label" \
+     && [ "$(jig_agent_git 2>/dev/null || true)" != merge ]; then
+    pr=$(_upgrade_branch_pr "$base" "$name")
+    url=${pr#*"$(printf '\t')"}
+    [ "$url" != "$pr" ] || url=""
+    jig_fail branch-has-other-commits "upgrade: $name carries commits Jig did not write, so Jig does not push or merge it for you; nothing was sent${url:+; its pull request: $url}. Review it and merge it yourself, or move those commits to another branch and run \`jig upgrade\` again"
+  fi
+  if ! git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$name"; then
+    git -C "$JIG_PROJECT" branch -q "$name" "$ref" \
+      || jig_die "upgrade: could not make $name here from origin's; nothing was changed"
+  fi
+  _upgrade_out "upgrade: the upgrade to $to is already on branch $name; carrying it on"
+  _UPGRADE_BRANCH=$name
+  _UPGRADE_J_OUTCOME=upgraded
+  _UPGRADE_J_COMMIT=$tip
+  _UPGRADE_J_STEPS=$(_upgrade_manual_steps "$based" "$label")
+  msg="$JIG_PROJECT/$JIG_AI_DIR/runtime/upgrade/message"
+  mkdir -p "${msg%/*}" || jig_die "upgrade: cannot create ${msg%/*}"
+  git -C "$JIG_PROJECT" log -1 --format=%B "refs/heads/$name" > "$msg" || jig_die "upgrade: cannot write $msg"
+  # Nothing here needs the tree, so nothing is held while CI is waited for.
+  ot_close
+  _upgrade_ship_branch "$base" "$msg"
+}
+
+# _upgrade_finish_tree <from> <to> <summary> — the end of a run in the tree:
+# the self-check, one commit on a branch cut for it, and the ship.
+_upgrade_finish_tree() {
+  local from="$1" to="$2" summary="$3" rc=0 base rel msg name out first why
+  base=$(cfg git.base_branch main)
+  _upgrade_self_check 0 || rc=$?
+  _upgrade_config_note 0
+  _UPGRADE_J_LEVEL=$_UPGRADE_EFF_LEVEL
+  if [ "$rc" != 0 ]; then
+    _UPGRADE_J_OUTCOME=incomplete
+    _upgrade_out "upgrade: not committed, because the install is not complete; run \`jig upgrade\` again"
+    return 0
+  fi
+  _upgrade_stage_change
+  if [ -z "$(jig_ship_staged)" ]; then
+    _UPGRADE_J_OUTCOME=nothing-to-do
+    _upgrade_out "upgrade: nothing changed"
+    _upgrade_swap_project "$_UPGRADE_MAIN"
+    if [ -n "$_UPGRADE_PREV" ] && [ "$_UPGRADE_PREV" != "$base" ]; then
+      _upgrade_out "next: $base already has this version; if $_UPGRADE_PREV still asks for an upgrade, bring it in with \`git merge $base\`"
+    fi
+    return 0
+  fi
+
+  rel="$JIG_AI_DIR/runtime/upgrade/message"
+  msg="$_UPGRADE_MAIN/$rel"
+  mkdir -p "$(dirname "$msg")" || jig_die "upgrade: cannot create $(dirname "$msg")"
+  _upgrade_message "$msg" "$from" "$to" "$summary"
+  _UPGRADE_J_STEPS=$(_upgrade_manual_steps "$from" "$to")
+  jig_ship_check_staged "upgrade"
+
+  name=$_UPGRADE_NAME
+  # The commit is made detached, and the branch is cut at it: a refusal leaves no
+  # branch to take back.
+  out=$(git -C "$JIG_PROJECT" commit -q -F "$msg" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    first=$(_jig_ship_first_line "$out")
+    if [ -n "$(git -C "$JIG_PROJECT" config --get core.hooksPath 2>/dev/null)" ] \
+       || [ -x "$(git -C "$JIG_PROJECT" rev-parse --git-path hooks/pre-commit 2>/dev/null)" ]; then
+      why="the project's pre-commit hook refused in Jig's tree"
+    else
+      why="git refused the commit in Jig's tree"
+    fi
+    _UPGRADE_J_OUTCOME=incomplete
+    jig_fail commit-refused "upgrade: not committed: $why: $first; nothing was left behind, and the checkout was not touched"
+  fi
+  out=$(git -C "$JIG_PROJECT" branch "$name" HEAD 2>&1) \
+    || jig_die "upgrade: committed, but could not cut branch $name at the commit: $out"
+  _upgrade_out "upgrade: working on branch $name, cut from $base"
+  _UPGRADE_BRANCH=$name
+  _UPGRADE_CREATED=1
+  _UPGRADE_J_OUTCOME=upgraded
+  _UPGRADE_J_COMMIT=$(git -C "$JIG_PROJECT" rev-parse HEAD 2>/dev/null || true)
+  printf 'committed %s\n' "$(git -C "$JIG_PROJECT" rev-parse --short HEAD)"
+  _upgrade_swap_project "$_UPGRADE_MAIN"
+  _upgrade_ship_branch "$base" "$msg"
+}
+
+# _upgrade_ship_branch <base> <message-file> — push the upgrade's branch, open
+# its pull request, give the tree and the lock back, and — when this run
+# merges — wait for CI and merge. Run in the checkout (JIG_PROJECT is its):
+# refs are shared, and a forge CLI finds its repository from there.
+_upgrade_ship_branch() {
+  local base="$1" msg="$2" level sha tmp url
+  level=$_UPGRADE_EFF_LEVEL
+  sha=$(git -C "$JIG_PROJECT" rev-parse "refs/heads/$_UPGRADE_BRANCH")
+  _upgrade_out "upgrade: shipping at $level ($_UPGRADE_LEVEL_KEY)"
+  jig_ship_require_commits "upgrade" "$_UPGRADE_BRANCH" "$base"
+  jig_ship_account "upgrade" "$level"
+  jig_ship_push "upgrade" "$_UPGRADE_BRANCH"
+  _UPGRADE_J_PUSHED=1
+  if [ "$level" = push ]; then
+    ot_close
+    _upgrade_tree_next pushed "$base"
+    return 0
+  fi
+  # jig_ship_pr registers the body it cuts with the same exit cleanup.
+  jig_ship_pr "upgrade" "$_UPGRADE_BRANCH" "$base" "$msg"
+  url=$JIG_SHIP_URL
+  _upgrade_record_pr "$base"
+  # The tree and the lock go now, not after the wait for CI.
+  ot_close
+  if [ "$_UPGRADE_MERGE_BY" = agent ] && [ -n "$url" ]; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/jig-upgrade-merge.XXXXXX")
+    jig_cleanup_add "$tmp"
+    jig_ship_merge "upgrade" "$url" "$sha" any > "$tmp"
+    cat "$tmp"
+    if [ "$JIG_SHIP_MERGED" != 1 ]; then
+      _UPGRADE_J_NOT_MERGED_CODE=$JIG_SHIP_NOT_MERGED_CODE
+      _UPGRADE_J_NOT_MERGED_REASON=$(sed -n 's/^not merged: //p' "$tmp" | sed -n '$p')
+    fi
+    rm -f "$tmp"
+  fi
+  if [ "$JIG_SHIP_MERGED" = 1 ]; then
+    _upgrade_record_merged "$base" "$sha" "$url"
+    jig_branch_leave "upgrade" "$_UPGRADE_BRANCH" "$sha"
+    _upgrade_move_base "$base"
+    # The branch went and the base moved: what a program caches on the clone's
+    # revision (Jig UI) is read again, as after `jig refresh`.
+    jig_record_changed
+    _upgrade_tree_next merged "$base"
+  else
+    _upgrade_tree_next not-merged "$base"
+  fi
+}
+
+# _upgrade_record_merged <base> <sha> <url> — the merge this run made into the
+# forge cache, so `jig status` hears it at once (forgecache_record).
+_upgrade_record_merged() {
+  local base="$1" sha="$2" url="$3"
+  case "$url" in */pull/* | */merge_requests/*) ;; *) url="" ;; esac
+  # shellcheck source=lib/task.sh
+  . "$JIG_LIB/task.sh"
+  # shellcheck source=lib/forgecache.sh
+  . "$JIG_LIB/forgecache.sh"
+  forgecache_record "$_UPGRADE_BRANCH" "$base" merged "$sha" "$url"
+}
+
+# _upgrade_move_base <base> — bring the base branch here up to origin's, the
+# step `jig refresh` takes (jig_base_fast_forward, common.sh), and keep what became of it in
+# _UPGRADE_J_BASE. Never moves the base under a `jig verify` running in a
+# checkout that stands on it: the scripts it executes would change under it.
+_upgrade_move_base() {
+  local base="$1" cur
+  jig_fetch_branches upgrade "$base"
+  cur=$(_upgrade_current_branch)
+  if [ "$cur" = "$base" ] && _upgrade_verify_here >/dev/null; then
+    JIG_BASE_FF_OUTCOME=verify-running
+    JIG_BASE_FF_MSG="\`jig verify\` is running in this checkout, which stands on $base"
+    JIG_BASE_FF_TO=""
+  else
+    jig_base_fast_forward "$base"
+  fi
+  _UPGRADE_J_BASE=$JIG_BASE_FF_OUTCOME
+}
+
+# _upgrade_superseded <to> <base> — the upgrade branches of an older version
+# that the merge of <to> overtook, here or on origin: what they carried the base
+# has in a newer version. Named, never deleted or closed: a person's commits may
+# lie on one of them. Sets _UPGRADE_J_SUPERSEDED, one branch per line.
+_upgrade_superseded() {
+  local to="$1" base="$2" ref b v where seen="" base_ref
+  base_ref=$(jig_base_ref "$base")
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    case "$ref" in
+      refs/heads/*) b=${ref#refs/heads/}; where=here ;;
+      refs/remotes/origin/*) b=${ref#refs/remotes/origin/}; where=origin ;;
+      *) continue ;;
+    esac
+    [ "$b" != "$_UPGRADE_BRANCH" ] || continue
+    v=$(jig_upgrade_branch_version "$b")
+    [ -n "$v" ] || continue
+    jig_version_lt "$(jig_version_core "$v")" "$(jig_version_core "$to")" || continue
+    # Merged is history, not superseded.
+    if [ -n "$base_ref" ] && git -C "$JIG_PROJECT" merge-base --is-ancestor "$ref" "$base_ref" 2>/dev/null; then
+      continue
+    fi
+    case "
+$seen" in
+      *"
+$b	"*)
+        seen=$(printf '%s\n' "$seen" | B="$b" W="$where" awk -F '\t' 'BEGIN { OFS = FS } $1 == ENVIRON["B"] { $2 = $2 ", " ENVIRON["W"] } { print }')
+        ;;
+      *) seen="$seen${seen:+
+}$b	$where" ;;
+    esac
+  done <<EOF
+$(git -C "$JIG_PROJECT" for-each-ref --format='%(refname)' 'refs/heads/jig/upgrade-*' 'refs/remotes/origin/jig/upgrade-*' 2>/dev/null)
+EOF
+  _UPGRADE_J_SUPERSEDED=""
+  while IFS="$(printf '\t')" read -r b where; do
+    [ -n "$b" ] || continue
+    _UPGRADE_J_SUPERSEDED="$_UPGRADE_J_SUPERSEDED$b
+"
+    _upgrade_out "note: $b ($where) is superseded: $base now has Jig $to, which carries what it had; it is no longer needed; housekeeping deletes it, and closes its pull request at agent.git pr or above, when only Jig's commits are on it, and otherwise leaves it to you"
+  done <<EOF
+$seen
+EOF
+}
+
+# _upgrade_tree_next <merged|not-merged|pushed> <base> — where things stand
+# after a run in the tree, in words: what became of the base here, and what a
+# checkout on another branch has to do to take the upgrade.
+_upgrade_tree_next() {
+  local state="$1" base="$2" cur have now
+  cur=$(_upgrade_current_branch)
+  case "$state" in
+    merged)
+      case "$_UPGRADE_J_BASE" in
+        fast-forwarded) _upgrade_out "upgrade: $base here moved to ${JIG_BASE_FF_TO:0:12}" ;;
+        up-to-date) _upgrade_out "upgrade: $base here is up to date" ;;
+        blocked-by-changes)
+          _upgrade_out "next: your uncommitted changes stand in the way of moving $base here; commit or set them aside, then run \`jig refresh\`" ;;
+        verify-running)
+          _upgrade_out "next: $base here has not moved, because $JIG_BASE_FF_MSG; run \`jig refresh\` or \`jig upgrade --land\` when it has finished" ;;
+        *)
+          _upgrade_out "next: $base here has not moved: ${JIG_BASE_FF_MSG:-$_UPGRADE_J_BASE}; \`jig refresh\` or \`jig upgrade --land\` brings it" ;;
+      esac
+      _upgrade_superseded "$(jig_version_core "$_UPGRADE_J_TO")" "$base"
+      if [ -n "$cur" ] && [ "$cur" != "$base" ]; then
+        case "$cur" in
+          "$_UPGRADE_BRANCH_PREFIX"*)
+            _upgrade_out "next: $cur is an older upgrade branch and is no longer needed; \`git checkout $base\` when you are ready (nothing was switched for you)" ;;
+          *)
+            have=$(jig_upgrade_version_at HEAD)
+            now=$(jig_upgrade_version_at "refs/heads/$base")
+            if [ "$have" != "$now" ]; then
+              _upgrade_out "next: $cur is still on Jig ${have:-unknown}; it takes Jig ${now:-$_UPGRADE_J_TO} when you next merge $base into it (\`git merge $base\`)"
+            fi
+            ;;
+        esac
+      fi
+      ;;
+    not-merged)
+      if [ -n "$_UPGRADE_J_NOT_MERGED_REASON" ]; then
+        _upgrade_out "next: $_UPGRADE_BRANCH is on origin and its pull request is open${JIG_SHIP_URL:+ ($JIG_SHIP_URL)}; Jig did not merge it ($_UPGRADE_J_NOT_MERGED_REASON). Run \`jig upgrade\` again to carry it on, or merge it yourself and run \`jig upgrade --land\`"
+      else
+        _upgrade_out "next: this upgrade is on branch $_UPGRADE_BRANCH${JIG_SHIP_URL:+ ($JIG_SHIP_URL)}; once it is merged into $base, run \`jig upgrade --land\` to bring it here"
+      fi
+      ;;
+    pushed)
+      _upgrade_out "next: this upgrade is pushed on branch $_UPGRADE_BRANCH; the pull request is yours; once it is merged into $base, run \`jig upgrade --land\`"
+      ;;
+  esac
+}
+
 # --- cmd_upgrade -------------------------------------------------------------
 
 # Staging directory / union-of-paths temp file / hash-table work directory for
@@ -1463,6 +1953,27 @@ _UPGRADE_J_PUSHED=0
 _UPGRADE_J_STEPS=""
 _UPGRADE_J_STOPS=""
 
+# _upgrade_land_handoff <args>... — when the `jig` this machine's PATH selects
+# is newer than the one running (this project's installed copy), give `--land`
+# to it, and never return. The same rule and loop marker as _upgrade_handoff:
+# a run that was handed off already goes on where it is. Nothing is printed
+# before the exec, so a newer jig under `--json` writes the whole envelope.
+# Silent, and no hand-off, when there is no global jig or it is not newer.
+_upgrade_land_handoff() {
+  local exe src gv
+  [ -z "${JIG_UPGRADE_HANDED_OFF:-}" ] || return 0
+  exe=$(jig_global_executable 2>/dev/null) || return 0
+  src=${exe%/scripts/jig}
+  gv=$(_upgrade_source_version "$src")
+  jig_version_newer "$gv" "$JIG_VERSION" || return 0
+  case " $* " in
+    *" --quiet "*) ;;
+    *) printf 'upgrade: this jig is %s; handing --land to %s from %s\n' "$JIG_VERSION" "$gv" "$src" >&2 ;;
+  esac
+  cd "$JIG_PROJECT" || jig_die "upgrade: cannot enter $JIG_PROJECT"
+  JIG_UPGRADE_HANDED_OFF="$JIG_VERSION" exec bash "$exe" upgrade "$@"
+}
+
 # cmd_upgrade [--json] … — `--json` anywhere runs the whole command as the
 # producer of json_run (conventions/json-output.md); the text it prints goes to
 # stderr unchanged.
@@ -1476,9 +1987,11 @@ cmd_upgrade() {
       *) rest+=("$a") ;;
     esac
   done
-  # `--land` brings a merged upgrade here (_upgrade_land_run); no source is
-  # read, so nothing is handed to a newer jig.
+  # `--land` brings a merged upgrade here (_upgrade_land_run). No source is
+  # read, but the newest code on the machine runs it all the same: a project's
+  # older copy refuses what the newer one would do (_upgrade_land_handoff).
   if [ "$land" = 1 ]; then
+    _upgrade_land_handoff "$@"
     if [ "$json" = 0 ]; then
       _upgrade_land_run "$@"
       return
@@ -1534,7 +2047,33 @@ EOF
     json_str_or_null "$_UPGRADE_J_COMMIT"; o="$o,\"commit\":$_JSON"
     json_bool "$( [ "$_UPGRADE_J_PUSHED" = 1 ] && printf true )"; o="$o,\"pushed\":$_JSON"
     json_str_or_null "${JIG_SHIP_URL:-}"; o="$o,\"pull_request\":$_JSON"
-    json_bool "$( [ "${JIG_SHIP_MERGED:-0}" = 1 ] && printf true )"; o="$o,\"merged\":$_JSON}"
+    json_bool "$( [ "${JIG_SHIP_MERGED:-0}" = 1 ] && printf true )"; o="$o,\"merged\":$_JSON"
+    json_str_or_null "$_UPGRADE_LEVEL_KEY"; o="$o,\"level_key\":$_JSON"
+    json_quote "$_UPGRADE_PATH"; o="$o,\"path\":$_JSON"
+    list=""
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      json_quote "$line"; list="$list${list:+,}$_JSON"
+    done <<IGN
+$_UPGRADE_IGNORED
+IGN
+    o="$o,\"ignored\":[$list]"
+    json_str_or_null "$_UPGRADE_MERGE_BY"; o="$o,\"merge_by\":$_JSON"
+    if [ -n "$_UPGRADE_J_NOT_MERGED_CODE" ]; then
+      json_quote "$_UPGRADE_J_NOT_MERGED_CODE"; o="$o,\"not_merged\":{\"code\":$_JSON"
+      json_quote "$_UPGRADE_J_NOT_MERGED_REASON"; o="$o,\"reason\":$_JSON}"
+    else
+      o="$o,\"not_merged\":null"
+    fi
+    json_str_or_null "$_UPGRADE_J_BASE"; o="$o,\"base\":$_JSON"
+    list=""
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      json_quote "$line"; list="$list${list:+,}$_JSON"
+    done <<SUP
+$_UPGRADE_J_SUPERSEDED
+SUP
+    o="$o,\"superseded\":[$list]}"
   else
     o="$o,\"git\":null"
   fi
@@ -1642,17 +2181,29 @@ _upgrade_run() {
   # A copy-mode project takes released code only, dry run included: a plan
   # the real run would refuse is no plan (adr-20261106-copy-mode-projects-take-released-code-only).
   jig_require_released_source upgrade "$source" "$_UPGRADE_UNRELEASED"
-  local from_version to_version to_label
+  local from_version to_version to_label in_tree=0 where=checkout
   if [ "$dry_run" != 1 ]; then
     _upgrade_handoff "$source"
     level=$(jig_agent_git) \
       || jig_die "upgrade: invalid agent.git: $level (expected none|commit|push|pr|merge); nothing was changed"
   fi
-  [ "${_upgrade_skip_preflight:-0}" = 1 ] || _upgrade_preflight "$source" "$dry_run"
+  # Which way a real run would go decides what could stop it: built in Jig's own
+  # tree it asks nothing of the checkout (_upgrade_use_tree).
+  if _upgrade_use_tree; then
+    in_tree=1
+    where=tree
+  fi
+  [ "${_upgrade_skip_preflight:-0}" = 1 ] || _upgrade_preflight "$source" "$dry_run" "$where"
   to_version=$(_upgrade_source_version "$source")
   to_label=$(jig_source_taken_version "$source" 2>/dev/null) || to_label="$to_version"
   if [ "$dry_run" != 1 ]; then
-    _upgrade_open_branch "$to_version" "$to_label"
+    if [ "$in_tree" = 1 ]; then
+      _UPGRADE_J_TO=$to_label
+      _upgrade_tree_begin "$to_version" "$to_label"
+      [ "$_UPGRADE_DONE" != 1 ] || return 0
+    else
+      _upgrade_open_branch "$to_version" "$to_label"
+    fi
     # The branch may hold another config; read what this run installs there.
     active_profiles=$(cfg_list profiles generic)
     active_adapters=$(cfg_list adapters "claude codex")
@@ -1663,13 +2214,31 @@ _upgrade_run() {
   _UPGRADE_J_FROM=$from_version
   _UPGRADE_J_TO=$to_label
 
-  _UPGRADE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/jig-upgrade-stage.XXXXXX")
-  jig_cleanup_add -d "$_UPGRADE_STAGE"
-  _upgrade_build_staged "$source" "$_UPGRADE_STAGE" "$active_profiles" "$active_adapters"
+  _upgrade_stage_union "$source" "$active_profiles" "$active_adapters"
 
-  _UPGRADE_UNION_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-upgrade-union.XXXXXX")
-  jig_cleanup_add "$_UPGRADE_UNION_FILE"
-  { (cd "$_UPGRADE_STAGE" && find . -type f | sed 's|^\./||'); manifest_paths; } | sort -u > "$_UPGRADE_UNION_FILE"
+  # A path the project gitignores could not travel in a commit made in Jig's tree: it
+  # would be placed there, left out of the commit and go with the tree, while the
+  # manifest records it as installed. Such a run works in the checkout instead.
+  if [ "$in_tree" = 1 ]; then
+    local ignored
+    ignored=$(git -C "$JIG_PROJECT" check-ignore --stdin < "$_UPGRADE_UNION_FILE" 2>/dev/null || true)
+    if [ -n "$ignored" ] && [ "$dry_run" = 1 ]; then
+      # Read-only: no tree, no lock, no branch. Say what a real run would do, and what
+      # would stop it there.
+      in_tree=0
+      _UPGRADE_J_STOPS=""
+      _upgrade_out "note: a real upgrade would work in your checkout, not in Jig's tree: this project's .gitignore ignores framework files it places"
+      [ "${_upgrade_skip_preflight:-0}" = 1 ] || _upgrade_preflight "$source" 1 checkout
+    elif [ -n "$ignored" ]; then
+      _upgrade_tree_fall_back "$source" "$to_version" "$to_label" "$ignored"
+      in_tree=0
+      active_profiles=$(cfg_list profiles generic)
+      active_adapters=$(cfg_list adapters "claude codex")
+      from_version=$(manifest_header_get jig.version)
+      _UPGRADE_J_FROM=$from_version
+      _upgrade_stage_union "$source" "$active_profiles" "$active_adapters"
+    fi
+  fi
 
   _UPGRADE_WORK=$(mktemp -d "${TMPDIR:-/tmp}/jig-upgrade-work.XXXXXX")
   jig_cleanup_add -d "$_UPGRADE_WORK"
@@ -1739,6 +2308,11 @@ _upgrade_run() {
   fi
   _upgrade_summary "$placed_count" "$kept_count" "$removed_count" "$conflict_count" "$manifest_state"
   [ "$manifest_state" = updated ] || _upgrade_kept_source_note "$source" "copy"
+  if [ "$in_tree" = 1 ]; then
+    _upgrade_finish_tree "$from_version" "$to_label" \
+      "$(_upgrade_summary_text "$placed_count" "$kept_count" "$removed_count" "$conflict_count" "$manifest_state")"
+    return 0
+  fi
   _upgrade_finish "$from_version" "$to_label" \
     "$(_upgrade_summary_text "$placed_count" "$kept_count" "$removed_count" "$conflict_count" "$manifest_state")"
 }
@@ -1859,24 +2433,6 @@ _upgrade_land_prs() {
     }'
 }
 
-# _upgrade_land_version <ref> — the Jig version the manifest records at <ref>;
-# nothing when <ref> or its manifest does not exist.
-_upgrade_land_version() {
-  jig_git_show_path "$1" "$JIG_AI_DIR/manifest" 2>/dev/null \
-    | sed -n 's/^jig\.version:[[:space:]]*//p' | head -n 1 || true
-}
-
-# _upgrade_land_to <branch> — the version `jig/upgrade-<to>[-<n>]` is named
-# for; nothing when the name holds no release version.
-_upgrade_land_to() {
-  local v="${1#"$_UPGRADE_BRANCH_PREFIX"}"
-  if jig_release_version "v$v" >/dev/null 2>&1; then
-    printf '%s\n' "$v"
-    return 0
-  fi
-  jig_release_version "v${v%-*}" 2>/dev/null || true
-}
-
 # _upgrade_land_label <branch> <head-commit> — the jig.version the upgrade
 # branch records, read from the branch here, the merged head, or origin's copy
 # of the branch, whichever this clone has; nothing when none is here. The
@@ -1888,7 +2444,7 @@ _upgrade_land_label() {
   for ref in "refs/heads/$1" "$2" "refs/remotes/origin/$1"; do
     [ -n "$ref" ] || continue
     git -C "$JIG_PROJECT" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 || continue
-    v=$(_upgrade_land_version "$ref")
+    v=$(jig_upgrade_version_at "$ref")
     if [ -n "$v" ]; then
       printf '%s\n' "$v"
       return 0
@@ -1931,7 +2487,7 @@ _upgrade_land_run() {
   prs=$(_upgrade_land_prs "$forge" "$base") \
     || jig_die "upgrade --land: the forge did not answer; nothing was changed"
   jig_fetch_branches "upgrade" "$base"
-  have=$(_upgrade_land_version "refs/heads/$base")
+  have=$(jig_upgrade_version_at "refs/heads/$base")
   cur=$(_upgrade_current_branch)
 
   # Which upgrade to land: the newest merged one that has something left to
@@ -1948,7 +2504,7 @@ _upgrade_land_run() {
         if [ -z "$open_head" ]; then open_head=$head; open_url=$url; fi
         ;;
       merged)
-        to=$(_upgrade_land_to "$head")
+        to=$(jig_upgrade_branch_version "$head")
         if [ "$cur" = "$head" ] \
            || git -C "$JIG_PROJECT" show-ref --verify --quiet "refs/heads/$head" \
            || { [ -n "$to" ] && { [ -z "$have" ] || jig_version_newer "$to" "$have"; }; }; then
@@ -1985,6 +2541,13 @@ PICK
   if [ "$cur" != "$base" ] && [ "$cur" != "$head" ]; then
     stay=1
   fi
+  # A linked worktree on the upgrade's branch is never switched to the base, as
+  # jig_ship_leave never switches one: housekeeping finds a worktree by the
+  # branch git lists in it. It stays where it is, like a third branch, and the
+  # branch waits for it to leave (jig_branch_leave keeps one checked out).
+  if [ "$cur" = "$head" ] && [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
+    stay=1
+  fi
 
   # Everything that stands in the way, all at once, before anything moves.
   if [ "$stay" = 0 ]; then
@@ -1994,13 +2557,7 @@ PICK
 "
     fi
   fi
-  if [ "$stay" = 0 ] && [ "$cur" != "$base" ] && [ "$(jig_config_clone_root)" != "$JIG_PROJECT" ]; then
-    # A linked worktree is never switched to the base, as jig_ship_leave
-    # never switches one: housekeeping finds a worktree by the branch git
-    # lists in it, and one moved to the base would be found by nothing.
-    reasons="${reasons}this is a linked worktree on $head, and Jig never switches one to $base; run \`jig upgrade --land\` in the main checkout ($(jig_config_clone_root))
-"
-  elif [ "$cur" != "$base" ] && jig_branch_checked_out "$base"; then
+  if [ "$cur" != "$base" ] && jig_branch_checked_out "$base"; then
     # A base checked out elsewhere is that worktree's to move: git could not
     # switch here to it, and a ref moved under it would leave that tree and
     # index behind the branch.
@@ -2023,9 +2580,9 @@ PICK
     # `X.Y.Z+<sha>` from an upgrade that returned it to `X.Y.Z`; the label the
     # branch records can, when this clone has it. A base that already holds
     # the merged head has the upgrade, whatever it records since.
-    to=$(_upgrade_land_to "$head")
+    to=$(jig_upgrade_branch_version "$head")
     if [ -n "$to" ]; then
-      a=$(_upgrade_land_version "refs/remotes/origin/$base")
+      a=$(jig_upgrade_version_at "refs/remotes/origin/$base")
       label=$(_upgrade_land_label "$head" "$sha")
       if [ -z "$a" ] || jig_version_newer "$to" "$a" \
          || { _upgrade_rebuilds "$label" "$a" \
@@ -2053,7 +2610,7 @@ $(printf '%s' "$reasons" | sed 's/^/  - /')"
   git -C "$JIG_PROJECT" merge --ff-only -q "refs/remotes/origin/$base" >/dev/null 2>&1 \
     || jig_die "upgrade --land: on $base, which could not be fast-forwarded to origin/$base"
   _UPGRADE_L_COMMIT=$(git -C "$JIG_PROJECT" rev-parse HEAD 2>/dev/null || true)
-  _UPGRADE_L_TO=$(_upgrade_land_version HEAD)
+  _UPGRADE_L_TO=$(jig_upgrade_version_at HEAD)
   _UPGRADE_L_OUTCOME=landed
   _upgrade_out "upgrade: landed $head${url:+ ($url)}; on $base at ${_UPGRADE_L_COMMIT:0:12}, Jig ${_UPGRADE_L_TO:-unknown}"
   _upgrade_land_let_go "$head" "$base" "$sha" 0
@@ -2121,13 +2678,13 @@ _upgrade_land_stay() {
   fi
   _UPGRADE_L_ON_BASE=0
   _UPGRADE_L_COMMIT=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$base" 2>/dev/null || true)
-  _UPGRADE_L_TO=$(_upgrade_land_version "refs/heads/$base")
+  _UPGRADE_L_TO=$(jig_upgrade_version_at "refs/heads/$base")
   _UPGRADE_L_OUTCOME=landed
   _upgrade_out "upgrade: landed $head${url:+ ($url)}; $base at ${_UPGRADE_L_COMMIT:0:12}, Jig ${_UPGRADE_L_TO:-unknown}; this checkout stays on ${cur:-a detached HEAD}"
   _upgrade_land_let_go "$head" "$base" "$sha" 1
   # Said only while the checkout's own Jig differs from the base's: a branch
   # that has merged the base already has the upgrade.
-  now=$(_upgrade_land_version HEAD)
+  now=$(jig_upgrade_version_at HEAD)
   if [ -n "$cur" ] && [ "$now" != "$_UPGRADE_L_TO" ]; then
     _upgrade_out "next: $cur is still at Jig ${now:-unknown}; merge $base into it to take the upgrade"
   fi
