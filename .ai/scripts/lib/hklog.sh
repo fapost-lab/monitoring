@@ -22,6 +22,27 @@ hklog_ids() {
   hklog_last_run_lines "$hk_log" | hklog_ids_in - "$1"
 }
 
+# hklog_purged_merged_ids — the tasks of every `action=purge` line of the whole
+# log that says `remote=merged`, distinct and in log order. Not the newest run
+# only: _hk_log_trim keeps every purge line, so this is the one trace of a merge
+# after the task's workspace is gone. The log is the main checkout's: a task
+# worktree links only the tasks directory and keeps no log of its own.
+hklog_purged_merged_ids() {
+  local root hk_log
+  jig_config_clone_root_v root
+  hk_log="$root/$JIG_AI_DIR/runtime/housekeeping.log"
+  [ -f "$hk_log" ] || return 0
+  awk '
+    / action=purge( |$)/ && / remote=merged( |$)/ {
+      for (i = 1; i <= NF; i++) if ($i ~ /^task=/) {
+        id = substr($i, 6)
+        if (!(id in seen)) { seen[id] = 1; print id }
+        break
+      }
+    }
+  ' "$hk_log"
+}
+
 # hklog_last_run_lines <log> — the lines of the last run in <log>: from its
 # last `--- run` marker to the end, or the whole file when it has none. Every
 # reader here wants only the newest run, and the log is only ever appended to:

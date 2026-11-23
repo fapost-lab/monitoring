@@ -49,8 +49,8 @@ json_quote() {
       # Rare (a hand-edited state file, an escape sequence in a reason or a
       # task document), so the pass is paid only when one is there. One
       # substitution per control byte, not a loop over the string's
-      # characters: `task artifact read --json` quotes whole documents, and a
-      # per-character loop that appends grows with the square of their size.
+      # characters: a long field can reach here, and a per-character loop
+      # that appends grows with the square of its size.
       # The replacement is quoted, so neither `\` nor `&` (bash 5.2's
       # patsub_replacement) means anything in it.
       n=${#_JSON_CTRL}
@@ -68,6 +68,33 @@ json_quote() {
       ;;
   esac
   _JSON="\"$s\""
+}
+
+# json_quote_text <s> — _JSON <- what json_quote <s> sets, for a text that may be
+# long: a whole document or a diff. json_quote's substitutions cost the length of
+# the string once per match on bash 3.2, so over a whole text they grow with the
+# square of its size (an 83 KB diff took minutes, a 37 KB spec 3 s). Here they run
+# on one line at a time, so the cost grows with the number of lines, and with the
+# square of the longest line only. The lines are read by the shell, which keeps a
+# carriage return (awk under Git Bash drops it, conventions/shell.md), and no
+# process is started. Each escaped line is kept in an array and the array joined
+# once: appending to one string would copy all of it again per line.
+json_quote_text() {
+  local line i=0 IFS
+  local -a acc
+  # The here-document ends the text with one newline more, so every line read
+  # was followed by one; the last `\n` is taken off again after the join.
+  while IFS= read -r line; do
+    json_quote "$line"
+    _JSON=${_JSON#\"}
+    acc[i]="${_JSON%\"}\\n"
+    i=$((i + 1))
+  done <<EOF
+$1
+EOF
+  IFS=
+  _JSON="${acc[*]}"
+  _JSON="\"${_JSON%\\n}\""
 }
 
 json_str_or_null() {
@@ -177,4 +204,87 @@ json_run() {
   json_quote "${both#*$'\n'}"
   printf '"error":{"code":"%s","message":%s}}\n' "$code" "$_JSON"
   return "$rc"
+}
+
+# json_utf8_clean <s> — _JSON_CLEAN <- <s> without the bytes that are not valid
+# UTF-8, _JSON_LOSSY <- true when there were any. Shared by every read that hands
+# JSON the text of a file a person committed (knowledge.sh, spec.sh). json_quote lets such bytes
+# through as they are, and one of them makes the whole line invalid JSON: a
+# source file is anything a person committed. Strict UTF-8 is checked and
+# repaired by iconv; where there is none, every byte outside ASCII becomes `?`,
+# one per byte, which is the lossy end of the same thing.
+json_utf8_clean() {
+  local ascii src
+  _JSON_CLEAN=$1
+  _JSON_LOSSY=false
+  if command -v iconv >/dev/null 2>&1; then
+    # Some iconv builds (macOS) accept what is not UTF-8 to a JSON parser: bytes
+    # F5 to FF, which lead no character, and F4 followed by 90 to BF, which leads
+    # one above U+10FFFF. Those go first; the continuation bytes they leave alone
+    # are iconv's to drop. F4 followed by 80 to 8F is U+100000 to U+10FFFF, valid
+    # and kept.
+    src=$(printf '%sx' "$1" | LC_ALL=C tr -d '\365-\377')
+    src=${src%x}
+    if [ -n "$(printf '%s' "$src" | LC_ALL=C tr -cd '\364')" ]; then
+      _json_drop_above_unicode "$src"
+      src=$_JSON_CLEAN
+      _JSON_CLEAN=$1
+    fi
+    if [ "$src" = "$1" ] && printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+      return 0
+    fi
+    # The sentinel keeps the trailing newlines $(...) would strip, and ends a
+    # truncated sequence the way following bytes would: three of them, since a
+    # four-byte lead left with fewer behind it takes them down with it (macOS
+    # iconv drops an incomplete last character whole).
+    _JSON_CLEAN=$(printf '%sxxx' "$src" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true)
+    _JSON_CLEAN=${_JSON_CLEAN%xxx}
+    _JSON_LOSSY=true
+    return 0
+  fi
+  # Printable ASCII, tab, carriage return and newline stay.
+  ascii=$(printf '\t\r -~')
+  if [ -z "$(printf '%s' "$1" | LC_ALL=C tr -d "\n$ascii")" ]; then
+    return 0
+  fi
+  _JSON_CLEAN=$(printf '%sx' "$1" | LC_ALL=C tr -c "\n$ascii" '?')
+  _JSON_CLEAN=${_JSON_CLEAN%x}
+  _JSON_LOSSY=true
+}
+
+# _json_drop_above_unicode <s> — _JSON_CLEAN <- <s> without each F4 byte and the byte
+# from 90 to BF that follows it. Matched by the shell, byte by byte under the C locale: sed and awk
+# would drop the carriage return of a CRLF line under Git Bash (conventions/shell.md). The text is
+# split on F4 by word splitting, not stripped with ${s//pattern/}: on bash 3.2 that substitution
+# costs the text's length once per match, and a source file can be long and hold many of them.
+# The `x` keeps a trailing F4's empty field, and the trailing newlines $(...) would strip.
+#
+# The work runs in a $(...) with a plain LC_ALL=C, never under `local LC_ALL=C`: bash restores a
+# local locale on return, which crashes Homebrew's bash on macOS now and then, while the
+# subshell's assignment dies with it, unrestored (conventions/shell.md). The text comes back
+# through the same sentinel-guarded $(...) that json_utf8_clean already passes it through first,
+# and globbing needs no restoring there.
+_json_drop_above_unicode() {
+  _JSON_CLEAN=$(
+    LC_ALL=C
+    # Each pattern opens with `(`: bash 3.2 cannot parse a bare `pattern)` inside $(...).
+    case $1 in (*$'\364'*) ;; (*) printf '%sx' "$1"; exit 0 ;; esac
+    local IFS=$'\364' part first=1
+    local -a parts acc
+    set -f
+    # shellcheck disable=SC2206 # the split on IFS is the point; globbing is off
+    parts=(${1}x)
+    # The pieces are joined once at the end: appending each to one string would
+    # copy all of it again per F4.
+    for part in "${parts[@]}"; do
+      if [ -n "$first" ]; then acc[0]=$part; first=; continue; fi
+      case $part in
+        ([$'\220'-$'\277']*) acc[${#acc[@]}]=${part#?} ;;
+        (*) acc[${#acc[@]}]=$'\364'$part ;;
+      esac
+    done
+    IFS=
+    printf '%s' "${acc[*]}"
+  )
+  _JSON_CLEAN=${_JSON_CLEAN%x}
 }

@@ -1,5 +1,7 @@
 # <Spec name>
 
+Summary: <One or two sentences on what the spec makes true, for someone who has not read it.>
+
 Depth: <easy | normal | deep> — <why this level>
 
 ## Idea

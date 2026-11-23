@@ -600,8 +600,13 @@ jig_source_release() {
 # status.showUntrackedFiles=no in someone's git config, plain --porcelain
 # hides untracked files and a dirty checkout would read as clean. Shared with
 # self-update, which refuses a checkout with changes for the same reason.
+# Jig only asks someone's framework checkout about its changes and must not
+# take that checkout's index lock: git status otherwise refreshes the index and
+# holds .git/index.lock, colliding with the person's own git or with a parallel
+# copy of the tree. The env var rather than --no-optional-locks because an
+# older git ignores the variable but would reject the flag.
 jig_source_changes() {
-  git -C "$1" status --porcelain --untracked-files=all 2>/dev/null
+  GIT_OPTIONAL_LOCKS=0 git -C "$1" status --porcelain --untracked-files=all 2>/dev/null
 }
 
 # jig_source_clean <dir> — true when checkout <dir> has no tracked, staged or
@@ -1966,7 +1971,7 @@ _jig_bcs_judge() {
   if [ "$depth" -gt 0 ] && [ -n "$_JIG_BCS_TIPS" ]; then
     cut=$(printf '%s\n' "$line" | _JIG_BCS_V="$_JIG_BCS_TIPS" awk '
       BEGIN { n = split(ENVIRON["_JIG_BCS_V"], a, "\n"); for (i = 1; i <= n; i++) { split(a[i], f, " "); if (f[1] != "") t[f[1]] = f[2] } }
-      NF && ($1 in t) { r = t[$1]; sub(/^refs\/remotes\/origin\//, "", r); print $1 "\t" r; exit }')
+      NF && !done && ($1 in t) { r = t[$1]; sub(/^refs\/remotes\/origin\//, "", r); print $1 "\t" r; done = 1 }')
     if [ -n "$cut" ]; then
       printf '%s\t-\tcut from %s\n' "${cut%%$'\t'*}" "${cut#*$'\t'}"
       return 0
@@ -2023,7 +2028,7 @@ EOF
     # Judged at the commit that was merged.
     sub=$(_jig_bcs_judge "$p" "$base" "$stage" $((depth + 1)))
     [ -n "$sub" ] || return 1
-    why=$(printf '%s\n' "$sub" | awk -F '\t' 'NF { print $3; exit }')
+    why=$(printf '%s\n' "$sub" | awk -F '\t' '!d && NF { print $3; d = 1 }')
     case "$why" in
       "cut from "*) printf '%s, which itself is %s\n' "$dep" "$why" ;;
       *", which itself is nested too deep to judge") printf '%s, which itself is nested too deep to judge\n' "$dep" ;;
@@ -2272,14 +2277,74 @@ jig_fresh_base_ref() {
   fi
 }
 
-# jig_git_batch_ssh — the value for GIT_SSH_COMMAND that adds `-o
-# BatchMode=yes` on top of whatever SSH command the environment already
-# names (plain `ssh` when nothing does), so an `ssh://` or `git@` remote
-# fails a password/passphrase prompt instead of waiting for it. Paired with
-# `GIT_TERMINAL_PROMPT=0`, which does the same for git's own credential
-# helper (HTTPS remotes): together they cover every interactive-credential
-# path git has, on every network call that must never sit waiting for input
-# nobody will type (this task).
+# _jig_ssh_first_word <command> — the first word of an SSH command line as git
+# reads it: leading blanks skipped, then quotes grouping (not kept), a backslash
+# outside single quotes escaping the next character, a blank outside quotes
+# ending the word.
+_jig_ssh_first_word() {
+  local s="$1" i=0 n c q="" w=""
+  n=${#s}
+  while [ "$i" -lt "$n" ]; do
+    c=${s:i:1}
+    case "$c" in ' ' | $'\t' | $'\n') i=$((i + 1)) ;; *) break ;; esac
+  done
+  while [ "$i" -lt "$n" ]; do
+    c=${s:i:1}
+    i=$((i + 1))
+    if [ -n "$q" ]; then
+      if [ "$c" = "$q" ]; then
+        q=""
+      elif [ "$c" = "\\" ] && [ "$q" = '"' ] && [ "$i" -lt "$n" ]; then
+        w="$w${s:i:1}"
+        i=$((i + 1))
+      else
+        w="$w$c"
+      fi
+      continue
+    fi
+    case "$c" in
+      ' ' | $'\t' | $'\n') break ;;
+      "'" | '"') q=$c ;;
+      \\)
+        if [ "$i" -lt "$n" ]; then
+          w="$w${s:i:1}"
+          i=$((i + 1))
+        fi
+        ;;
+      *) w="$w$c" ;;
+    esac
+  done
+  printf '%s' "$w"
+}
+
+# jig_git_batch_ssh <repo> — the value for GIT_SSH_COMMAND that adds `-o
+# BatchMode=yes` on top of the SSH command git itself would run for <repo>, so
+# an `ssh://` or `git@` remote fails a password/passphrase prompt instead of
+# waiting for it. Paired with `GIT_TERMINAL_PROMPT=0`, which does the same for
+# git's own credential helper (HTTPS remotes): together they cover every
+# interactive-credential path git has, on every network call that must never
+# sit waiting for input nobody will type (this task).
+#
+# The base command is chosen in git's own order (connect.c), because
+# GIT_SSH_COMMAND set by a caller beats `core.sshCommand` and GIT_SSH: the first
+# that is non-empty wins — $GIT_SSH_COMMAND as is; `core.sshCommand` of <repo>;
+# $GIT_SSH, single-quoted for sh (git runs GIT_SSH without a shell but
+# GIT_SSH_COMMAND with one); plain `ssh`. <repo> is required: a clone that
+# picks its key through `core.sshCommand` must keep it under Jig, and a
+# worktree reads its clone's config, so the repository the call runs against
+# decides, not this tree.
+#
+# `-o BatchMode=yes` is OpenSSH's. The variant — $GIT_SSH_VARIANT, else
+# `ssh.variant` of <repo>, matched case-sensitively as git does, else guessed
+# from the program's name, case-insensitively (plink[.exe],
+# tortoiseplink[.exe]; for GIT_SSH the name of its path before quoting) — says
+# which no-prompt option the program takes: plink and putty get `-batch`
+# (unless the command already carries it), tortoiseplink none, since git adds
+# `-batch` for it itself, and simple none, as it takes no options at all;
+# ssh, auto and anything unrecognised get `-o BatchMode=yes`. The first word of
+# a command is read as git splits it (split_cmdline): quotes group and are not
+# part of the word, a backslash outside single quotes takes the next character
+# literally, a blank outside quotes ends it.
 #
 # Not a timeout. Neither this nor GIT_TERMINAL_PROMPT=0 bounds a call that
 # hangs for a different reason — a stalled TCP connection, a slow forge.
@@ -2288,7 +2353,56 @@ jig_fresh_base_ref() {
 # none is added here; a caller that must not wait past a budget runs the
 # call through jig_net below.
 jig_git_batch_ssh() {
-  printf '%s -o BatchMode=yes\n' "${GIT_SSH_COMMAND:-ssh}"
+  local repo="${1:-}" base="" variant="" prog="" gitssh
+  if [ -z "$repo" ]; then
+    # `GIT_SSH_COMMAND="$(jig_git_batch_ssh)" git ...` carries on after the
+    # error with an empty command, i.e. plain ssh that may ask: `false`
+    # refuses every connection, so such a call fails instead of waiting.
+    printf 'false\n'
+    jig_die "jig_git_batch_ssh: the repository argument is required"
+  fi
+  if [ -n "${GIT_SSH_COMMAND:-}" ]; then
+    base=$GIT_SSH_COMMAND
+  else
+    base=$(git -C "$repo" config --get core.sshCommand 2>/dev/null || true)
+  fi
+  if [ -z "$base" ]; then
+    if [ -n "${GIT_SSH:-}" ]; then
+      _jig_replace_all_v gitssh "$GIT_SSH" "'" "'\\''"
+      base="'$gitssh'"
+      prog=$GIT_SSH
+    else
+      base=ssh
+    fi
+  fi
+  variant=${GIT_SSH_VARIANT:-}
+  if [ -z "$variant" ]; then
+    variant=$(git -C "$repo" config --get ssh.variant 2>/dev/null || true)
+  fi
+  if [ -z "$variant" ] || [ "$variant" = auto ]; then
+    # GIT_SSH's path was kept above; a command's program is its first word.
+    if [ -z "$prog" ]; then
+      prog=$(_jig_ssh_first_word "$base")
+    fi
+    prog=${prog##*/}
+    prog=${prog##*\\}
+    prog=$(printf '%s' "$prog" | tr '[:upper:]' '[:lower:]')
+    case "$prog" in
+      plink | plink.exe) variant=plink ;;
+      tortoiseplink | tortoiseplink.exe) variant=tortoiseplink ;;
+      *) variant=ssh ;;
+    esac
+  fi
+  case "$variant" in
+    plink | putty)
+      case " $base " in
+        *" -batch "*) printf '%s\n' "$base" ;;
+        *) printf '%s -batch\n' "$base" ;;
+      esac
+      ;;
+    tortoiseplink | simple) printf '%s\n' "$base" ;;
+    *) printf '%s -o BatchMode=yes\n' "$base" ;;
+  esac
 }
 
 # _JIG_NET_DEADLINE — the epoch second after which no call through jig_net may
@@ -2402,7 +2516,7 @@ jig_ls_remote_tags() {
   max_ticks=$((seconds * 5))
   out=$(mktemp "${TMPDIR:-/tmp}/jig-lsremote.XXXXXX") || return 1
   jig_cleanup_add "$out"
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$root")" \
     git -C "$root" ls-remote --tags origin >"$out" 2>/dev/null &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
@@ -3155,14 +3269,14 @@ Nothing was pushed; the commit is on this machine, and running this again goes o
 jig_git_origin() {
   _jig_git_cred "$(_jig_git_origin_url "$1")"
   if [ -n "${_JIG_GH_IN_NET:-}" ]; then
-    GIT_SSH_COMMAND=$(jig_git_batch_ssh)
+    GIT_SSH_COMMAND=$(jig_git_batch_ssh "$JIG_PROJECT")
     GIT_TERMINAL_PROMPT=0
     export GIT_SSH_COMMAND GIT_TERMINAL_PROMPT
     # Not into git's hooks: a jig they run is not under this jig_net.
     unset _JIG_GH_IN_NET
     exec git ${_JIG_GIT_CRED[@]+"${_JIG_GIT_CRED[@]}"} -C "$JIG_PROJECT" "$@"
   fi
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$JIG_PROJECT")" \
     git ${_JIG_GIT_CRED[@]+"${_JIG_GIT_CRED[@]}"} -C "$JIG_PROJECT" "$@"
 }
 
@@ -4666,7 +4780,7 @@ jig_branch_worktree() {
   list=$(git -C "$JIG_PROJECT" worktree list --porcelain 2>/dev/null) || { printf '?\n'; return 0; }
   printf '%s\n' "$list" | awk -v want="branch refs/heads/$1" '
     /^worktree / { wt = substr($0, 10) }
-    $0 == want { print wt; exit }'
+    !d && $0 == want { print wt; d = 1 }'
 }
 
 # jig_base_fast_forward <base> — fast-forward the base to origin's, the only move it ever makes:
@@ -4952,11 +5066,19 @@ jig_spec_title_v() {
   local __jst_line
   printf -v "$1" '%s' ""
   [ -r "$2" ] && [ -f "$2" ] || return 0
+  # A glob, not a regex: under a UTF-8 locale `=~` matches nothing on a line
+  # holding a byte that is not UTF-8, while bash's glob falls back to bytes.
   while IFS= read -r __jst_line || [ -n "$__jst_line" ]; do
-    if [[ $__jst_line =~ ^#[[:space:]]+(.*)$ ]]; then
-      printf -v "$1" '%s' "${BASH_REMATCH[1]}"
-      return 0
-    fi
+    case $__jst_line in
+      '#'[[:space:]]*)
+        __jst_line=${__jst_line#?}
+        while case $__jst_line in [[:space:]]*) true ;; *) false ;; esac; do
+          __jst_line=${__jst_line#?}
+        done
+        printf -v "$1" '%s' "$__jst_line"
+        return 0
+        ;;
+    esac
   done < "$2"
 }
 

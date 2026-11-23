@@ -155,7 +155,9 @@ Every other run checks the roadmap here, before the commit:
 It checks the roadmap items that name the task when its `task.md` carries a `Spec:` line, so
 the checkmark reaches the base branch in the same change as the work; for a task with no link
 it says so and changes nothing. If it reports that no roadmap item names the task, the roadmap
-and the task disagree: ask the human, and do not edit the roadmap by hand.
+and the task disagree: ask the human, and do not edit the roadmap by hand. An item missed after the
+merge shows in `jig status` as `roadmap behind`; `jig spec item check <spec> --merged` checks it
+through a pull request.
 
 A task that was abandoned or moved instead of finished has no checkmark to earn: `jig task abandon
 <id> --reason` closed its item with why (`jig spec drop`). What the move decided about the system —

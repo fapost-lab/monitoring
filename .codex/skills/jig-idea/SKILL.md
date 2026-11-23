@@ -44,12 +44,18 @@ status; progress is read from its roadmap.
 
   It refuses a dirty tree by the same rule `task start` uses, then switches to `spec/<id>`
   — reusing the branch an earlier session shipped if it is still here, fetching it from
-  origin if only that has it, or cutting a fresh one otherwise. A spec with an open epic is
+  origin if only that has it, or cutting a fresh one otherwise. A reused branch is brought
+  up to date first, by the command, never by hand: moved to the default branch when all of
+  it is merged there, and the default branch merged in when it changed the spec since. Do
+  not delete a stale `spec/<id>` yourself; when `spec resume` refuses (a conflict, a
+  branch diverged from origin's or checked out in another worktree), do what it names and
+  run it again. A spec with an open epic is
   edited on the epic instead; `spec resume` says so and refuses, rather than cutting a
   `spec/<id>` nothing would ever ship — switch to the epic branch it names first. Only then
   read every file in the directory, starting from its open questions, its fog items and
   what it set aside — that is where the last session stopped. The files stay as they are
-  until §7.
+  until §7. A spec with no `Epic:` line whose roadmap `jig spec list` shows at `0/… done`
+  can still get an epic: ask the epic question of §8 again in this session.
 
 **When `spec resume` or `spec new` refuses a dirty tree**, the uncommitted changes are
 somebody else's — never work around it: name what `git status` shows and ask the human to
@@ -171,10 +177,13 @@ is an answer to that question, not the yes to write.
 
   It refuses an invalid or taken id and a dirty tree, writes `spec.md` and `roadmap.md`
   from the templates, and switches to a branch of its own, `spec/<id>`. Fill the files in,
-  starting with the heading of `spec.md`, which names the spec in `jig spec list`. Write
+  starting with the heading of `spec.md`, which names the spec in `jig spec list`, and the
+  `Summary:` line under it — one or two sentences on what the spec makes true, for someone
+  who has not read it; Jig UI shows it beside the title. Write
   the idea in the human's own words, not a retelling. Other files (`architecture.md`,
   `stack.md`, `research.md`) are added when the conversation needed them.
-- **Existing spec.** Edit its files on the branch §1 switched to.
+- **Existing spec.** Edit its files on the branch §1 switched to; one without a `Summary:` line
+  gets one.
 
 Write everything the summary held. A rejected option is recorded with its reason: the next
 session must not reopen the argument. What is unresolved goes to "Open questions", an
@@ -215,13 +224,19 @@ a round, and write it with the rest after the yes (§7). Format: the `roadmap.md
 - Waves group items that can run at the same time, in separate worktrees (ADR-0029). Wave N
   depends only on earlier waves.
 - No dates and no point estimates: order is the priority.
-- **Merged once, at the end?** When no phase gives a user anything on its own, the spec gets
-  an epic branch (ADR-0040). The command writes `roadmap.md`, so it runs after the yes (§7), once
-  the spec exists: `jig spec epic <id>` writes the `Epic:` line. The epic's final pull request
-  merges the finished feature without raising the version; the release that ships it is made apart,
-  by `jig-release` (adr-20261112-release-notes-name-the-commit-they-describe). `--release <level>`
-  is for a release epic only, which `jig-release` declares. A spec whose phases each ship on their
-  own gets no line — ask when unsure.
+- **Merged once, at the end?** Always ask, once the roadmap draft is shown and before the yes
+  of §7, whatever you think of the answer: piece by piece or in one go is a decision about the
+  product and the team's flow — review load, CI cost, users meeting a half-built feature — and it
+  is the human's. Say what you recommend and why, in their terms: an **epic** when no phase is
+  useful on its own, or the spec is large (several phases or waves); **no epic** when every phase
+  gives users something by itself. Record the answer in `spec.md` either way, with its reason:
+  "no epic" is a choice, not a default nobody made. An epic is an epic branch (ADR-0040). The
+  command writes `roadmap.md`, so it runs after the yes, once the spec exists: `jig spec epic <id>`
+  writes the `Epic:` line. The epic's final pull request merges the finished feature without
+  raising the version; the release that ships it is made apart, by `jig-release`
+  (adr-20261112-release-notes-name-the-commit-they-describe). `--release <level>` is for a release
+  epic only, which `jig-release` declares. A spec without an epic gets no `Epic:` line, never one
+  saying "none".
 - **Shipping the declaration and the epic.** The line reaches the default branch with the spec:
   stage `.ai/specs/<id>/` and run `jig spec ship <id> --message-file <file>`; once that is merged,
   `jig spec epic <id>` cuts the branch and `jig spec ship <id>` pushes it. `spec ship` goes as far

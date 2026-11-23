@@ -15,11 +15,11 @@
 # finishes and reopens a spec's epic branch (ADR-0035, ADR-0040 as amended),
 # and `ship` carries a declaration, an epic or an epic's final pull request as
 # far as `agent.git` allows (adr-20260922-spec-work-ships-by-the-agent-git-level);
-# `list` only reads. `draft` keeps a `jig-idea` conversation on disk before
+# `list` and `read` only read. `draft` keeps a `jig-idea` conversation on disk before
 # there is a spec, in the gitignored workspace ("idea drafts", at the end).
 # shellcheck shell=bash
 
-SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec draft write <id> --from <file>|- | jig spec draft rename <id> <new-id> | jig spec draft list | jig spec draft drop <id> | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> [--revision <n>] [--json] | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item file <id> <item> --task <task-id> | --new <task-id> [--goal <text>] (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
+SPEC_USAGE="usage: jig spec new <id> | jig spec resume <id> | jig spec list [--json] | jig spec read <id> spec|roadmap [--json] | jig spec draft write <id> --from <file>|- | jig spec draft rename <id> <new-id> | jig spec draft list | jig spec draft drop <id> | jig spec plan <id> --phase <n> [--format text|tsv] | jig spec stop <id> --phase <n> --reason <text> | jig spec done <task-id> | jig spec drop <task-id> [--revision <n>] [--json] | jig spec link <spec-id> <task-id> | jig spec item add <id> --phase <n> --text <t> [--after <item> | --top | --bottom] | jig spec item move <id> <item> [--phase <n>] [--after <item> | --top | --bottom] | jig spec item check <id> <item> | --merged | jig spec item file <id> <item> --task <task-id> | --new <task-id> [--goal <text>] (each [--revision <n>] [--json]) | jig spec close <id> [--leftovers-handled] | jig spec remove <id> [--dry-run] [--abandon-unstarted] | jig spec epic <id> [--release patch|minor|major | --finish [--leftovers-handled] | --reopen] | jig spec ship <id> [--message-file <file>] [--title <t>] [--body-file <file>]"
 
 cmd_spec() {
   local sub="${1:-}"
@@ -30,6 +30,7 @@ cmd_spec() {
     new) spec_new "$@"; jig_status_page_touch ;;
     resume) spec_resume "$@"; jig_status_page_touch ;;
     list) spec_list "$@" ;;
+    read) spec_read "$@" ;;
     # Redrawn only when the command wrote (jig_record_changed marks it):
     # `draft list` reads, and the page shows the count of drafts.
     draft) spec_draft "$@"; jig_status_page_flush ;;
@@ -97,28 +98,127 @@ _spec_cut_own_branch() {
   printf '%s\n' "$branch"
 }
 
-# _spec_switch_to_existing_branch <id> <cmd> — switch to `spec/<id>` when it
-# already exists, locally or on origin (fetched fresh first); nothing, and
-# exit 1, when it exists nowhere. Used by `spec resume`, where a spec's
-# branch from an earlier session may already be there, unlike `spec new`
-# and `spec ship`'s declaration, which only ever create one.
+# _spec_sha <ref> — the commit <ref> names, or nothing.
+_spec_sha() {
+  git -C "$JIG_PROJECT" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null || true
+}
+
+# _spec_is_ancestor <a> <b> — exit 0 when commit <a> is reachable from <b>.
+_spec_is_ancestor() {
+  git -C "$JIG_PROJECT" merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1
+}
+
+# _spec_switch_to_existing_branch <id> <cmd> <default> — switch to
+# `spec/<id>` when it already exists, locally or on origin, brought up to date
+# first; exit 1, having changed nothing, when it exists nowhere. Called from
+# <default> on a clean tree, by `spec resume` and by `spec drop`, where a
+# spec's branch from an earlier session may already be there, unlike
+# `spec new` and `spec ship`'s declaration, which only ever create one.
+#
+# A spec's branch outlives its pull request: merged, it stays here and on
+# origin while <default> goes on changing the spec (`spec done` rewrites the
+# roadmap). Taken as it is, it puts the next session on a base the default
+# branch has left, and that session's pull request conflicts — on which
+# GitHub runs no CI. So the branch is freshened before the switch, and never
+# by a reset (adr-20260930-a-spec-lives-on-its-own-branch-from-the-first-minute):
+#   - both `spec/<id>` and <default> are fetched first;
+#   - a branch checked out in another worktree is refused: it moves there;
+#   - behind origin's copy it is fast-forwarded to it; ahead, it keeps its
+#     unpushed commits; diverged from it, it is refused, naming both;
+#   - all of it already in <default> (origin's, else this clone's): moved to
+#     <default>'s tip, a fast-forward, said in one line;
+#   - commits of its own, and <default> changed the spec's directory since they
+#     forked: <default> is taken in with one merge commit, as
+#     adr-20261115-the-decisions-branch-takes-in-the-base does — only when
+#     needed, and not at `agent.git` `none`, where committing is the person's
+#     and a line names the merge instead. A conflict is aborted and refused,
+#     naming the files, with HEAD back on <default>.
+# Every line it says goes to stderr; stdout stays empty.
 _spec_switch_to_existing_branch() {
-  local id="$1" cmd="$2" branch
+  local id="$1" cmd="$2" default="$3" branch local_sha origin_sha tip where
+  local base_ref base_sha fork rel line level key files
   branch="spec/$id"
-  if git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1; then
-    git -C "$JIG_PROJECT" switch --quiet "$branch" >/dev/null 2>&1 \
-      || jig_die "$cmd: could not switch to $branch"
-    printf '%s\n' "$branch"
-    return 0
-  fi
+  rel="$JIG_AI_DIR/specs/$id"
+  jig_fetch_branches "$cmd" "$default"
   jig_fetch_branches "$cmd" "$branch" 2>/dev/null
-  if git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null 2>&1; then
-    git -C "$JIG_PROJECT" switch --quiet -c "$branch" --track "origin/$branch" >/dev/null 2>&1 \
-      || jig_die "$cmd: could not switch to origin/$branch"
-    printf '%s\n' "$branch"
+  local_sha=$(_spec_sha "refs/heads/$branch")
+  origin_sha=$(_spec_sha "refs/remotes/origin/$branch")
+  [ -n "$local_sha$origin_sha" ] || return 1
+
+  where=$(jig_branch_worktree "$branch")
+  [ "$where" != "?" ] \
+    || jig_die "$cmd: git could not list this clone's worktrees, so $branch may be checked out in one; nothing was changed"
+  [ -z "$where" ] \
+    || jig_die "$cmd: $branch is checked out in $where; work on the spec there, or switch that checkout to another branch and run again"
+
+  if [ -z "$local_sha" ]; then
+    tip=$origin_sha
+  elif [ -z "$origin_sha" ] || [ "$local_sha" = "$origin_sha" ]; then
+    tip=$local_sha
+  elif _spec_is_ancestor "$local_sha" "$origin_sha"; then
+    tip=$origin_sha
+  elif _spec_is_ancestor "$origin_sha" "$local_sha"; then
+    tip=$local_sha
+  else
+    jig_die "$cmd: $branch and origin/$branch have diverged; merge origin/$branch into $branch, then run again"
+  fi
+
+  base_ref="origin/$default"
+  base_sha=$(_spec_sha "refs/remotes/origin/$default")
+  if [ -z "$base_sha" ]; then
+    base_ref=$default
+    base_sha=$(_spec_sha "refs/heads/$default")
+  fi
+  if [ -n "$base_sha" ] && [ "$tip" != "$base_sha" ] && _spec_is_ancestor "$tip" "$base_sha"; then
+    tip=$base_sha
+    printf '%s: %s is all in %s already; moved it there (%s)\n' \
+      "$cmd" "$branch" "$base_ref" "$(git -C "$JIG_PROJECT" rev-parse --short "$tip")" >&2
+  fi
+
+  # Only fast-forwards from here: every move above lands on a descendant.
+  if [ -z "$local_sha" ]; then
+    git -C "$JIG_PROJECT" branch --quiet --track "$branch" "origin/$branch" >/dev/null 2>&1 \
+      || jig_die "$cmd: could not create $branch from origin/$branch"
+    local_sha=$origin_sha
+  fi
+  if [ "$tip" != "$local_sha" ]; then
+    git -C "$JIG_PROJECT" update-ref -m "jig $cmd: fast-forward" "refs/heads/$branch" "$tip" "$local_sha" >/dev/null 2>&1 \
+      || jig_die "$cmd: could not fast-forward $branch"
+  fi
+  git -C "$JIG_PROJECT" switch --quiet "$branch" >/dev/null 2>&1 \
+    || jig_die "$cmd: could not switch to $branch"
+
+  # Commits of its own, and the default branch moved on under the spec.
+  [ -n "$base_sha" ] || return 0
+  _spec_is_ancestor "$base_sha" "$tip" && return 0
+  fork=$(git -C "$JIG_PROJECT" merge-base "$tip" "$base_sha" 2>/dev/null) || fork=""
+  [ -n "$fork" ] || return 0
+  git -C "$JIG_PROJECT" diff --quiet "$fork" "$base_sha" -- "$rel" 2>/dev/null && return 0
+  line=$(spec_ship_git 2>/dev/null) || line=$'none\tagent.git'
+  level=${line%%$'\t'*}
+  key=${line#*$'\t'}
+  if [ "$level" = none ]; then
+    printf '%s: %s changed %s/ after %s was cut; %s is none in this clone, so merge it yourself: git merge %s\n' \
+      "$cmd" "$base_ref" "$rel" "$branch" "$key" "$base_ref" >&2
     return 0
   fi
-  return 1
+  if ! git -C "$JIG_PROJECT" merge --quiet --no-ff --no-commit "$base_sha" >/dev/null 2>&1; then
+    files=$(git -C "$JIG_PROJECT" diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/  /')
+    git -C "$JIG_PROJECT" merge --abort >/dev/null 2>&1 || true
+    git -C "$JIG_PROJECT" switch --quiet "$default" >/dev/null 2>&1 \
+      || jig_die "$cmd: $branch conflicts with $base_ref, and switching back to $default failed"
+    jig_die "$cmd: $branch conflicts with $base_ref; switched back to $default. Resolve it on the branch (git switch $branch && git merge $base_ref), commit, then run again. Conflicting:
+${files:-  (git named no file)}"
+  fi
+  if ! git -C "$JIG_PROJECT" commit --quiet --no-edit \
+      -m "Take $base_ref into $branch" \
+      -m "$base_ref changed $rel/ after $branch was cut." >/dev/null 2>&1; then
+    git -C "$JIG_PROJECT" merge --abort >/dev/null 2>&1 || true
+    git -C "$JIG_PROJECT" switch --quiet "$default" >/dev/null 2>&1 || true
+    jig_die "$cmd: could not commit the merge of $base_ref into $branch; switched back to $default"
+  fi
+  printf '%s: took %s into %s: it changed %s/ after the branch was cut\n' \
+    "$cmd" "$base_ref" "$branch" "$rel" >&2
 }
 
 # _spec_refuse_dirty_tree <cmd> — refuse a dirty tree by the same rule
@@ -205,10 +305,12 @@ spec_new() {
 # spec_resume <id> — before a second session edits an existing spec, put it
 # back on its own branch: the same dirty-tree refusal `spec new` uses, then a
 # switch to `spec/<id>` (created if this is its first resume, reused if an
-# earlier one already cut it, fetched from origin if only that has it).
-# `jig-idea` calls this before touching an existing spec's files, so the
-# roadmap `jig spec new` files tasks into (step 10, jig-idea) is edited on
-# the branch too, never straight on the default one
+# earlier one already cut it, fetched from origin if only that has it — and,
+# reused, brought up to date with origin and the default branch first,
+# _spec_switch_to_existing_branch). `jig-idea` calls this before touching an
+# existing spec's files, so the roadmap `jig spec new` files tasks into
+# (step 10, jig-idea) is edited on the branch too, never straight on the
+# default one
 # (idea-leaves-a-tree-task-start-refuses).
 #
 # A spec with an open epic is edited on the epic instead (jig-idea says so);
@@ -237,8 +339,7 @@ spec_resume() {
   fi
   _spec_require_default_branch "spec resume" "$default"
   _spec_refuse_dirty_tree "spec resume"
-  branch=$(_spec_switch_to_existing_branch "$id" "spec resume") || branch=""
-  if [ -z "$branch" ]; then
+  if ! _spec_switch_to_existing_branch "$id" "spec resume" "$default"; then
     branch=$(_spec_cut_own_branch "$id" "spec resume") || exit 1
   fi
   printf 'switched to %s\n' "$branch"
@@ -281,12 +382,173 @@ spec_title() {
   [ -z "$t" ] || printf '%s\n' "$t"
 }
 
+# spec_summary_v <var> <spec.md> — the spec's short description into <var>, empty
+# when there is none; the parse starts no process (the caller cleans the text for JSON). It is the
+# paragraph that opens with a `Summary:` line in the head of spec.md, before the
+# first `## ` heading (schemas/spec.md): the line's text and the non-blank lines
+# after it, up to a blank line or a heading, each trimmed and joined by one space.
+# A `Summary:` further down — quoted in the Idea, say — is never read. An empty
+# value, or the template's `<…>` placeholder left as it is, reads as none.
+spec_summary_v() {
+  local __ssv_line __ssv_out="" __ssv_in=0 __ssv_inner
+  printf -v "$1" '%s' ""
+  if [ ! -r "$2" ] || [ ! -f "$2" ]; then return 0; fi
+  # Glob patterns and expansions, never `=~`: under a UTF-8 locale a regex does not
+  # match across a byte that is not UTF-8, and the summary would vanish unseen;
+  # the caller drops such bytes (json_utf8_clean) instead.
+  while IFS= read -r __ssv_line || [ -n "$__ssv_line" ]; do
+    __ssv_line=${__ssv_line%$'\r'}
+    case "$__ssv_line" in '##'*) break ;; esac
+    if [ "$__ssv_in" -eq 0 ]; then
+      case "$__ssv_line" in Summary:*) ;; *) continue ;; esac
+      __ssv_line=${__ssv_line#Summary:}
+      __ssv_in=1
+    else
+      case "$__ssv_line" in '#'*) break ;; esac
+      __ssv_in=2
+    fi
+    __ssv_line=${__ssv_line#"${__ssv_line%%[![:space:]]*}"}
+    __ssv_line=${__ssv_line%"${__ssv_line##*[![:space:]]}"}
+    if [ -z "$__ssv_line" ]; then
+      # A blank line ends the paragraph; an empty `Summary:` line itself does not.
+      [ "$__ssv_in" -eq 1 ] || break
+      continue
+    fi
+    __ssv_out="${__ssv_out:+$__ssv_out }$__ssv_line"
+  done < "$2"
+  case "$__ssv_out" in
+    '<'*'>')
+      __ssv_inner=${__ssv_out#<}
+      __ssv_inner=${__ssv_inner%>}
+      case "$__ssv_inner" in *'<'* | *'>'*) ;; *) __ssv_out="" ;; esac
+      ;;
+  esac
+  printf -v "$1" '%s' "$__ssv_out"
+}
+
 # spec_progress <roadmap.md> — "roadmap D/T done, F filed, fog G": the sum of
-# spec_phase_counts, so the whole and its phases cannot disagree.
+# spec_phase_counts, so the whole and its phases cannot disagree. When an
+# unchecked item counted as done because its task merged, the line says so at
+# its end (", N merged but unchecked"): the count is right, and the checkmark
+# is still owed (`jig spec item check`). The tail counts only what that command
+# would still check (_spec_there_v), the rule `jig status` reads too.
 spec_progress() {
-  spec_phase_counts "$1" | awk -F '\t' '
+  local rows there id
+  id=${1%/roadmap.md}
+  id=${id##*/}
+  rows=$(spec_phase_counts "$1" items)
+  _spec_there_v there "$id" "$1" "$rows"
+  { [ -z "$there" ] || printf '%s\n' "$there"; printf '%s\n' "$rows"; } | _spec_progress_sum
+}
+
+# _spec_progress_sum — the `spec_phase_counts <file> items` output on stdin, as
+# spec_progress prints it, after any `there<TAB><task-id>` lines (_spec_there_v).
+# Item rows only feed the unchecked-and-done count, and an item whose task is
+# checked there is not behind; the section lines carry the sums.
+_spec_progress_sum() {
+  awk -F '\t' '
+    $1 == "there" { there[$2] = 1; next }
+    $1 == "item" { if ($2 == 0 && $3 == 1 && !(substr($4, 2) in there)) behind++; next }
+    $1 == "section" { next }
     { done += $3; total += $4; filed += $5; fog += $6 }
-    END { printf "roadmap %d/%d done, %d filed, fog %d\n", done, total, filed, fog }
+    END {
+      printf "roadmap %d/%d done, %d filed, fog %d", done, total, filed, fog
+      if (behind > 0) printf ", %d merged but unchecked", behind
+      printf "\n"
+    }
+  '
+}
+
+# _spec_there_v <var> <spec-id> <roadmap.md> <rows> — <var> gets one
+# `there<TAB><task-id>` line for each checked item that names a task, in the
+# roadmap where `jig spec item check` would start its write. Asked only when
+# <rows> (the `spec_phase_counts <roadmap> items` output) holds an item that is
+# unchecked and counted as done: this checkout's copy may lag the base, a worktree
+# cut before a task of the spec merged or a main nobody pulled, and a checkmark
+# owed here may be made there already. The write starts from the tip of spec/<id>
+# while an earlier one still waits there, else from the base branch as of the last
+# fetch (no fetch here). Empty when there is nothing to ask: no such item, no ref,
+# no copy of the roadmap in it, or an open epic, whose roadmap is read from the
+# epic (jig_spec_roadmap_ref_v) or is the checkout's own with checkmarks no pull
+# request carried yet. A walk resolves the base ref and the records directory once
+# (_spec_merged_memo); a lone call resolves them here.
+_spec_there_v() {
+  local __v="$1" id="$2" roadmap="$3" rows="$4" line ref base dir c d rest out=""
+  printf -v "$__v" '%s' ""
+  case $'\n'"$rows" in *$'\nitem\t0\t1\t'*) ;; *) return 0 ;; esac
+  jig_spec_epic_v line "$roadmap" 2>/dev/null || line=""
+  if [ -n "$line" ] && [ "${line##* }" != finished ]; then return 0; fi
+  if [ "${_SPEC_MERGED_MEMO:-}" = 1 ]; then
+    base=${_SPEC_BASE_REF:-}
+    dir=${_SPEC_REC_DIR:-}
+  else
+    cfg_v base git.base_branch main
+    jig_base_ref_v base "$base"
+    # shellcheck source=lib/owntree.sh
+    . "$JIG_LIB/owntree.sh"
+    dir=$(ot_records_dir)
+  fi
+  ref=$base
+  # A record file first: ot_waiting finds the records directory by forking.
+  if [ -n "$dir" ] && [ -f "$dir/spec-$id" ]; then
+    if ot_waiting "spec:$id"; then ref=$OT_W_TIP; fi
+  fi
+  [ -n "$ref" ] || return 0
+  while IFS=$'\t' read -r c d rest; do
+    [ "$c" = item ] && [ "$d" = 1 ] || continue
+    # rest is `<done>`, `=<task-id>`, then the fields no one here reads.
+    rest=${rest#*$'\t'}
+    rest=${rest%%$'\t'*}
+    [ "$rest" != = ] || continue
+    out="${out:+$out$'\n'}there"$'\t'"${rest#=}"
+  done < <(jig_git_show_path "$ref" "$JIG_AI_DIR/specs/$id/roadmap.md" 2>/dev/null | spec_phase_counts - items)
+  printf -v "$__v" '%s' "$out"
+}
+
+# spec_merged_unchecked_rows — `<spec-id>\t<n>` for every spec with n > 0
+# unchecked items whose task is known to have merged, for `jig status`. A
+# roadmap is read where it is current, as spec_phase_rows does, and an item
+# already checked where the write of `spec item check` starts is not counted
+# (_spec_there_v), so this and spec_progress's tail cannot disagree. One awk
+# counts every spec's rows after the walk: no process chain per spec.
+spec_merged_unchecked_rows() {
+  local root id roadmap loc ref source rows there
+  local _SPEC_MERGED_MEMO _SPEC_MERGED _SPEC_MERGED_SET _SPEC_BASE_REF _SPEC_REC_DIR
+  root=$(spec_dir)
+  _spec_merged_memo
+  # No merged task, nothing can be behind.
+  [ -n "$_SPEC_MERGED" ] || return 0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    roadmap="$root/$id/roadmap.md"
+    [ -f "$roadmap" ] || continue
+    jig_spec_roadmap_ref_v loc "$id" || continue
+    printf 'spec\t%s\n' "$id"
+    if [ -n "$loc" ]; then
+      IFS=$'\t' read -r ref source <<EOF
+$loc
+EOF
+      jig_git_show_path "$ref" "$JIG_AI_DIR/specs/$id/roadmap.md" 2>/dev/null \
+        | spec_phase_counts - items || true
+    else
+      rows=$(spec_phase_counts "$roadmap" items)
+      _spec_there_v there "$id" "$roadmap" "$rows"
+      [ -z "$there" ] || printf '%s\n' "$there"
+      printf '%s\n' "$rows"
+    fi
+  done < <(spec_ids) | _spec_unchecked_done_rows
+}
+
+# _spec_unchecked_done_rows — spec_merged_unchecked_rows's stream on stdin: a
+# `spec<TAB><id>` line opens each spec, its `there<TAB><task-id>` lines and item
+# rows follow. `<id><TAB><n>` for each spec with n > 0 unchecked items that counted
+# as done and whose task is not checked there.
+_spec_unchecked_done_rows() {
+  awk -F '\t' '
+    $1 == "spec" { cur = $2; order[++k] = cur; next }
+    $1 == "there" { there[cur SUBSEP $2] = 1; next }
+    $1 == "item" && $2 == 0 && $3 == 1 && !((cur SUBSEP substr($4, 2)) in there) { n[cur]++ }
+    END { for (i = 1; i <= k; i++) if (n[order[i]] > 0) printf "%s\t%d\n", order[i], n[order[i]] }
   '
 }
 
@@ -323,7 +585,11 @@ spec_progress() {
 spec_phase_counts() {
   local items=0 merged
   [ "${2:-}" != items ] || items=1
-  merged=" $(spec_merged_task_ids | cut -f1 | tr '\n' ' ') "
+  if [ "${_SPEC_MERGED_MEMO:-}" = 1 ]; then
+    merged=$_SPEC_MERGED_SET
+  else
+    merged=" $(spec_merged_task_ids | cut -f1 | tr '\n' ' ') "
+  fi
   # The set reaches awk through the environment: a `-v` value has its escapes
   # expanded.
   JIG_SP_MERGED="$merged" awk -v items="$items" '
@@ -465,7 +731,7 @@ _spec_item_ids() {
 # whether the ref is the remote's as of the last fetch; with no ref at all it
 # has no rows, and spec_list_rows already says `branch missing`.
 spec_phase_rows() {
-  local root id roadmap loc ref source _SPEC_MERGED_MEMO _SPEC_MERGED
+  local root id roadmap loc ref source _SPEC_MERGED_MEMO _SPEC_MERGED _SPEC_MERGED_SET _SPEC_BASE_REF _SPEC_REC_DIR
   root=$(spec_dir)
   _spec_merged_memo
   while IFS= read -r id; do
@@ -524,20 +790,36 @@ spec_list() {
 
 # _spec_list_json [--json] — the producer of `jig spec list --json`
 # (schemas/json.md): `{"specs":[...]}`, one object per spec in spec_ids order.
-# Every value is read from what already answers it — spec_title, jig_spec_epic,
+# Every value is read from what already answers it — spec_title, spec_summary_v, jig_spec_epic,
 # jig_spec_roadmap_ref (where the current roadmap is, as the status page reads it),
 # spec_phase_items (the counts of spec_phase_counts with their items) and
 # spec_release_check. Local refs only: no fetch, no forge.
+#
+# A title, a summary or an item is text a person committed and may hold bytes
+# that are not UTF-8 (conventions/json-output.md): the whole value is cleaned
+# once, as knowledge.sh's _km_json_print does, so the processes the cleaning
+# starts do not grow with the number of specs.
 _spec_list_json() {
-  local arg root id dir title missing line branch state here checked_out
-  local loc rc ref src content release epic phases progress waiting
-  local _SPEC_MERGED_MEMO _SPEC_MERGED
+  local arg out rc=0
   for arg in "$@"; do
     [ "$arg" = --json ] || jig_fail usage "spec list: unexpected argument: $arg"
   done
   jig_require_repo
   # shellcheck source=lib/owntree.sh
   . "$JIG_LIB/owntree.sh"
+  # The sentinel keeps the trailing newlines $(...) would strip.
+  out=$(_spec_list_json_specs && printf x) || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  json_utf8_clean "${out%x}"
+  printf '%s' "$_JSON_CLEAN"
+}
+
+# _spec_list_json_specs — `{"specs":[...]}` as _spec_list_json prints it, before
+# the cleaning.
+_spec_list_json_specs() {
+  local root id dir title summary missing line branch state here checked_out
+  local loc rc ref src content release epic phases progress waiting
+  local _SPEC_MERGED_MEMO _SPEC_MERGED _SPEC_MERGED_SET _SPEC_BASE_REF _SPEC_REC_DIR
   root=$(spec_dir)
   _spec_merged_memo
   here=$(git -C "$JIG_PROJECT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
@@ -546,9 +828,10 @@ _spec_list_json() {
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     dir="$root/$id"
-    title="" missing=""
+    title="" summary="" missing=""
     if [ -f "$dir/spec.md" ]; then
       title=$(spec_title "$dir/spec.md")
+      spec_summary_v summary "$dir/spec.md"
     else
       missing='"spec.md"'
     fi
@@ -591,7 +874,9 @@ _spec_list_json() {
     json_quote "$id"
     printf '%s{"id":%s' "$sep" "$_JSON"
     json_str_or_null "$title"
-    printf ',"title":%s,"missing_files":[%s]' "$_JSON" "$missing"
+    printf ',"title":%s' "$_JSON"
+    json_str_or_null "$summary"
+    printf ',"summary":%s,"missing_files":[%s]' "$_JSON" "$missing"
     json_str_or_null "$release"
     printf ',"release":%s,"epic":%s' "$_JSON" "$epic"
     _spec_json_waiting "$id"
@@ -600,6 +885,92 @@ _spec_list_json() {
     sep=","
   done < <(spec_ids)
   printf ']}\n'
+}
+
+# spec_read <id> spec|roadmap [--json] — `jig spec read`: one document of a spec as
+# it is written, for a reader that must not open `.ai/specs/` itself (Jig UI). Text:
+# the file's bytes as they are; `--json`: an object holding them as a string
+# (schemas/json.md). Only reads: no revision, no status page.
+spec_read() {
+  local arg
+  for arg in "$@"; do
+    if [ "$arg" = --json ]; then
+      # shellcheck source=lib/json.sh
+      . "$JIG_LIB/json.sh"
+      json_run _spec_read_json "$@"
+      return
+    fi
+  done
+  _spec_read 0 "$@"
+}
+
+# _spec_read_json <args...> — the producer json_run runs: `--json` may stand
+# anywhere among the arguments.
+_spec_read_json() {
+  local arg args=()
+  for arg in "$@"; do
+    [ "$arg" = --json ] || args+=("$arg")
+  done
+  _spec_read 1 ${args[@]+"${args[@]}"}
+}
+
+# _spec_read <as_json> <id> <kind> — the document read where `spec list --json`
+# reads it, so the text and the phases beside it cannot disagree: spec.md from
+# the checkout, as the title and summary are; roadmap.md from the ref of an open
+# epic checked out elsewhere (jig_spec_roadmap_ref_v, ADR-0040), else from the
+# checkout. An edit still waiting on `spec/<id>` is not shown here: `spec list
+# --json` gives its phases as `waiting`.
+_spec_read() {
+  local as_json="$1" id kind root rel loc="" rc=0 ref="" content out
+  shift
+  local usage="usage: jig spec read <id> spec|roadmap [--json]"
+  [ $# -eq 2 ] || jig_fail usage "spec read: $usage"
+  id=$1 kind=$2
+  case "$id" in -*) jig_fail usage "spec read: unexpected argument: $id ($usage)" ;; esac
+  case "$kind" in
+    spec | roadmap) ;;
+    -*) jig_fail usage "spec read: unexpected argument: $kind ($usage)" ;;
+    *) jig_fail usage "spec read: unknown document: $kind (one of: spec, roadmap)" ;;
+  esac
+  jig_require_repo
+  spec_valid_id "$id" || jig_fail usage "spec read: invalid spec id: $id"
+  root=$(spec_dir)
+  [ -d "$root/$id" ] || jig_fail not-found "spec read: no spec $id"
+  rel="$JIG_AI_DIR/specs/$id/$kind.md"
+  if [ "$kind" = roadmap ]; then
+    jig_spec_roadmap_ref_v loc "$id" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      jig_fail epic-missing "spec read: the roadmap of $id is on its epic, and the epic's branch is neither here nor fetched from the remote"
+    fi
+    [ -z "$loc" ] || ref=${loc%%$'\t'*}
+  fi
+  # The sentinel keeps the trailing newlines $(...) would strip.
+  if [ -n "$ref" ]; then
+    content=$(jig_git_show_path "$ref" "$rel" 2>/dev/null && printf x) \
+      || jig_fail not-found "spec read: $id has no $kind.md on $ref"
+  else
+    [ -f "$root/$id/$kind.md" ] || jig_fail not-found "spec read: $id has no $kind.md"
+    if [ "$as_json" != 1 ]; then
+      cat "$root/$id/$kind.md" || jig_die "spec read: cannot read $rel"
+      return 0
+    fi
+    content=$(cat "$root/$id/$kind.md" && printf x) || jig_die "spec read: cannot read $rel"
+  fi
+  content=${content%x}
+  if [ "$as_json" != 1 ]; then
+    printf '%s' "$content"
+    return 0
+  fi
+  json_quote "$id"; out="{\"spec\":$_JSON,\"kind\":\"$kind\","
+  json_quote "$rel"; out="$out\"path\":$_JSON,"
+  json_str_or_null "$ref"; out="$out\"ref\":$_JSON,"
+  out="$out\"bytes\":$(printf '%s' "$content" | wc -c | tr -d ' '),"
+  # A committed file may hold bytes that are not UTF-8, and one of them would make
+  # the whole line invalid JSON: they are dropped, and `lossy` says so, as
+  # `knowledge read` does (conventions/json-output.md).
+  json_utf8_clean "$content"
+  json_quote_text "$_JSON_CLEAN"
+  printf '%s"content":%s,"lossy":%s}\n' "$out" "$_JSON" "$_JSON_LOSSY"
 }
 
 # _spec_json_waiting <id> — _SPEC_JSON_WAITING <- the edit of this spec that has not
@@ -666,7 +1037,7 @@ _spec_json_phases() {
 # renders it (ARCHITECTURE.md, Scripts layout: a reporting command consumes a
 # peer's answer, never recomputes it).
 spec_list_rows() {
-  local root id title state missing _SPEC_MERGED_MEMO _SPEC_MERGED
+  local root id title state missing _SPEC_MERGED_MEMO _SPEC_MERGED _SPEC_MERGED_SET _SPEC_BASE_REF _SPEC_REC_DIR
   root=$(spec_dir)
   _spec_merged_memo
   while IFS= read -r id; do
@@ -1126,10 +1497,16 @@ ROW
 # `<task-id>\t<closed|housekeeping>` line each: `closed` for a task whose
 # workspace `state` says `consolidated` (ADR-0030 closes a task only after its
 # change landed), then `housekeeping` for an id the newest housekeeping run
-# logged `remote=merged` and that is not closed. The one rule every reader of
-# "merged" shares — the roadmap counts (spec_phase_counts) and `spec plan` —
-# read offline: no fetch, no forge call. Both sources are local and
-# gitignored, so a clone holding neither knows only the roadmap's checkmarks.
+# logged `remote=merged` and that is not closed, and for an id any run purged
+# as merged (`action=purge remote=merged`) whose workspace is gone: housekeeping
+# removes a merged task's workspace at once, so after one more run the first
+# two sources have forgotten it, and the purge line is the one trace the log
+# keeps (_hk_log_trim). An id with a workspace now is a live task, maybe a new
+# one that reused the name, and never reads as merged from an old purge. The
+# one rule every reader of "merged" shares — the roadmap counts
+# (spec_phase_counts) and `spec plan` — read offline: no fetch, no forge call.
+# All sources are local and gitignored, so a clone holding none knows only the
+# roadmap's checkmarks.
 #
 # Inside a walk over every spec the answer is the one _spec_merged_memo read
 # at its start, not read again per spec.
@@ -1142,15 +1519,34 @@ spec_merged_task_ids() {
 }
 
 # _spec_merged_memo — read spec_merged_task_ids once for a walk over every
-# spec. The walk declares `local _SPEC_MERGED_MEMO _SPEC_MERGED` and calls this
+# spec. The walk declares `local _SPEC_MERGED_MEMO _SPEC_MERGED _SPEC_MERGED_SET
+# _SPEC_BASE_REF _SPEC_REC_DIR` and calls this
 # before its loop; bash scopes locals dynamically, so every spec_phase_counts
 # under it, subshells included, answers from that one read, and the memo ends
 # with the walk -- a later reader in the same process reads again. Asked per
 # spec, the read cost 20 specs a pass over every task's state and the whole
 # housekeeping log each: 6.8 s where 0.37.0 took 0.76.
 _spec_merged_memo() {
+  local tid rest
   _SPEC_MERGED=$(_spec_merged_task_ids_read)
+  _SPEC_MERGED_SET=" "
+  _SPEC_BASE_REF=""
+  _SPEC_REC_DIR=""
   _SPEC_MERGED_MEMO=1
+  [ -n "$_SPEC_MERGED" ] || return 0
+  while IFS=$'\t' read -r tid rest; do
+    _SPEC_MERGED_SET="$_SPEC_MERGED_SET$tid "
+  done <<MERGED_EOF
+$_SPEC_MERGED
+MERGED_EOF
+  # Only a walk that has a merged task can find a checkmark owed: the base ref
+  # and the records directory (a fork or two) are read once for it, for
+  # _spec_there_v, not once per spec.
+  cfg_v tid git.base_branch main
+  jig_base_ref_v _SPEC_BASE_REF "$tid"
+  # shellcheck source=lib/owntree.sh
+  . "$JIG_LIB/owntree.sh"
+  _SPEC_REC_DIR=$(ot_records_dir)
 }
 
 _spec_merged_task_ids_read() {
@@ -1175,13 +1571,37 @@ _spec_merged_task_ids_read() {
       }
     ' "$@" 2>/dev/null) || closed=""
   fi
+  # Ids from the log are validated before they name a path (RULES.md), and an
+  # id with a workspace now is a live task, never merged by an old purge.
+  local pid purged="" purged_all
+  purged_all=$(_spec_purged_merged_ids)
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    jig_valid_id "$pid" || continue
+    [ -d "$ws/$pid" ] || purged="${purged:+$purged
+}$pid"
+  done <<EOF
+$purged_all
+EOF
   {
     [ -z "$closed" ] || printf '%s\n' "$closed" | awk '{ print "c\t" $0 }'
     _spec_plan_hk_merged | awk '{ print "h\t" $0 }'
+    [ -z "$purged" ] || printf '%s\n' "$purged" | awk '{ print "h\t" $0 }'
   } | awk -F '\t' '
     $1 == "c" { if (!($2 in seen)) { seen[$2] = 1; printf "%s\tclosed\n", $2 } ; next }
     $1 == "h" { if (!($2 in seen)) { seen[$2] = 1; printf "%s\thousekeeping\n", $2 } }
   '
+}
+
+# _spec_purged_merged_ids — the task ids of every purge line of the whole
+# housekeeping log that says `remote=merged`, read by the log's shared parser
+# (hklog_purged_merged_ids). The caller drops the ones that have a workspace again.
+_spec_purged_merged_ids() {
+  command -v hklog_purged_merged_ids >/dev/null 2>&1 || {
+    # shellcheck source=lib/hklog.sh
+    . "$JIG_LIB/hklog.sh"
+  }
+  hklog_purged_merged_ids
 }
 
 # _spec_plan_hk_merged — the task ids the newest housekeeping run found merged
@@ -1809,6 +2229,37 @@ spec_ship_removed_src() {
     || jig_die "spec ship: cannot resolve $ref"
 }
 
+# spec_ship_merges_cleanly <branch> <base> — refuse, naming the files, when
+# <branch> does not merge into <base> without conflicts: GitHub runs no CI on a
+# conflicting pull request, so it would sit unchecked until someone noticed.
+# Refused before anything leaves the machine, the commit stays local
+# (adr-20260925-a-ship-refuses-before-it-sends). `merge-tree --write-tree`
+# merges in memory, so neither the working tree nor the index is touched. A git
+# that cannot do it (older than 2.38) or histories it cannot merge only warn:
+# the check is a courtesy, the pull request still tells.
+spec_ship_merges_cleanly() {
+  local branch="$1" base="$2" base_ref out rc=0 files
+  jig_fetch_branches "spec ship" "$base"
+  base_ref=$(jig_base_ref "$base")
+  [ -n "$base_ref" ] || return 0
+  out=$(git -C "$JIG_PROJECT" merge-tree --write-tree --name-only --no-messages "$base_ref" "$branch" 2>/dev/null) || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      files=$(printf '%s\n' "$out" | sed 1d | sed '/^$/d' | sort -u)
+      base_ref=${base_ref#refs/remotes/}
+      base_ref=${base_ref#refs/heads/}
+      jig_die "spec ship: $branch does not merge into $base_ref without conflicts, and GitHub runs no CI on a conflicting pull request. Conflicting files:
+$files
+Nothing was pushed and no pull request opened; the commit is on this machine. Merge $base into $branch, resolve the conflicts, and run \`jig spec ship\` again."
+      ;;
+    *)
+      jig_warn "spec ship: could not check whether $branch merges into $base without conflicts (git merge-tree --write-tree needs git 2.38); the pull request will tell"
+      return 0
+      ;;
+  esac
+}
+
 # spec_ship_steps <level> <branch> <base> <message-file> <title> <body-file> [<draft>] [<idea>] —
 # commit, push <branch>, open its pull request into <base>, stopping where
 # <level> stops; the same steps and stop lines as `task ship`. <draft> is the
@@ -1839,6 +2290,7 @@ spec_ship_steps() {
     printf "stopped at commit: push is the human's\n"
     return 0
   fi
+  spec_ship_merges_cleanly "$branch" "$base"
   jig_ship_account "spec ship" "$level"
   jig_ship_push "spec ship" "$branch"
   if [ "$level" = push ]; then
@@ -2345,6 +2797,26 @@ _spec_done_phase_refusal() {
     "$tid" "$phase"
 }
 
+# _spec_done_no_workspace <task-id> — a task whose workspace is gone
+# (housekeeping removes a closed task's after its merge) may still be named by an
+# unchecked roadmap item here. Then the way to check it is a pull request, not this
+# checkout, and the refusal says which command; nothing is written. Returns when no item
+# of any spec in this checkout names the task, and the caller says `unknown task`.
+_spec_done_no_workspace() {
+  local tid="$1" sid handle found="" root
+  root=$(spec_dir)
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    [ -f "$root/$sid/roadmap.md" ] || continue
+    handle=$(spec_phase_items "$root/$sid/roadmap.md" | JIG_SD_TID="$tid" awk -F '\t' '
+      $1 == "item" && $2 == 0 && $4 == ("=" ENVIRON["JIG_SD_TID"]) && !found { print $6; found = 1 }
+    ')
+    [ -z "$handle" ] || found="${found:+$found; }jig spec item check $sid $handle"
+  done < <(spec_ids)
+  [ -n "$found" ] || return 0
+  jig_die "spec done: $tid has no workspace here (housekeeping removes a closed task's after its merge); if its work merged, check its item through a pull request: $found"
+}
+
 # spec_done <task-id> — check the roadmap items that name a linked task.
 #
 # Called by jig-consolidate when the knowledge decision is recorded, before the
@@ -2358,7 +2830,10 @@ spec_done() {
   local tid="$1" tdir sid roadmap tmp out rc=0 refusal
   jig_require_init
   tdir=$(spec_task_dir "$tid") || jig_die "spec done: invalid task id: $tid"
-  [ -f "$tdir/task.md" ] || jig_die "spec done: unknown task: $tid (no $JIG_AI_DIR/workspace/tasks/$tid/task.md)"
+  if [ ! -f "$tdir/task.md" ]; then
+    _spec_done_no_workspace "$tid"
+    jig_die "spec done: unknown task: $tid (no $JIG_AI_DIR/workspace/tasks/$tid/task.md)"
+  fi
   refusal=$(_spec_done_phase_refusal "$tid" "$tdir")
   [ -z "$refusal" ] || jig_die "$refusal"
   sid=$(jig_spec_link "$tdir/task.md") || rc=$?
@@ -2485,8 +2960,7 @@ _spec_drop_to_spec_branch() {
     *) jig_die "spec drop: could not read $JIG_AI_DIR/specs/$sid/roadmap.md" ;;
   esac
   _spec_refuse_dirty_tree "spec drop"
-  branch=$(_spec_switch_to_existing_branch "$sid" "spec drop") || branch=""
-  if [ -z "$branch" ]; then
+  if ! _spec_switch_to_existing_branch "$sid" "spec drop" "$default"; then
     branch=$(_spec_cut_own_branch "$sid" "spec drop") || exit 1
   fi
   printf 'spec drop: switched to %s\n' "$branch"
@@ -3219,7 +3693,7 @@ spec_unlink_task() {
 
 # --- roadmap items, in Jig's own tree ---------------------------------------------
 #
-# `spec item add|move|file` change a roadmap on `spec/<id>`, reaching the base (the
+# `spec item add|move|file|check` change a roadmap on `spec/<id>`, reaching the base (the
 # default branch, or an open epic) through a pull request, in a tree of Jig's own, and
 # never in anybody's checkout (lib/owntree.sh, adr-20261104-a-write-goes-in-jigs-own-tree).
 
@@ -3377,9 +3851,9 @@ _spec_item_need() {
 
 _SPEC_ITEM_SPEC=""
 
-# _spec_item_main <add|move|file> <spec> [<item>] … — the three writes.
+# _spec_item_main <add|move|file|check> <spec> [<item>] … — the four writes.
 _spec_item_main() {
-  local args=() arg sub id item="" phase="" text="" after="" place="" task="" task_given="" rev="" rev_given="" newtask="" goal="" goal_given=""
+  local args=() arg sub id item="" phase="" text="" after="" place="" task="" task_given="" rev="" rev_given="" newtask="" goal="" goal_given="" merged_only=""
   for arg in "$@"; do
     [ "$arg" = --json ] || args+=("$arg")
   done
@@ -3389,6 +3863,15 @@ _spec_item_main() {
   args=("${args[@]:2}")
   case "$sub" in
     add) ;;
+    check)
+      # The item is optional: `--merged` names them all.
+      if [ "${#args[@]}" -ge 1 ]; then
+        case "${args[0]}" in
+          -*) ;;
+          *) item=${args[0]}; args=("${args[@]:1}") ;;
+        esac
+      fi
+      ;;
     move | file)
       [ "${#args[@]}" -ge 1 ] || jig_fail usage "spec item $sub: missing the item"
       item=${args[0]}
@@ -3403,18 +3886,21 @@ _spec_item_main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --revision) _spec_item_need "$1" $#; rev=$2; rev_given=1; shift 2 ;;
+      --merged)
+        [ "$sub" = check ] || jig_fail usage "spec item $sub: unexpected argument: $1"
+        merged_only=1; shift ;;
       --phase)
-        [ "$sub" != file ] || jig_fail usage "spec item file: unexpected argument: $1"
+        case "$sub" in file | check) jig_fail usage "spec item $sub: unexpected argument: $1" ;; esac
         _spec_item_need "$1" $#; phase=$2; shift 2 ;;
       --text)
         [ "$sub" = add ] || jig_fail usage "spec item $sub: unexpected argument: $1"
         _spec_item_need "$1" $#; text=$2; shift 2 ;;
       --after)
-        [ "$sub" != file ] || jig_fail usage "spec item file: unexpected argument: $1"
+        case "$sub" in file | check) jig_fail usage "spec item $sub: unexpected argument: $1" ;; esac
         [ -z "$place" ] || jig_fail usage "spec item $sub: give one of --after, --top, --bottom"
         _spec_item_need "$1" $#; place=after; after=$2; shift 2 ;;
       --top | --bottom)
-        [ "$sub" != file ] || jig_fail usage "spec item file: unexpected argument: $1"
+        case "$sub" in file | check) jig_fail usage "spec item $sub: unexpected argument: $1" ;; esac
         [ -z "$place" ] || jig_fail usage "spec item $sub: give one of --after, --top, --bottom"
         place=${1#--}; shift ;;
       --task)
@@ -3448,6 +3934,17 @@ _spec_item_main() {
       fi
       if [ "$place" = after ] && [ -n "$phase" ]; then
         jig_fail usage "spec item move: --after names the place; --phase goes with --top or --bottom"
+      fi
+      ;;
+    check)
+      [ -n "$item" ] || [ -n "$merged_only" ] || jig_fail usage "spec item check: give an item or --merged"
+      [ -z "$item" ] || [ -z "$merged_only" ] || jig_fail usage "spec item check: give one of an item and --merged"
+      _SPEC_ITEM_MERGED=""
+      # Before the write begins: which tasks merged is read from this checkout's
+      # workspaces and housekeeping log, not from the roadmap in Jig's tree.
+      if [ -n "$merged_only" ]; then
+        jig_require_init
+        _SPEC_ITEM_MERGED=" $(spec_merged_task_ids | cut -f1 | tr '\n' ' ') "
       fi
       ;;
     file)
@@ -3498,6 +3995,7 @@ _spec_item_main() {
     add) _spec_item_build_add "$id" "$phase" "$text" "$place" "$after" "$norm" "$new" "$msg"; handle=$_SPEC_ITEM_HANDLE ;;
     move) _spec_item_build_move "$id" "$item" "$phase" "$place" "$after" "$norm" "$new" "$msg"; handle=$item ;;
     file) _spec_item_build_file "$id" "$item" "$task" "$norm" "$new" "$msg"; handle=$item ;;
+    check) _spec_item_build_check "$id" "$item" "$norm" "$new" "$msg"; handle=$_SPEC_ITEM_HANDLES ;;
   esac
 
   ot_claim
@@ -3519,30 +4017,50 @@ _spec_item_main() {
   fi
 
   # The item as the roadmap now has it. Its handle holds, but for one of a repeated text,
-  # which a move may renumber: the text then still finds it.
+  # which a move may renumber: the text then still finds it. A check writes several
+  # at once (`--merged`), and a checked item keeps its handle.
   tr -d '\r' < "$roadmap" > "$norm"
   _spec_map_load "$norm"
-  _spec_map_find "$handle"
-  local i=$_SPEC_I sec
-  sec=${S_PHASE[${M_SEC[$i]}]}
+  local h i sec items="" isep="" ot_w=""
   if [ -n "$_SPEC_ITEM_JSON" ]; then
-    local rec w
     ot_answer_json
-    w=$_JSON
-    json_quote "$id"; rec="{\"spec\":$_JSON,\"item\":{\"id\":\"${M_ID[$i]}\""
-    json_quote "${M_TEXT[$i]}"; rec="$rec,\"text\":$_JSON"
-    if [ "${M_CHECKED[$i]}" = 1 ]; then rec="$rec,\"checked\":true"; else rec="$rec,\"checked\":false"; fi
-    json_str_or_null "${M_TID[$i]}"; rec="$rec,\"task\":$_JSON"
-    if [ "${M_FOG[$i]}" = 1 ]; then rec="$rec,\"fog\":true"; else rec="$rec,\"fog\":false"; fi
-    json_int_or_null "$sec"; rec="$rec,\"phase\":$_JSON}"
-    printf '%s,"write":%s}\n' "$rec" "$w"
+    ot_w=$_JSON
+  fi
+  for h in $handle; do
+    _spec_map_find "$h"
+    i=$_SPEC_I
+    sec=${S_PHASE[${M_SEC[$i]}]}
+    if [ -n "$_SPEC_ITEM_JSON" ]; then
+      local rec
+      rec="{\"id\":\"${M_ID[$i]}\""
+      json_quote "${M_TEXT[$i]}"; rec="$rec,\"text\":$_JSON"
+      if [ "${M_CHECKED[$i]}" = 1 ]; then rec="$rec,\"checked\":true"; else rec="$rec,\"checked\":false"; fi
+      json_str_or_null "${M_TID[$i]}"; rec="$rec,\"task\":$_JSON"
+      if [ "${M_FOG[$i]}" = 1 ]; then rec="$rec,\"fog\":true"; else rec="$rec,\"fog\":false"; fi
+      json_int_or_null "$sec"; rec="$rec,\"phase\":$_JSON}"
+      items="$items$isep$rec"
+      isep=","
+    else
+      printf 'spec item: %s %s in %s\n' "$sub" "${M_ID[$i]}" "$id"
+    fi
+  done
+  if [ -n "$_SPEC_ITEM_JSON" ]; then
+    json_quote "$id"
+    if [ "$sub" = check ]; then
+      printf '{"spec":%s,"items":[%s],"write":%s}\n' "$_JSON" "$items" "$ot_w"
+    else
+      printf '{"spec":%s,"item":%s,"write":%s}\n' "$_JSON" "$items" "$ot_w"
+    fi
   else
-    printf 'spec item: %s %s in %s\n' "$sub" "${M_ID[$i]}" "$id"
     ot_answer_text
   fi
 }
 
 _SPEC_ITEM_HANDLE=""
+# The handles a check wrote, space-separated (a handle has no space), and the set of
+# tasks `--merged` reads as merged, as " id id " (empty when no `--merged`).
+_SPEC_ITEM_HANDLES=""
+_SPEC_ITEM_MERGED=""
 _SPEC_ITEM_PHASE=""
 _SPEC_ITEM_NEW=""
 
@@ -3593,6 +4111,61 @@ _spec_item_build_move() {
   block=$(sed -n "${M_FIRST[$self]},${M_LAST[$self]}p" "$norm")
   _spec_map_splice "$norm" "$_SPEC_AT" "$_SPEC_PRE" "$_SPEC_POST" "${M_FIRST[$self]}" "${M_LAST[$self]}" "$block" > "$new"
   printf 'Move a roadmap item in %s\n\n%s\n' "$id" "${M_TEXT[$self]}" > "$msg"
+}
+
+# _spec_item_build_check <id> <item|""> <norm> <new> <msg> — the first line of the item
+# (or of every unchecked item whose task merged, with no <item>) goes from `[ ]` to `[x]`,
+# the bullet and the indent as they were. Refused before anything is written: an item
+# that is checked already (`already-closed`), and `--merged` with nothing to check. The
+# handles it checks are left in _SPEC_ITEM_HANDLES.
+_spec_item_build_check() {
+  local id="$1" item="$2" norm="$3" new="$4" msg="$5" i n=0 firsts="" subject="" text=""
+  _SPEC_ITEM_HANDLES=""
+  if [ -n "$item" ]; then
+    _spec_map_find "$item"
+    i=$_SPEC_I
+    [ "${M_CHECKED[$i]}" != 1 ] || jig_fail already-closed "spec item check: $item is checked already"
+    _SPEC_ITEM_HANDLES=$item
+    firsts=" ${M_FIRST[$i]} "
+    text=${M_TEXT[$i]}
+    n=1
+  else
+    i=0
+    while [ "$i" -lt "${#M_ID[@]}" ]; do
+      if [ "${M_CHECKED[$i]}" != 1 ] && [ -n "${M_TID[$i]}" ]; then
+        case "$_SPEC_ITEM_MERGED" in
+          *" ${M_TID[$i]} "*)
+            _SPEC_ITEM_HANDLES="${_SPEC_ITEM_HANDLES:+$_SPEC_ITEM_HANDLES }${M_ID[$i]}"
+            firsts="$firsts ${M_FIRST[$i]}"
+            text="${text:+$text$'\n'}${M_TEXT[$i]}"
+            n=$((n + 1)) ;;
+        esac
+      fi
+      i=$((i + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+      text="spec item check: no unchecked item of the roadmap of $id names a task known to have merged"
+      # A first run already checked them: spec/<id> holds the checks until its
+      # pull request lands, and a second write starts from there.
+      if ot_waiting "spec:$id"; then
+        subject=""
+        [ -z "$OT_R_PR" ] || subject=" ($OT_R_PR)"
+        text="$text; $OT_R_BRANCH still waits to reach $OT_R_BASE$subject: checks made there land with it"
+      fi
+      jig_fail not-found "$text"
+    fi
+    firsts="$firsts "
+  fi
+  JIG_SI_FIRSTS="$firsts" awk '
+    BEGIN { n = split(ENVIRON["JIG_SI_FIRSTS"], a, " "); for (k = 1; k <= n; k++) at[a[k]] = 1 }
+    (NR in at) && match($0, /^[[:space:]]*[-*][[:space:]]+\[ \]/) {
+      head = substr($0, 1, RLENGTH - 3)
+      print head "[x]" substr($0, RLENGTH + 1)
+      next
+    }
+    { print }' "$norm" > "$new"
+  if [ "$n" = 1 ]; then subject="Check a roadmap item of $id"; else subject="Check roadmap items of $id"; fi
+  printf '%s\n\n%s\n' "$subject" "$text" > "$msg"
 }
 
 # _spec_item_build_file — the item gets the task in front (`fog:` goes: it is filed

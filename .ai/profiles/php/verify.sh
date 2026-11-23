@@ -14,15 +14,18 @@
 # the test files the changed paths map to — a
 # changed *Test.php itself, or any FooTest.php under tests/ for a changed
 # Foo.php — and everything when a path maps to nothing or a file that can
-# affect any test (composer.json/lock, phpunit.xml*) changed. composer
+# affect any test (composer.json/lock, phpunit.xml*, and what a PHP framework
+# loads on every request: routes/, config/, database/, bootstrap/) changed. composer
 # validate is not narrowable by files: in a scoped run it runs only when
 # composer.json or composer.lock changed, and skips with a reason otherwise;
 # in a full run it always runs.
 #
-# phpunit/pest answer to the check name `tests` (`checks: [tests]`): when a
-# profile in the same run declares `covers: [php:tests]` and runs that suite
-# itself, jig verify hands the check over and jp_covered prints the skip. This
-# profile names its check and nothing about who covers it.
+# Checks by role (`checks:` in profile.yaml): tests (phpunit or pest), static
+# (phpstan), style (pint), manifest (composer validate). Every check answers
+# to its role: when a profile in the same run declares `covers: [php:<role>]`
+# and runs that check itself, jig verify hands the check over and jp_covered
+# prints the skip. This profile names its checks and nothing about who covers
+# them.
 #
 # The test rule is not "anything that is not .php needs no test". What decides
 # is whether a path can change the result of the test run, which runs PHP: a
@@ -81,8 +84,10 @@ _php_tests_named() {
 }
 
 # Files whose change can alter the result of any test: the dependency
-# manifest/lock (autoloading) and PHPUnit's own configuration.
-PHP_TEST_ALL_GLOBS="composer.json composer.lock phpunit.xml*"
+# manifest/lock (autoloading), PHPUnit's own configuration, and the directories
+# a PHP framework loads on every request — routes, configuration, migrations
+# and seeders, its bootstrap — which no test is named after.
+PHP_TEST_ALL_GLOBS="composer.json composer.lock phpunit.xml* routes/* config/* database/* bootstrap/*"
 
 # Files that define how a project's front end is built: the package manifest,
 # its lock file, and the bundler's configuration. A change to one can alter
@@ -163,21 +168,45 @@ _php_all_reason() {
   return 0
 }
 
-# --- phpunit / pest ------------------------------------------------------
+# --- tests: phpunit / pest ------------------------------------------------
+#
+# Every check is named by its role, the tool inside the label
+# (`tests (phpunit)`), and its command line comes from the profile's check
+# table through jp_check_cmd (schemas/profile.md, Check table): the words
+# below are the defaults the table leaves to this script — the runner chosen
+# on the fly and the path of each vendor/bin tool. Every fallback to the full
+# set (ALL, a filter that selects nothing, a changed configuration) is a
+# `full` command line.
+
+# _php_explain_cmd <role> <label> <selection> <default-cmd>... — under
+# `--explain`, exit 0 when the check table can build the command line the
+# planned run would use: `narrowed` for a selection of files, `full`
+# otherwise. When it cannot, jp_check_cmd has printed the check's PLAN line.
+_php_explain_cmd() {
+  local role="$1" label="$2" selection="$3"
+  shift 3
+  if jp_scoped && [ -n "$selection" ] && [ "$selection" != ALL ]; then
+    jp_check_cmd "$role" "$label" narrowed "$@"
+  else
+    jp_check_cmd "$role" "$label" full "$@"
+  fi
+}
+
+test_bin=$(_php_tool phpunit)
+test_check=phpunit
+if [ -z "$test_bin" ]; then
+  test_bin=$(_php_tool pest)
+  test_check=pest
+fi
+# With neither runner, the check's lines name it phpunit.
+[ -n "$test_bin" ] || test_check=phpunit
+test_label="tests ($test_check)"
 
 if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
-  test_bin=$(_php_tool phpunit)
-  test_check=phpunit
-  if [ -z "$test_bin" ]; then
-    test_bin=$(_php_tool pest)
-    test_check=pest
-  fi
-  # With neither runner, the check's lines name it phpunit.
-  [ -n "$test_bin" ] || test_check=phpunit
-  if jp_covered tests "$test_check"; then
+  if jp_covered tests "$test_label"; then
     :
   elif [ -z "$test_bin" ]; then
-    jp_plan phpunit skip "$PHP_WHERE"
+    jp_plan "$test_label" skip "$PHP_WHERE"
   else
     jp_select _php_builtin
     filters=$JP_SELECTION
@@ -194,62 +223,75 @@ EOF
     else
       why=
     fi
-    jp_plan_select "$test_check" "$filters" "test files" "$why"
+    if jp_scoped && [ -z "$filters" ]; then
+      jp_plan_select "$test_label" "$filters" "test files" "$why"
+    elif _php_explain_cmd tests "$test_label" "$filters" "$test_bin"; then
+      jp_plan_select "$test_label" "$filters" "test files" "$why"
+    fi
   fi
 
-  for check in phpstan pint; do
+  for role in static style; do
+    case "$role" in
+      static) check=phpstan ;;
+      style) check=pint ;;
+    esac
+    label="$role ($check)"
+    if jp_covered "$role" "$label"; then
+      continue
+    fi
     tool=$(_php_tool "$check")
     if [ -z "$tool" ]; then
-      jp_plan "$check" skip "$PHP_WHERE"
+      jp_plan "$label" skip "$PHP_WHERE"
     elif [ "$check" = phpstan ] && jp_scoped && jp_changed_any phpstan.neon phpstan.neon.dist; then
-      jp_plan_full "$check" "phpstan configuration changed"
+      if jp_check_cmd "$role" "$label" full "$tool"; then
+        jp_plan_full "$label" "phpstan configuration changed"
+      fi
     elif jp_scoped; then
       files=$(jp_changed php)
       if [ -z "$files" ]; then
-        jp_plan "$check" skip "no changed .php files"
-      else
-        jp_plan "$check" filtered "changed .php files: $(printf '%s\n' "$files" | paste -sd, -)"
+        jp_plan "$label" skip "no changed .php files"
+      elif jp_check_cmd "$role" "$label" narrowed "$tool"; then
+        jp_plan "$label" filtered "changed .php files: $(printf '%s\n' "$files" | paste -sd, -)"
       fi
-    else
-      jp_plan "$check" full "full scope"
+    elif jp_check_cmd "$role" "$label" full "$tool"; then
+      jp_plan "$label" full "full scope"
     fi
   done
 
-  if ! jp_have composer; then
-    jp_plan "composer validate" skip "composer not found in PATH"
+  label="manifest (composer validate)"
+  if jp_covered manifest "$label"; then
+    :
+  elif ! jp_have composer; then
+    jp_plan "$label" skip "composer not found in PATH"
   elif jp_scoped && ! jp_changed_any composer.json composer.lock; then
-    jp_plan "composer validate" skip "composer.json/composer.lock not changed"
-  else
-    jp_plan "composer validate" full "manifest validation"
+    jp_plan "$label" skip "composer.json/composer.lock not changed"
+  elif jp_check_cmd manifest "$label" full composer; then
+    jp_plan "$label" full "manifest validation"
   fi
   exit 0
 fi
 
-test_bin=$(_php_tool phpunit)
-test_check=phpunit
-if [ -z "$test_bin" ]; then
-  test_bin=$(_php_tool pest)
-  test_check=pest
-fi
-[ -n "$test_bin" ] || test_check=phpunit
-
-if jp_covered tests "$test_check"; then
+if jp_covered tests "$test_label"; then
   :
 elif [ -z "$test_bin" ]; then
-  jp_skip "phpunit" "$PHP_WHERE"
+  jp_skip "$test_label" "$PHP_WHERE"
 else
   v=$(jp_version "$test_bin" --version)
   if ! jp_scoped; then
-    jp_run "$test_check" "$v" "$test_bin"
+    if jp_check_cmd tests "$test_label" full "$test_bin"; then
+      jp_run "$test_label" "$v" "${JP_CMD[@]}"
+    fi
   else
     jp_select _php_builtin
     filters=$JP_SELECTION
     if [ -z "$filters" ]; then
-      jp_skip "$test_check" "scope: no changed file maps to a test"
+      jp_skip "$test_label" "scope: no changed file maps to a test"
     elif [ "$filters" = ALL ]; then
       why=$(_php_all_reason "$(jp_decide_cause _php_builtin)")
-      jp_full_left_to_ci "$test_check" "$why" \
-        || jp_run "$test_check" "$v, scope: $why, ran full set" "$test_bin"
+      jp_full_left_to_ci "$test_label" "$why" \
+        || if jp_check_cmd tests "$test_label" full "$test_bin"; then
+          jp_run "$test_label" "$v, scope: $why, ran full set" "${JP_CMD[@]}"
+        fi
     else
       IFS='
 '
@@ -259,26 +301,30 @@ else
       set +f
       IFS=$' \t\n'
       if missing=$(jp_first_missing "$@"); then
-        jp_full_left_to_ci "$test_check" "filter '$missing' selects no tests" \
-          || jp_run "$test_check" "$v, scope: filter '$missing' selects no tests, ran full set" "$test_bin"
-      else
-        jp_run "$test_check" "$v, scope: $# test files$JP_SELECTION_NOTE" "$test_bin" "$@"
+        jp_full_left_to_ci "$test_label" "filter '$missing' selects no tests" \
+          || if jp_check_cmd tests "$test_label" full "$test_bin"; then
+            jp_run "$test_label" "$v, scope: filter '$missing' selects no tests, ran full set" "${JP_CMD[@]}"
+          fi
+      elif jp_check_cmd tests "$test_label" narrowed "$test_bin" -- "$@"; then
+        jp_run "$test_label" "$v, scope: $# test files$JP_SELECTION_NOTE" "${JP_CMD[@]}"
       fi
     fi
   fi
 fi
 
-# --- phpstan ---------------------------------------------------------------
+# --- static: phpstan ---------------------------------------------------------
 
-phpstan=$(_php_tool phpstan)
-if [ -z "$phpstan" ]; then
-  jp_skip "phpstan" "$PHP_WHERE"
+label="static (phpstan)"
+if jp_covered static "$label"; then
+  :
+elif phpstan=$(_php_tool phpstan); [ -z "$phpstan" ]; then
+  jp_skip "$label" "$PHP_WHERE"
 else
   v=$(jp_version "$phpstan" --version)
   if jp_scoped && ! jp_changed_any phpstan.neon phpstan.neon.dist; then
     files=$(jp_changed php)
     if [ -z "$files" ]; then
-      jp_skip "phpstan" "scope: no changed .php files"
+      jp_skip "$label" "scope: no changed .php files"
     else
       n=$(printf '%s\n' "$files" | grep -c .)
       # One argument per line, so a path with a space stays one path.
@@ -289,27 +335,33 @@ else
       set -- $files
       set +f
       IFS=$' \t\n'
-      jp_run "phpstan" "$v, scope: $n files" "$phpstan" analyse --no-progress "$@"
+      if jp_check_cmd static "$label" narrowed "$phpstan" -- "$@"; then
+        jp_run "$label" "$v, scope: $n files" "${JP_CMD[@]}"
+      fi
     fi
   elif jp_scoped; then
-    jp_full_left_to_ci "phpstan" "phpstan configuration changed" \
-      || jp_run "phpstan" "$v, scope: phpstan configuration changed, whole project" "$phpstan" analyse --no-progress
-  else
-    jp_run "phpstan" "$v" "$phpstan" analyse --no-progress
+    jp_full_left_to_ci "$label" "phpstan configuration changed" \
+      || if jp_check_cmd static "$label" full "$phpstan"; then
+        jp_run "$label" "$v, scope: phpstan configuration changed, whole project" "${JP_CMD[@]}"
+      fi
+  elif jp_check_cmd static "$label" full "$phpstan"; then
+    jp_run "$label" "$v" "${JP_CMD[@]}"
   fi
 fi
 
-# --- pint --------------------------------------------------------------------
+# --- style: pint -------------------------------------------------------------
 
-pint=$(_php_tool pint)
-if [ -z "$pint" ]; then
-  jp_skip "pint" "$PHP_WHERE"
+label="style (pint)"
+if jp_covered style "$label"; then
+  :
+elif pint=$(_php_tool pint); [ -z "$pint" ]; then
+  jp_skip "$label" "$PHP_WHERE"
 else
   v=$(jp_version "$pint" --version)
   if jp_scoped; then
     files=$(jp_changed php)
     if [ -z "$files" ]; then
-      jp_skip "pint" "scope: no changed .php files"
+      jp_skip "$label" "scope: no changed .php files"
     else
       n=$(printf '%s\n' "$files" | grep -c .)
       IFS='
@@ -319,27 +371,32 @@ else
       set -- $files
       set +f
       IFS=$' \t\n'
-      jp_run "pint" "$v, scope: $n files" "$pint" --test "$@"
+      if jp_check_cmd style "$label" narrowed "$pint" -- "$@"; then
+        jp_run "$label" "$v, scope: $n files" "${JP_CMD[@]}"
+      fi
     fi
-  else
-    jp_run "pint" "$v" "$pint" --test
+  elif jp_check_cmd style "$label" full "$pint"; then
+    jp_run "$label" "$v" "${JP_CMD[@]}"
   fi
 fi
 
-# --- composer validate -------------------------------------------------------
+# --- manifest: composer validate ---------------------------------------------
 # Not narrowable by files: composer.json describes the whole project. Runs
 # always in full mode; in a scoped run, only when the manifest or lock file
 # it validates actually changed.
 
-if jp_have composer; then
+label="manifest (composer validate)"
+if jp_covered manifest "$label"; then
+  :
+elif jp_have composer; then
   v=$(jp_version composer --version)
   if jp_scoped && ! jp_changed_any composer.json composer.lock; then
-    jp_skip "composer validate" "scope: composer.json/composer.lock not changed"
-  else
-    jp_run "composer validate" "$v" composer validate --no-check-publish
+    jp_skip "$label" "scope: composer.json/composer.lock not changed"
+  elif jp_check_cmd manifest "$label" full composer; then
+    jp_run "$label" "$v" "${JP_CMD[@]}"
   fi
 else
-  jp_skip "composer validate" "composer not found in PATH"
+  jp_skip "$label" "composer not found in PATH"
 fi
 
 jp_end

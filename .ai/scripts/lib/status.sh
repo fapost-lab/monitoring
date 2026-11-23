@@ -322,6 +322,14 @@ $rel"
   if [ "$specs" -gt 0 ]; then
     printf 'specs: %s (jig spec list)\n' "$specs"
     spec_epic_status
+    # An item the roadmap still shows unchecked although its task merged: the
+    # counts already treat it as done (spec_phase_counts), so only this line
+    # says the checkmark is owed.
+    local sid sn
+    while IFS=$'\t' read -r sid sn; do
+      [ -n "$sid" ] || continue
+      printf 'roadmap behind: %s — %s merged but unchecked (jig spec item check %s --merged)\n' "$sid" "$sn" "$sid"
+    done < <(spec_merged_unchecked_rows)
   else
     printf 'specs: none\n'
   fi
@@ -541,6 +549,7 @@ EOF
     printf '%s\n' "wrong base: $wrong task(s) (see .ai/runtime/housekeeping.log)"
   fi
 
+  _status_unreached_profiles
   _status_session_hook
   _status_notify_hook
   _status_instructions
@@ -890,6 +899,7 @@ _status_terminal() {
       "modified:" | "missing:") list=${l%:} ;;
       "proposals: none") _STT_KNOW+=("proposals"$'\t'"none"$'\t') ;;
       "proposals: "* | "sources changed: "*) _status_need warn "$l" ;;
+      "profiles unreached: "*) _status_need warn "$l" ;;
       "specs: none") _STT_KNOW+=("specs"$'\t'"none"$'\t') ;;
       "specs: "*" (jig spec list)")
         t=${l#specs: }
@@ -901,6 +911,7 @@ _status_terminal() {
         _STT_KNOW+=("drafts"$'\t'"${t% (jig spec draft list)}"$'\t'"jig spec draft list")
         ;;
       "epic: "*", branch missing") _status_need warn "$l" ;;
+      "roadmap behind: "*) _status_need warn "$l" ;;
       "epic: "*) _STT_KNOW+=("epic"$'\t'"${l#epic: }"$'\t') ;;
       "task "*)
         ntasks=$((ntasks + 1))
@@ -2392,7 +2403,7 @@ _status_attention() {
   local stopped="" gates="" git_steps="" rec id stop_reason stop_at ago level queue url live hk_note pr_ids="" parked
   [ -n "$_STATUS_PARKED_READY" ] || _status_parked_read
   local nc wrong kept closed open open_closed settled phase phase_stops="" todo
-  local rvl rv rw rwl still title t=$'\t' verbatim by
+  local rvl rv rw rwl still title t=$'\t' verbatim by last_stage
   hk_note=""
   [ -z "$_STATUS_HK_AT" ] || hk_note="housekeeping at $_STATUS_HK_WHEN"
   level=$(jig_agent_git 2>/dev/null) || level=none
@@ -2525,6 +2536,32 @@ UPR
         phase_stops="$phase_stops$phase	$_ST_ID	$stop_reason
 "
         continue
+      fi
+      # An attended run stopped at its design's gate: the reader's answer to
+      # the stop is the gate's own, approving the design or answering its
+      # questions (jig task gate), so the one card is the gate's, with the time
+      # the run stopped (adr-20261119-a-gate-takes-an-answer). Only a stop at
+      # the gate: a run whose last stage is past it (review, after the design
+      # moved, say) stopped about something else and keeps its own card. The
+      # stage is the last one the run marked since it started, a resume
+      # included, read from the journal only for an attended run.
+      if [ "$(_task_autopilot_mode "$_ST_ID")" != unattended ] \
+        && _task_autopilot_stop_stage_v last_stage "$_ST_ID" \
+        && _task_autopilot_stage_before_gate "$last_stage"; then
+        case "$_ST_GATE" in
+          waiting)
+            gates="$gates$(_status_attn gate-waiting task "$_ST_ID" "$_ST_ID" \
+              "A design is waiting for your decision" "$stop_reason" \
+              "Read the design the agent showed you and approve it, or answer its questions; the stopped run resumes after either." "" "${stop_at:--}")
+"
+            continue ;;
+          changed)
+            gates="$gates$(_status_attn gate-changed task "$_ST_ID" "$_ST_ID" \
+              "A design changed after you approved it" "$stop_reason" \
+              "Read what changed and approve it again, or answer its questions; the stopped run resumes after either." "" "${stop_at:--}")
+"
+            continue ;;
+        esac
       fi
       # An unattended run at its repair limit is resumed by nothing: what is
       # left is its draft, or a person taking the task over
@@ -2909,7 +2946,7 @@ _status_is_pr_item() {
 # _status_json [--json] — the producer json_run runs for `jig status --json`.
 _status_json() {
   local arg attn rec kind stype sid tasks title detail todo url extra objs="" o t tl hk stale root vers
-  local xb xbase xst xat xto xk xl extra0 xt=$'\t' xurl xci xmg xa xo xc xr xmove xrows xrv xwf xrj pr_sids=""
+  local xb xbase xst xat xto xk xl extra0 xt=$'\t' xurl xci xmg xa xo xc xr xmove xrows xrv xwf xrj xq pr_sids=""
   for arg in "$@"; do
     [ "$arg" = --json ] || jig_fail usage "status --json: unknown argument: $arg (usage: jig status --json)"
   done
@@ -2990,6 +3027,17 @@ REC
     # An upgrade's pull request: which branch, into what, as of when, and the
     # version it brings (schemas/json.md).
     case "$kind" in
+      # A design at its gate: the questions of its design.md and the last answer
+      # given (jig task list --json's gate fields), and, for a stopped
+      # attended run, when it stopped.
+      gate-waiting | gate-changed)
+        [ "$extra" != - ] || extra=""
+        json_str_or_null "$extra"; o="$o,\"stopped_at\":$_JSON"
+        _task_gate_questions_v xq "$sid"
+        o="$o,\"questions\":$xq"
+        _task_gate_answer_json_v xq "$sid"
+        o="$o,\"answer\":$xq"
+        ;;
       # A stopped run's question as the journal has it, and when it stopped.
       autopilot-stopped)
         IFS="$xt" read -r xb xat <<X
@@ -3497,6 +3545,7 @@ _status_html_stage() {
   fi
   case "$_ST_GATE" in
     waiting) printf '<span class="badge warn">design at the gate</span>' ;;
+    answered) printf '<span class="badge">answer at the gate, waiting for the agent</span>' ;;
     changed) printf '<span class="badge warn">design changed after approval</span>' ;;
     approved) printf '<span class="badge ok">design approved</span>' ;;
     *) printf '<span class="muted">not tracked outside autopilot</span>' ;;
@@ -3960,6 +4009,19 @@ _status_autopilot_git() {
   # Nothing when it answers from an invalid agent.git: the agent.git line
   # already names that, and a second failure for one mistake reads as two.
   return 0
+}
+
+# A profile directory that profiles: in .ai/config.yaml does not reach never
+# runs, and nothing else says so. Silent when there is none, and when the
+# config cannot be read (the invalid name is reported where it is used).
+_status_unreached_profiles() {
+  local names
+  # shellcheck source=lib/profiles.sh
+  . "$JIG_LIB/profiles.sh"
+  names=$(profiles_unreached 2>/dev/null) || return 0
+  [ -n "$names" ] || return 0
+  names=$(printf '%s\n' "$names" | paste -sd, - | sed 's/,/, /g')
+  printf 'profiles unreached: %s (not in profiles: in .ai/config.yaml, so never run)\n' "$names"
 }
 
 # Whether the housekeeping trigger is wired up for the installed runtimes.

@@ -130,7 +130,10 @@ _task_usage() {
       printf '       jig task autopilot <id> end [--reason <how it ended>]\n'
       printf '       jig task autopilot <id> report\n'
       ;;
-    gate) printf 'usage: jig task gate <id> approved [--by human|agent] [--revision <n>] [--json]\n' ;;
+    gate)
+      printf 'usage: jig task gate <id> approved [--by human|agent] [--revision <n>] [--json]\n'
+      printf '       jig task gate <id> answered --answer <the human'"'"'s answer> [--revision <n>] [--json]\n'
+      ;;
     waive)
       printf 'usage: jig task waive <id> ready|consolidate|ship <path> --reason <text>\n'
       printf '       jig task waive <id> ready|consolidate|ship <path> --withdraw\n'
@@ -1820,12 +1823,37 @@ _task_start_base() {
 
   if [ "$base" = "$default" ]; then
     jig_fetch_branches "task start" "$default"
+    [ -z "$spec" ] || _task_start_note_no_epic "$spec" "$default"
   else
     jig_fetch_branches "task start" "$default" "$base"
     [ -n "$(jig_base_ref "$base")" ] \
       || jig_die "task start: epic $base of spec $spec exists neither here nor on origin; push it, or create it with \`jig spec epic $spec\`"
   fi
   printf '%s\n' "$base"
+}
+
+# _task_start_note_no_epic <spec> <default> — a note, never a refusal, when a
+# task of a spec with no Epic: line is started while nothing of that spec has
+# merged yet: the last moment an epic can still hold the whole feature
+# (jig-idea §8 asks the person; this is the deterministic backstop for a spec
+# where the question was skipped). "Nothing merged" is read without spec.sh,
+# which task.sh never sources (ARCHITECTURE.md): no checked item in the
+# roadmap (schemas/spec.md), and no task linked to the spec closed here
+# (ADR-0030 closes a task only after its change landed). A task merged but not
+# yet closed is missed, and costs one needless note. On stderr: the caller's
+# stdout is the base branch.
+_task_start_note_no_epic() {
+  local spec="$1" default="$2" roadmap state dir link
+  roadmap="$JIG_PROJECT/$JIG_AI_DIR/specs/$spec/roadmap.md"
+  ! grep -Eq '^[[:space:]]*[-*][[:space:]]+\[[xX]\]' "$roadmap" 2>/dev/null || return 0
+  for state in "$JIG_PROJECT/$JIG_AI_DIR/workspace/tasks"/*/state; do
+    [ -f "$state" ] || continue
+    [ "$(sed -n 's/^status:[[:space:]]*//p' "$state" | head -n 1)" = consolidated ] || continue
+    dir=${state%/state}
+    link=$(jig_spec_link "$dir/task.md" 2>/dev/null) || continue
+    [ "$link" != "$spec" ] || return 0
+  done
+  jig_info "task start: spec $spec has no epic; its tasks will merge into $default"
 }
 
 # _task_start_branch <name> <base> — create <name> off the freshest <base>,
@@ -3724,6 +3752,57 @@ _task_autopilot_at_limit() {
   [ "$repairs" -ge 2 ]
 }
 
+# _task_autopilot_stage_before_gate <stage> — exit 0 when <stage>, the last
+# stage a run reached (_task_autopilot_stop_stage_v: empty when it has
+# reached none since it started, a resume included), is one before the human
+# gate of a T3/T4 route (_task_route: discover, specify, alternatives, design)
+# or the gate itself. A run that stops there stopped at the gate; one that
+# stops after it (implement, review, verify, ...) stopped about something
+# else, even while the gate waits or has changed, and keeps its own card and
+# its own answer (adr-20261119-a-gate-takes-an-answer). An allow-list: a stage
+# nobody listed reads as past the gate, the safe miss, because the stop card
+# still answers the run.
+_task_autopilot_stage_before_gate() {
+  case "$1" in
+    "" | - | discover | specify | alternatives | design | human-gate | gate) return 0 ;;
+  esac
+  return 1
+}
+
+# _task_autopilot_stop_stage_v <var> <id> — the last stage the task's current
+# run marked, into <var>; empty when it marked none. Only `start` resets it:
+# a resumed run continues from the stage it stopped in, so a run that marked
+# implement, stopped, was resumed and stopped again without marking a stage
+# stopped after implement, not at the gate. (Field 3 of the facts line is
+# not this: `resume` resets it there, for what the run has done since.) Read
+# only for a stopped run, by the gate's answer and the status page's card.
+# The journal is parsed as _task_autopilot_facts_v parses it.
+_task_autopilot_stop_stage_v() {
+  local __tass_file __tass_line __tass_event __tass_text __tass_stage="" __tass_t=$'\t'
+  task_dir_v __tass_file "$2"
+  __tass_file="$__tass_file/autopilot"
+  if [ -f "$__tass_file" ]; then
+    while IFS= read -r __tass_line || [ -n "$__tass_line" ]; do
+      __tass_event="" __tass_text=""
+      case "$__tass_line" in
+        *"$__tass_t"*)
+          __tass_line=${__tass_line#*"$__tass_t"}
+          __tass_event=${__tass_line%%"$__tass_t"*}
+          case "$__tass_line" in
+            *"$__tass_t"*)
+              __tass_line=${__tass_line#*"$__tass_t"}
+              __tass_text=${__tass_line%%"$__tass_t"*} ;;
+          esac ;;
+      esac
+      case "$__tass_event" in
+        start) __tass_stage="" ;;
+        stage) __tass_stage=$__tass_text ;;
+      esac
+    done < "$__tass_file"
+  fi
+  printf -v "$1" '%s' "$__tass_stage"
+}
+
 # _task_autopilot_limit_roads <id> — what is left for a stopped unattended run
 # at its repair limit, as the refusals that meet it name it: the draft, or a
 # person taking the task over (adr-20261108-a-person-takes-over-a-stopped-run).
@@ -4811,7 +4890,7 @@ _task_since_review_knowledge() {
     [ -n "$path" ] || continue
     hash=${path##* }
     path=${path% *}
-    old_hash=$(printf '%s\n' "$old" | awk -v p="$path" '{ h = $NF; sub(/ [^ ]*$/, ""); if ($0 == p) { print h; exit } }')
+    old_hash=$(printf '%s\n' "$old" | awk -v p="$path" '!d { h = $NF; sub(/ [^ ]*$/, ""); if ($0 == p) { print h; d = 1 } }')
     [ "$hash" != "$old_hash" ] || continue
     if ! jig_knowledge_is_global "$JIG_PROJECT/$path"; then
       _TASK_SR_WHY="$path, which resolves for the task's files, changed since the review"
@@ -5542,6 +5621,20 @@ $path
 # (adr-20260922-unattended-runs-ask-nothing-and-merge-on-green-ci), and is
 # refused anywhere else: outside such a run the gate is a human's.
 #
+# task_gate <id> answered --answer <text> [--revision <n>] [--json] — the
+# human's other decision: not an approval but an answer to the design's
+# `## Gate questions`. It records `gate: answered` and the hash of the design
+# answered, and appends the answer to the task's `gate-answers`; the gate is
+# `waiting` again once the design is rewritten (_task_gate_state_v). Always a
+# human's: `--by agent` is refused, and an approved design takes no answer.
+#
+# Either decision, by a human, on a task whose attended run is stopped at the
+# gate also answers that stop (_task_gate_answer_the_run), so the run resumes.
+# A stop at the gate is a stop before any stage after it
+# (_task_autopilot_stage_before_gate): a run that stopped in review keeps its
+# own stop, whatever the gate says. The stage is the last one the run marked
+# since it started, a resume included.
+#
 # The three keys are one new state file under one revision claim, checked as
 # `task pause`'s write is: against the caller's `--revision`, or the one read
 # before the task is. A board's approve button sends the revision of the read
@@ -5561,9 +5654,9 @@ task_gate() {
   _task_gate_body 0 "$@"
 }
 
-# _task_gate_body <as_json> <id> approved [--by human|agent] [--revision <n>]
-# [--json] — the body of `task gate`; with <as_json> 1 it runs inside json_run
-# and prints the approval as data.
+# _task_gate_body <as_json> <id> approved|answered [--by human|agent]
+# [--answer <text>] [--revision <n>] [--json] — the body of `task gate`; with
+# <as_json> 1 it runs inside json_run and prints the decision as data.
 _task_gate_body() {
   local as_json="$1" arg args=()
   shift
@@ -5573,17 +5666,20 @@ _task_gate_body() {
   set -- ${args[@]+"${args[@]}"}
   jig_require_init
   [ $# -ge 2 ] || jig_fail usage "$(_task_usage gate)"
-  local id="$1" decision="$2" by=human dir design rev="" rev_given=0 expected
+  local id="$1" decision="$2" by=human by_given=0 answer="" has_answer=0 dir design rev="" rev_given=0 expected
   shift 2
   while [ $# -gt 0 ]; do
     case "$1" in
       --by)
         [ $# -ge 2 ] || jig_fail usage "$(_task_usage gate)"
         case "$2" in
-          human | agent) by="$2" ;;
+          human | agent) by="$2"; by_given=1 ;;
           *) jig_fail usage "task gate: invalid --by: $2 (expected human|agent)" ;;
         esac
         shift 2 ;;
+      --answer)
+        [ $# -ge 2 ] || jig_fail usage "task gate: --answer requires a value"
+        answer="$2"; has_answer=1; shift 2 ;;
       --revision)
         [ $# -ge 2 ] || jig_fail usage "task gate: --revision requires a value"
         rev="$2"; rev_given=1; shift 2 ;;
@@ -5593,7 +5689,21 @@ _task_gate_body() {
   done
   [ "$rev_given" -eq 0 ] || [ -n "$rev" ] || jig_fail usage "task gate: --revision is empty"
   [ -z "$rev" ] || jig_revision_valid "$rev" || jig_fail usage "task gate: --revision is not a revision: $rev"
-  [ "$decision" = approved ] || jig_fail usage "task gate: unknown decision: $decision (expected approved)"
+  case "$decision" in
+    approved)
+      [ "$has_answer" -eq 0 ] || jig_fail usage "task gate: --answer is for the answered decision: jig task gate $id answered --answer <text>" ;;
+    answered)
+      # The agent has no answer to its own questions: an unattended run's
+      # recommendation is its approval (--by agent).
+      { [ "$by_given" -eq 0 ] || [ "$by" = human ]; } \
+        || jig_fail usage "task gate: an answer is a human's: --by agent is refused for answered"
+      [ "$has_answer" -eq 1 ] \
+        || jig_fail usage "task gate: --answer is required: the human's answer to the design's questions, in their words: jig task gate $id answered --answer <text>"
+      [ -n "$answer" ] || jig_fail usage "task gate: --answer must not be empty"
+      _task_finding_valid_field "$answer" \
+        || jig_fail usage "task gate: --answer must be a single line with no tab" ;;
+    *) jig_fail usage "task gate: unknown decision: $decision (expected approved|answered)" ;;
+  esac
   _task_valid_id "$id" || jig_fail usage "invalid task id: $id"
   # The revision this write is checked against: the caller's, or the one read
   # here before the task is, so the state read below is never newer than it.
@@ -5601,7 +5711,7 @@ _task_gate_body() {
   dir=$(task_dir "$id")
   [ -f "$dir/state" ] || jig_fail not-found "task gate: unknown task: $id"
   _task_guard_write "$id" "task gate"
-  _task_gate_check "$id" "$by"
+  _task_gate_check "$id" "$by" "$decision"
   if [ -n "$_TASK_GATE_MSG" ]; then
     # A code only where a program can act on it: the run's own answer to give,
     # or a design to write. The agent's self-approval refused outside a run is
@@ -5611,46 +5721,106 @@ _task_gate_body() {
     fi
     jig_die "$_TASK_GATE_MSG"
   fi
+  local before run mode last_stage
+  _task_gate_state_v before "$id"
+  # An approved design is in work: an answer to it is said in the session, and
+  # the agent changes the design (the gate is then `changed`).
+  if [ "$decision" = answered ] && [ "$before" = approved ]; then
+    jig_die "task gate: $id's design is approved; nothing waits at its gate"
+  fi
   design=$(_task_receipt_design_hash "$id")
 
   # The new state, whole, before the claim: a refused claim leaves nothing.
   local tmp="$dir/state.tmp.$$" tmp2="$dir/state.tmp2.$$"
   jig_cleanup_add "$tmp"
   jig_cleanup_add "$tmp2"
-  _task_state_set_into "$dir/state" "$tmp2" gate approved
+  _task_state_set_into "$dir/state" "$tmp2" gate "$decision"
   _task_state_set_into "$tmp2" "$tmp" gate_design "$design"
   _task_state_set_into "$tmp" "$tmp2" gate_by "$by"
   rm -f "$tmp"
+  # The answer's journal line, also whole before the claim, lands with the
+  # state under the one revision raise below: a read never sees `answered`
+  # without its answer (adr-20261016-the-clone-revision-is-a-claimed-name).
+  local jtmp="$dir/gate-answers.tmp.$$"
+  if [ "$decision" = answered ]; then
+    jig_cleanup_add "$jtmp"
+    _task_gate_answer_line_into "$dir" "$jtmp" "$design" "$by" "$answer"
+  fi
   _task_claim_or_refuse "task gate" "$expected" "$tmp2"
+  [ "$decision" != answered ] || mv "$jtmp" "$dir/gate-answers"
   mv "$tmp2" "$dir/state"
   jig_task_state_forget
   jig_record_changed
 
+  # The stop of an attended run at this gate is answered by the decision.
+  task_state_var run "$id" autopilot
+  if [ "$run" = stopped ] && [ "$by" = human ]; then
+    _task_autopilot_mode_v mode "$id"
+    _task_autopilot_stop_stage_v last_stage "$id"
+    if _task_autopilot_stage_before_gate "$last_stage"; then
+      case "$before:$mode" in
+        waiting:attended | changed:attended | answered:attended)
+          if [ "$decision" = answered ]; then
+            _task_autopilot_log "$id" answer "gate answered: $answer"
+          else
+            _task_autopilot_log "$id" answer "gate approved"
+          fi
+          _task_rewrite_state "$dir" autopilot_answered "$(_task_autopilot_now)" ;;
+      esac
+    fi
+  fi
+
   if [ "$as_json" = 1 ]; then
     local rec
-    json_quote "$by"; rec="{\"state\":\"approved\",\"by\":$_JSON"
-    json_quote "$design"; rec="$rec,\"design\":$_JSON}"
+    json_quote "$by"; rec="{\"state\":\"$decision\",\"by\":$_JSON"
+    json_quote "$design"; rec="$rec,\"design\":$_JSON"
+    if [ "$decision" = answered ]; then
+      json_quote "$answer"; rec="$rec,\"answer\":$_JSON"
+    fi
+    rec="$rec}"
     printf '{"task":%s,"gate":%s}\n' "$(_task_json_one "$id")" "$rec"
     return 0
   fi
-  if [ "$by" = agent ]; then
+  if [ "$decision" = answered ]; then
+    printf 'gate: answered\n'
+  elif [ "$by" = agent ]; then
     printf 'gate: approved by the agent\n'
   else
     printf 'gate: approved\n'
   fi
 }
 
-# _task_gate_check <id> <by> — why `jig task gate <id> approved --by <by>`
-# refuses this task by its state, in _TASK_GATE_MSG, empty when it would record
-# the approval; and, in _TASK_GATE_CODE, the code a program acts on
-# (schemas/json.md), empty for a refusal that has none of its own. The one place
-# the conditions live: `task gate` and the actions table both ask it, through
-# _task_gate_refusal for the table. Sets variables rather than printing, so the
+# _task_gate_answer_line_into <dir> <tmp> <design-hash> <by> <text> — into
+# <tmp>, the task's `gate-answers` with one line added,
+# `<utc>\t<design-hash>\t<by>\t<text>`: only ever appended, so the last line
+# is the latest answer and the file is the history. The caller moves <tmp>
+# into place with the decision's state, after the claim, and records the
+# change once, so a reader never sees a torn line or an answer the revision
+# does not count.
+_task_gate_answer_line_into() {
+  local dir="$1" tmp="$2"
+  _task_guard_dir "$dir"
+  if [ -f "$dir/gate-answers" ]; then
+    cp "$dir/gate-answers" "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$(_task_autopilot_now)" "$3" "$4" "$5" >> "$tmp"
+}
+
+# _task_gate_check <id> <by> [<decision>] — why `jig task gate <id> <decision>
+# --by <by>` (approved unless said) refuses this task by its state, in
+# _TASK_GATE_MSG, empty when it would record the decision; and, in
+# _TASK_GATE_CODE, the code a program acts on (schemas/json.md), empty for a
+# refusal that has none of its own. The one place the conditions live: `task
+# gate` and the actions table both ask it, through _task_gate_refusal for the
+# table, for both decisions. Sets variables rather than printing, so the
 # command gets the code and the message from one decision, in its own shell.
 _TASK_GATE_MSG=""
 _TASK_GATE_CODE=""
 _task_gate_check() {
-  local id="$1" by="$2" class run mode design
+  local id="$1" by="$2" decision="${3:-approved}" class run mode design verb=approve
+  [ "$decision" != answered ] || verb=answer
   _TASK_GATE_MSG="" _TASK_GATE_CODE=""
   task_state_var run "$id" autopilot
   if [ "$by" = agent ]; then
@@ -5667,7 +5837,11 @@ _task_gate_check() {
     # task is the one approving.
     if [ "$run" = on ]; then
       _TASK_GATE_CODE=autopilot-running
-      printf -v _TASK_GATE_MSG "task gate: %s's run is unattended, so this approval is the agent's: jig task gate %s approved --by agent" "$id" "$id"
+      if [ "$decision" = answered ]; then
+        printf -v _TASK_GATE_MSG "task gate: %s's run is unattended, so nobody answers at its gate: the agent approves its own design with the recommendations: jig task gate %s approved --by agent" "$id" "$id"
+      else
+        printf -v _TASK_GATE_MSG "task gate: %s's run is unattended, so this approval is the agent's: jig task gate %s approved --by agent" "$id" "$id"
+      fi
       return 0
     fi
     # Not on, so stopped.
@@ -5688,31 +5862,36 @@ _task_gate_check() {
       return 0 ;;
   esac
   _task_design_hash_v design "$id"
-  [ "$design" != "-" ] || printf -v _TASK_GATE_MSG 'task gate: %s has no design.md to approve' "$id"
+  [ "$design" != "-" ] || printf -v _TASK_GATE_MSG 'task gate: %s has no design.md to %s' "$id" "$verb"
 }
 
-# _task_gate_refusal <id> <by> — _task_gate_check's message, printed: what the
-# actions table (_task_actions) asks for `--by human`, the approval a person
-# gives.
+# _task_gate_refusal <id> <by> [<decision>] — _task_gate_check's message,
+# printed: what the actions table (_task_actions) asks for `--by human`, the
+# approval or the answer a person gives.
 _task_gate_refusal() {
-  _task_gate_check "$1" "$2"
+  _task_gate_check "$1" "$2" "${3:-approved}"
   [ -z "$_TASK_GATE_MSG" ] || printf '%s\n' "$_TASK_GATE_MSG"
   return 0
 }
 
 # _task_gate_state <id> — where a T3/T4 task stands at its human gate:
-# `waiting` (a design.md exists and no approval is recorded), `changed` (the
-# design moved after the approval), `approved`; nothing for a task without a
-# gate or without a design yet. The status page's "needs you" reads it.
+# `waiting` (a design.md exists and no approval is recorded), `answered` (a
+# human answered its questions and the design has not been rewritten since),
+# `changed` (the design moved after the approval), `approved`; nothing for a
+# task without a gate or without a design yet. The status page's "needs you"
+# reads it.
 _task_gate_state() {
   local gate
   _task_gate_state_v gate "$1"
   [ -z "$gate" ] || printf '%s\n' "$gate"
 }
 
-# _task_gate_state_v <var> <id> — the same answer into <var>.
+# _task_gate_state_v <var> <id> — the same answer into <var>. An answer pins
+# the design it answered (`gate_design`, as an approval does): once the design
+# is rewritten the gate waits for the human again, as `waiting`, not `changed`
+# (nothing was approved).
 _task_gate_state_v() {
-  local __tgs_v __tgs_design
+  local __tgs_v __tgs_design __tgs_gate
   printf -v "$1" '%s' ""
   task_state_var __tgs_v "$2" class
   case "$__tgs_v" in
@@ -5721,17 +5900,157 @@ _task_gate_state_v() {
   esac
   _task_design_hash_v __tgs_design "$2"
   [ "$__tgs_design" != "-" ] || return 0
-  task_state_var __tgs_v "$2" gate
-  if [ "$__tgs_v" != approved ]; then
+  task_state_var __tgs_gate "$2" gate
+  case "$__tgs_gate" in
+    approved | answered) ;;
+    *)
+      printf -v "$1" '%s' waiting
+      return 0 ;;
+  esac
+  task_state_var __tgs_v "$2" gate_design
+  if [ "$__tgs_v" = "$__tgs_design" ]; then
+    printf -v "$1" '%s' "$__tgs_gate"
+  elif [ "$__tgs_gate" = answered ]; then
     printf -v "$1" '%s' waiting
+  else
+    printf -v "$1" '%s' changed
+  fi
+}
+
+# _task_gate_questions_v <var> <id> — the questions of the task's design.md
+# `## Gate questions` section as a JSON array into <var>: `[]` for a section
+# with no question, `null` for a design with no such section (or none at all).
+# The section runs from that heading to the next `## ` heading or the end of
+# the file; a line in a fenced code block is no heading and no content. In it,
+# `### <text>` opens a question, `- <text>` is an option, `Recommended: <text>`
+# the agent's recommendation, any other non-empty line a line of context
+# (joined with a space). Each is
+# `{"question","context"|null,"options":[...],"recommendation"|null}`. It reads
+# the shape and never refuses one: the limit of five is a rule the design's
+# writer is warned of (_task_gate_questions_warn), not one a reader enforces.
+_task_gate_questions_v() {
+  local __tgq_file __tgq_text="" __tgq_line __tgq_in=0 __tgq_fence=0 __tgq_open=0 __tgq_found=0
+  local __tgq_q="" __tgq_ctx="" __tgq_opts="" __tgq_rec="" __tgq_all="" __tgq_cr=$'\r'
+  printf -v "$1" '%s' null
+  task_dir_v __tgq_file "$2"
+  __tgq_file="$__tgq_file/design.md"
+  [ -f "$__tgq_file" ] || return 0
+  IFS= read -r -d '' __tgq_text < "$__tgq_file" || true
+  case "$__tgq_text" in *"## Gate questions"*) ;; *) return 0 ;; esac
+  while IFS= read -r __tgq_line || [ -n "$__tgq_line" ]; do
+    __tgq_line=${__tgq_line%"$__tgq_cr"}
+    __tgq_line=${__tgq_line#"${__tgq_line%%[![:space:]]*}"}
+    __tgq_line=${__tgq_line%"${__tgq_line##*[![:space:]]}"}
+    case "$__tgq_line" in
+      '```'* | '~~~'*)
+        __tgq_fence=$((1 - __tgq_fence))
+        continue ;;
+    esac
+    [ "$__tgq_fence" = 0 ] || continue
+    if [ "$__tgq_in" = 0 ]; then
+      [ "$__tgq_line" != "## Gate questions" ] || { __tgq_in=1; __tgq_found=1; }
+      continue
+    fi
+    case "$__tgq_line" in
+      '## '* | '##')
+        break ;;
+      '') continue ;;
+      '### '*)
+        _task_gate_question_flush __tgq_all "$__tgq_open" "$__tgq_q" "$__tgq_ctx" "$__tgq_opts" "$__tgq_rec"
+        __tgq_open=1 __tgq_q=${__tgq_line#'### '} __tgq_ctx="" __tgq_opts="" __tgq_rec="" ;;
+      '- '*)
+        [ "$__tgq_open" = 1 ] || continue
+        json_quote "${__tgq_line#'- '}"
+        __tgq_opts="${__tgq_opts:+$__tgq_opts,}$_JSON" ;;
+      'Recommended: '*)
+        [ "$__tgq_open" = 1 ] || continue
+        __tgq_rec=${__tgq_line#'Recommended: '} ;;
+      *)
+        [ "$__tgq_open" = 1 ] || continue
+        __tgq_ctx="${__tgq_ctx:+$__tgq_ctx }$__tgq_line" ;;
+    esac
+  done <<EOF
+$__tgq_text
+EOF
+  [ "$__tgq_found" = 1 ] || return 0
+  _task_gate_question_flush __tgq_all "$__tgq_open" "$__tgq_q" "$__tgq_ctx" "$__tgq_opts" "$__tgq_rec"
+  printf -v "$1" '[%s]' "$__tgq_all"
+}
+
+# _task_gate_question_flush <var> <open> <question> <context> <options>
+# <recommendation> — append the question read so far to the comma-joined
+# objects in <var>; <options> is the already quoted, comma-joined list. Nothing
+# when <open> is not 1 (no question has begun).
+_task_gate_question_flush() {
+  [ "$2" = 1 ] || return 0
+  local __tgf_o __tgf_prev=${!1}
+  json_quote "$3"; __tgf_o="{\"question\":$_JSON"
+  json_str_or_null "$4"; __tgf_o="$__tgf_o,\"context\":$_JSON"
+  __tgf_o="$__tgf_o,\"options\":[$5]"
+  json_str_or_null "$6"; __tgf_o="$__tgf_o,\"recommendation\":$_JSON}"
+  printf -v "$1" '%s' "${__tgf_prev:+$__tgf_prev,}$__tgf_o"
+}
+
+# _task_gate_answer_v <at-var> <design-var> <by-var> <text-var> <id> — the
+# task's last gate answer, the last non-empty line of `gate-answers`
+# (_task_gate_answer_line_into), split into its four fields. All four are empty
+# when there is no answer. The one reader: the JSON producer and `task show`
+# both ask it.
+_task_gate_answer_v() {
+  local __tga_file __tga_line="" __tga_l __tga_t=$'\t'
+  local __tga_at="" __tga_design="" __tga_by="" __tga_text=""
+  task_dir_v __tga_file "$5"
+  __tga_file="$__tga_file/gate-answers"
+  if [ -f "$__tga_file" ]; then
+    while IFS= read -r __tga_l || [ -n "$__tga_l" ]; do
+      [ -z "$__tga_l" ] || __tga_line=$__tga_l
+    done < "$__tga_file"
+  fi
+  if [ -n "$__tga_line" ]; then
+    IFS="$__tga_t" read -r __tga_at __tga_design __tga_by __tga_text <<EOF
+$__tga_line
+EOF
+  fi
+  printf -v "$1" '%s' "$__tga_at"
+  printf -v "$2" '%s' "$__tga_design"
+  printf -v "$3" '%s' "$__tga_by"
+  printf -v "$4" '%s' "$__tga_text"
+}
+
+# _task_gate_answer_json_v <var> <id> — the task's last gate answer
+# (_task_gate_answer_v) into <var> as `{"text","at","by","design"}`, `null`
+# when there is none.
+_task_gate_answer_json_v() {
+  local __tgj_at __tgj_design __tgj_by __tgj_text __tgj_o
+  _task_gate_answer_v __tgj_at __tgj_design __tgj_by __tgj_text "$2"
+  if [ -z "$__tgj_at$__tgj_design$__tgj_by$__tgj_text" ]; then
+    printf -v "$1" '%s' null
     return 0
   fi
-  task_state_var __tgs_v "$2" gate_design
-  if [ "$__tgs_v" != "$__tgs_design" ]; then
-    printf -v "$1" '%s' changed
-  else
-    printf -v "$1" '%s' approved
+  json_quote "$__tgj_text"; __tgj_o="{\"text\":$_JSON"
+  json_str_or_null "$__tgj_at"; __tgj_o="$__tgj_o,\"at\":$_JSON"
+  json_str_or_null "$__tgj_by"; __tgj_o="$__tgj_o,\"by\":$_JSON"
+  json_str_or_null "$__tgj_design"; __tgj_o="$__tgj_o,\"design\":$_JSON}"
+  printf -v "$1" '%s' "$__tgj_o"
+}
+
+# _task_gate_questions_warn <id> — for a T3/T4 task whose design.md was just
+# written: a warning on stderr when it has no `## Gate questions` section or
+# more than five questions (the jig-task skill's rule). Never fails.
+_task_gate_questions_warn() {
+  local q n
+  # shellcheck source=lib/json.sh
+  declare -F json_quote >/dev/null || . "$JIG_LIB/json.sh"
+  _task_gate_questions_v q "$1"
+  if [ "$q" = null ]; then
+    jig_warn "task artifact: $1's design.md has no \`## Gate questions\` section; the human at the gate answers it (0-5 questions, or one line saying there are none)"
+    return 0
   fi
+  n=$(printf '%s' "$q" | grep -o '{"question":' | grep -c . || true)
+  if [ "${n:-0}" -gt 5 ]; then
+    jig_warn "task artifact: $1's design.md has $n gate questions; ask at most five, the ones only the human can answer"
+  fi
+  return 0
 }
 
 # _task_design_hash_v <var> <id> — _task_receipt_design_hash into <var>. On a
@@ -6908,12 +7227,17 @@ EOF
     json_quote "$gate"; o="$o,\"gate\":{\"state\":$_JSON"
     # Who approved: nobody while it waits; an approval recorded before
     # `gate_by` existed is read as `human` (schemas/state.md).
-    if [ "$gate" = waiting ]; then
-      _JSON=null
-    else
-      json_quote "${gate_by:-human}"
-    fi
-    o="$o,\"by\":$_JSON}"
+    case "$gate" in
+      waiting | answered) _JSON=null ;;
+      *) json_quote "${gate_by:-human}" ;;
+    esac
+    o="$o,\"by\":$_JSON"
+    # The questions of the design as it is now, and the last answer a human
+    # gave (the design it answered may be an older one): schemas/json.md.
+    _task_gate_questions_v v "$id"
+    o="$o,\"questions\":$v"
+    _task_gate_answer_json_v v "$id"
+    o="$o,\"answer\":$v}"
   else
     o="$o,\"gate\":null"
   fi
@@ -7109,7 +7433,7 @@ EOF
 #
 # The rows, in their order; the ids are a contract. The pause request rows ask
 # the guards `jig queue request|cancel` asks (common.sh), which read the queue.
-_TASK_ACTIONS="start pause resume request-pause cancel-pause-request approve-gate answer-stop handover set-class ship land request-review merge promote pr-status close abandon archive unarchive reopen drop-item"
+_TASK_ACTIONS="start pause resume request-pause cancel-pause-request approve-gate answer-gate answer-stop handover set-class ship land request-review merge promote pr-status close abandon archive unarchive reopen drop-item"
 
 # _task_actions <id> <pr-state> [<ci> [<mergeable> [<pr-url-state>
 # [<base-state>]]]] — one line per row of the table:
@@ -7158,6 +7482,7 @@ _task_actions_v() {
       request-pause) command="jig queue request task:$id pause" ;;
       cancel-pause-request) command="jig queue cancel task:$id pause" ;;
       approve-gate) command="jig task gate $id approved" ;;
+      answer-gate) command="jig task gate $id answered --answer <text>" ;;
       answer-stop)
         # The `--by human` an unattended run's answer needs, in the command
         # and in the guard alike.
@@ -7228,6 +7553,12 @@ _task_actions_v() {
       *:cancel-pause-request) _task_actions_ask_v reason "$id" "$action" jig_pause_cancel_refusal "$id" ;;
       *:approve-gate)
         _task_actions_ask_v reason "$id" "$action" _task_gate_refusal "$id" human
+        if [ -z "$reason" ]; then
+          _task_gate_state_v gate "$id"
+          [ "$gate" != approved ] || reason="task gate: $id's design is approved; nothing waits at its gate"
+        fi ;;
+      *:answer-gate)
+        _task_actions_ask_v reason "$id" "$action" _task_gate_refusal "$id" human answered
         if [ -z "$reason" ]; then
           _task_gate_state_v gate "$id"
           [ "$gate" != approved ] || reason="task gate: $id's design is approved; nothing waits at its gate"
@@ -7372,6 +7703,19 @@ task_show() {
   file="$(task_dir "$1")/state"
   [ -f "$file" ] || jig_die "task show: unknown task: $1"
   cat "$file"
+  # Two derived lines after the state, never keys of it: where the gate stands
+  # now (`gate_state`, _task_gate_state_v — the `gate` key stays `answered`
+  # after the design is rewritten, when the state is `waiting` again) and the
+  # last answer given at it. A session picking the task up acts on an answer
+  # only while `gate_state` is `answered` (the jig-task skill); the history is
+  # the `gate-answers` file, whose last line _task_gate_answer_v reads, as the
+  # JSON producer does.
+  # shellcheck disable=SC2034 # the design and author fields are not shown here
+  local gstate ga_at ga_design ga_by ga_text
+  _task_gate_state_v gstate "$1"
+  [ -z "$gstate" ] || printf 'gate_state: %s\n' "$gstate"
+  _task_gate_answer_v ga_at ga_design ga_by ga_text "$1"
+  [ -z "$ga_at" ] || printf 'gate_answer: %s %s\n' "$ga_at" "$ga_text"
 }
 
 # The task for this checkout's current branch (design §2). Deterministic,
@@ -7735,7 +8079,8 @@ _task_artifact_read() {
   json_quote "$id"; out="{\"task\":$_JSON,\"kind\":\"$kind\","
   json_str_or_null "$_TASK_ART_AT"; out="$out\"updated_at\":$_JSON,"
   json_int_or_null "$_TASK_ART_BYTES"; out="$out\"bytes\":$_JSON,"
-  json_quote "$content"
+  # A whole document: json_quote over all of it is quadratic on bash 3.2.
+  json_quote_text "$content"
   printf '%s"content":%s}\n' "$out" "$_JSON"
 }
 
@@ -7898,6 +8243,14 @@ task_artifact() {
 
   mv "$tmp" "$dest"
   _task_touch_state "$root"
+  # A design at a human gate says what it asks (the jig-task skill): a warning,
+  # not a refusal, for the one that does not.
+  case "$kind:$mode" in
+    design:write)
+      case "$(task_state_get "$id" class)" in
+        T3 | T4) _task_gate_questions_warn "$id" ;;
+      esac ;;
+  esac
   # An absolute path when the workspace is borrowed: it is in another
   # worktree, and a relative one would be read against the wrong root
   # (ADR-0029: paths in reports are absolute).
@@ -7933,12 +8286,14 @@ task_artifact() {
 #
 # Nothing here may fail the ship: every path that cannot answer gives up.
 _task_ship_unverified_notice() {
-  local installed p pdir covered=0
+  local installed p pdir covered=0 names
   # shellcheck source=lib/profiles.sh
   . "$JIG_LIB/profiles.sh" 2>/dev/null || return 0
   installed=$(profiles_installed_dir 2>/dev/null) || return 0
   [ -n "$installed" ] || return 0
-  for p in $(profiles_active 2>/dev/null); do
+  # The stack, so a base counts; one that does not resolve reads as the list.
+  profiles_stack_v names 2>/dev/null || names=$(profiles_active 2>/dev/null) || names=""
+  for p in $names; do
     pdir=$(profiles_dir "$installed" "$p" 2>/dev/null) || continue
     [ -d "$pdir" ] || continue
     if ! profiles_is_fallback "$pdir"; then

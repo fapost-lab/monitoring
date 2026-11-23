@@ -535,7 +535,7 @@ land_clean_branch_refusal() {
   [ -n "$carried" ] || return 0
   n=$(printf '%s\n' "$carried" | awk 'NF { n++ } END { print n + 0 }')
   IFS=$'\t' read -r _ merge what <<EOF
-$(printf '%s\n' "$carried" | awk 'NF { print; exit }')
+$(printf '%s\n' "$carried" | awk '!d && NF { print; d = 1 }')
 EOF
   [ "$merge" != "the merge in progress" ] || merge="the merge in progress, not committed yet"
   if [ "$merge" = - ]; then

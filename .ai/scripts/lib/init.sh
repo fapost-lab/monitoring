@@ -374,10 +374,27 @@ cmd_init() {
   # of `generic` alone, which verifies nothing and reports pass. An explicit
   # flag, and a config that already exists, stay authoritative — there the
   # detection below is only a suggestion, so init never overrides a choice.
-  local detected_words suggested_words="" w
+  local detected_words suggested_words="" w stack_words="" top_words="" detect_edges="" dl db db_base
   detected_words=$(profiles_detect "$source/profiles")
   if [ "$profiles_given" = 0 ] && [ ! -f "$JIG_PROJECT/.ai/config.yaml" ]; then
-    profiles_words=$(_init_dedup_words "generic $detected_words")
+    # Only the top layers are written: a detected profile some other detected
+    # one extends is reached through it, and the stack installs it all the same
+    # (adr-20261117-profiles-lists-top-layers-and-jig-resolves-the-stack).
+    # shellcheck disable=SC2086
+    profiles_stack_v detect_edges --edges --stock-root "$source/profiles" $detected_words \
+      || jig_die "init: the profiles do not resolve: $PROFILES_STACK_ERROR"
+    top_words=""
+    for w in $detected_words; do
+      db=0
+      while IFS=$'\t' read -r dl db_base; do
+        [ -n "$dl" ] || continue
+        [ "$db_base" != "$w" ] || db=1
+      done <<EOF
+$detect_edges
+EOF
+      [ "$db" = 1 ] || top_words="$top_words $w"
+    done
+    profiles_words=$(_init_dedup_words "generic $top_words")
     for pw in $profiles_words; do
       _profiles_valid_name "$pw" || jig_die "invalid profile name: $pw"
     done
@@ -386,12 +403,19 @@ cmd_init() {
     fi
   fi
 
+  # What gets installed is the stack of the selection: the names, and every
+  # profile they extend. Resolved before anything is written, so a base that is
+  # missing or a name a stock profile clashes with stops init at once.
+  # shellcheck disable=SC2086
+  profiles_stack_v stack_words --stock-root "$source/profiles" $profiles_words \
+    || jig_die "init: the profiles do not resolve: $PROFILES_STACK_ERROR"
+
   # Suggest profiles the target project looks like it needs but the
   # selection above does not include (domains/install). Advisory only:
   # never changes what gets installed, so init stays non-interactive and
-  # predictable.
+  # predictable. A profile the stack reaches through a layer is included.
   for w in $detected_words; do
-    case " $profiles_words " in
+    case " $stack_words " in
       *" $w "*) ;;
       *) suggested_words="$suggested_words $w" ;;
     esac
@@ -521,10 +545,13 @@ cmd_init() {
     # symbolic links anyway (jig_link_detect).
     _init_place_symlink "$source/templates/AGENTS.md" \
       "$JIG_PROJECT/.ai/templates/AGENTS.md"
-    for p in $profiles_words; do
+    for p in $stack_words; do
       pdir=$(profiles_dir "$source/profiles" "$p")
-      [ -d "$pdir" ] \
-        || jig_die "init: profile '$p' not found in source: $pdir"
+      if [ ! -d "$pdir" ]; then
+        # The project's own profile, already here: nothing to place.
+        [ -d "$JIG_PROJECT/.ai/profiles/$p" ] && continue
+        jig_die "init: profile '$p' not found in source: $pdir"
+      fi
       mkdir -p "$JIG_PROJECT/.ai/profiles"
       dest_pdir=$(profiles_dir "$JIG_PROJECT/.ai/profiles" "$p")
       _init_place_symlink "$(cd "$pdir" && pwd)" "$dest_pdir"
@@ -567,10 +594,13 @@ cmd_init() {
     # AGENTS.md is placed separately, in step 5, and stays project-owned.
     _init_copy_framework_file "$source/templates/AGENTS.md" \
       "$JIG_PROJECT/.ai/templates/AGENTS.md"
-    for p in $profiles_words; do
+    for p in $stack_words; do
       pdir=$(profiles_dir "$source/profiles" "$p")
-      [ -d "$pdir" ] \
-        || jig_die "init: profile '$p' not found in source: $pdir"
+      if [ ! -d "$pdir" ]; then
+        # The project's own profile, already here: nothing to place.
+        [ -d "$JIG_PROJECT/.ai/profiles/$p" ] && continue
+        jig_die "init: profile '$p' not found in source: $pdir"
+      fi
       dest_pdir=$(profiles_dir "$JIG_PROJECT/.ai/profiles" "$p")
       _init_copy_tree "$pdir" "$dest_pdir"
     done

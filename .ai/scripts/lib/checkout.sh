@@ -498,6 +498,11 @@ _jig_checkout_record_inner() {
 # before the command's own claim of `--revision <n>`, and a close from a
 # session would always be refused as stale-revision.
 #
+# `task gate` is left out for the same reason, and because approving a design
+# is the person's decision, not taking the task: Jig UI started from an agent
+# session inherits its id, and its approval would hold the task for that
+# session and always be refused against the person's read (#590).
+#
 # `task artifact read` is reading. `task artifact write|append <id> task` on a
 # task nobody started (no `branch:` in its state) is filing it: the goal goes
 # in with the task, by whoever found the work — often a session busy with
@@ -509,7 +514,7 @@ _jig_checkout_works() {
   case "${1:-}" in
     task)
       case "${2:-}" in
-        start | bootstrap | set | artifact | finding | autopilot | gate | receipt) ;;
+        start | bootstrap | set | artifact | finding | autopilot | receipt) ;;
         *) return 1 ;;
       esac
       case "$*" in

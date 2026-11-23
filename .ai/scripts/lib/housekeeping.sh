@@ -606,7 +606,7 @@ _hk_released() {
   fi
   if [ "$_HK_FORGE_KIND" != none ] && [ -n "$_HK_FORGE_PRS" ] \
      && printf '%s\n' "$_HK_FORGE_PRS" | awk -F '\t' -v h="$base" -v b="$default" '
-          $1 == h && $2 == b && tolower($3) == "merged" { found = 1; exit }
+          $1 == h && $2 == b && tolower($3) == "merged" { found = 1 }
           END { exit !found }'; then
     printf 'true\n'
     return 0
@@ -1044,10 +1044,13 @@ _hk_forge_state() {
   # none into its base: a staging `task ship` leaves exactly that, and it must
   # keep the task as an open pull request into the base would. Off that flow
   # no base is named so.
+  # The awk below reads to the end of its pipe, with a flag in place of an
+  # early quit, so the writer is never left to SIGPIPE under pipefail
+  # (conventions/shell.md).
   line=$(printf '%s\n' "$_HK_FORGE_PRS" | awk -F'\t' -v b="$branch" -v base="$base" -v st="$_HK_STAGING_BRANCH" "$_HK_PR_STATE_AWK"'
-    $1 == b && $2 == base { print prstate($3); found = 1; exit }
-    $1 == b && st != "" && $2 == st && !seen_st { seen_st = 1; s = prstate($3); if (s == "open" || s == "closed") staged = s }
-    $1 == b && other == "" && (st == "" || $2 != st) && prstate($3) == "merged" { other = $2 }
+    !found && $1 == b && $2 == base { print prstate($3); found = 1 }
+    !found && $1 == b && st != "" && $2 == st && !seen_st { seen_st = 1; s = prstate($3); if (s == "open" || s == "closed") staged = s }
+    !found && $1 == b && other == "" && (st == "" || $2 != st) && prstate($3) == "merged" { other = $2 }
     END {
       if (found) exit
       if (staged != "") print staged
@@ -1388,7 +1391,7 @@ _hk_branch_sweep() {
     # origin's branch is still at: ls-remote's answer, not the local ref's.
     rsha=""
     if [ "$remote_ok" = 1 ]; then
-      rsha=$(printf '%s\n' "$heads" | awk -v r="refs/heads/$b" '$2 == r { print $1; exit }')
+      rsha=$(_hk_origin_head "$heads" "$b")
     fi
     # The merged head still vouches for the local branch when origin's copy
     # is gone or moved: its upstream ref may be gone with it, and then `-d`
@@ -1479,7 +1482,7 @@ _hk_superseded_upgrade() {
     [ -n "$rsha" ] || return 0
   else
     [ "$remote_ok" = 1 ] || return 0
-    rsha=$(printf '%s\n' "$heads" | awk -v r="refs/heads/$b" '$2 == r && !found { print $1; found = 1 }')
+    rsha=$(_hk_origin_head "$heads" "$b")
     [ -n "$rsha" ] || return 0
     trk=$(git -C "$JIG_PROJECT" rev-parse --verify --quiet "refs/remotes/origin/$b^{commit}" 2>/dev/null || true)
     if [ "$trk" != "$rsha" ]; then
@@ -1580,6 +1583,15 @@ _hk_open_prs_of() {
   printf '%s\n' "$out" | awk -F '\t' -v b="$1" -v w="$2" '
     $1 == "" { next }
     (w == "head" && $1 == b) || (w == "base" && $2 == b) { print $3 "\t" $4 }'
+}
+
+# _hk_origin_head <heads> <branch> — the commit `git ls-remote --heads origin`
+# (<heads>) gives for refs/heads/<branch>; nothing when it is absent. The awk
+# reads its whole input and never quits early: under pipefail a writer cut off
+# by a reader that exited at the first match turns a found branch into a
+# failure that aborts housekeeping (conventions/shell.md).
+_hk_origin_head() {
+  printf '%s\n' "$1" | awk -v r="refs/heads/$2" '$2 == r && !found { print $1; found = 1 }'
 }
 
 # _hk_not_jigs_what — in words, what jig_upgrade_commits_are_jigs found that is
