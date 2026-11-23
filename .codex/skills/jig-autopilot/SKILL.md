@@ -88,7 +88,7 @@ In an unattended run there are no stops: §5. Otherwise, on a stop, record it, t
 
 | Stop | What you ask |
 |---|---|
-| The human gate of a T3/T4 task | Approve, change or reject the design — shown as [show the document](../jig-task/references/show-the-document.md) says |
+| The human gate of a T3/T4 task | Approve or answer the design, with its `## Gate questions` written (`jig-task`, human gate) — shown as [show the document](../jig-task/references/show-the-document.md) says. The person may answer at the gate from their board: that answers the stop too, and `resume` brings back `gate approved` or `gate answered: <their words>` — rework the design and stop at the gate again on the second |
 | `repair` exited 3 | How to proceed: another approach, dismissing the finding (a P0/P1 only with them), dropping the task, or taking it over (§5, "A person takes the task over") |
 | Re-classification to T3 or T4 | The gate for the new design. Up to T2, continue and say so in the report |
 | A decision nobody made | The decision: a product choice not settled in `task.md`, the spec or knowledge. Never guess one |
@@ -154,7 +154,7 @@ request or its body, write it in the commit message and the hand-back instead.
 
 | Stop | Instead |
 |---|---|
-| The gate of a T3/T4 task, or a re-classification into one | Write the design as usual, then `jig task gate <id> approved --by agent`, `jig task autopilot <id> approve --reason "<what was approved>"`, and in `task.md` (`jig task artifact append <id> task --from -`): "Human gate — approved by the agent (unattended)". The approve reason, in English, says what was approved and names the ADR or knowledge holding the detail; it is the design's only trace in the pull request, which never carries `design.md` |
+| The gate of a T3/T4 task, or a re-classification into one | Write the design as usual, its `## Gate questions` included and each one taken as recommended, then `jig task gate <id> approved --by agent`, `jig task autopilot <id> approve --reason "<what was approved>"`, and in `task.md` (`jig task artifact append <id> task --from -`): "Human gate — approved by the agent (unattended)". The approve reason, in English, says what was approved and names the ADR or knowledge holding the detail; it is the design's only trace in the pull request, which never carries `design.md` |
 | A decision nobody made | The most cautious option that is easiest to undo. `jig task autopilot <id> decide --reason "<what you chose, and why>"` |
 | A destructive operation | Never. Find another way or leave that part out, and say so with `decide --reason` |
 | A gate hook refused and the task's work cannot satisfy it | Never waive. `stop --reason` naming the hook, then `jig task ship <id> --message-file <file> --draft` (a draft runs no hook), its body starting `Not finished: hooks.<gate> refused: <why>`. The run stays `stopped`; a person waives it and resumes with `--by human` |

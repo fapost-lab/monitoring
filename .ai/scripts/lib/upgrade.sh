@@ -155,6 +155,17 @@ _upgrade_build_staged() {
 
 # --- shared helpers (both modes) --------------------------------------------
 
+# _upgrade_stack_v <var> <source> <then> — the profiles this run installs into
+# <var>: `profiles:` closed over `extends`, a stock profile's extends read from
+# <source>. A base is installed, kept up to date and never deleted while a layer
+# reaches it, though `profiles:` names only the layer (upgrade still never edits
+# `profiles:`). A stack that does not resolve is a refusal here, before either
+# mode places a file; <then> says what that left behind.
+_upgrade_stack_v() {
+  profiles_stack_v "$1" --stock-root "$2/profiles" \
+    || jig_die "upgrade: the profiles do not resolve: $PROFILES_STACK_ERROR. $3"
+}
+
 # _upgrade_source_version <source> — the framework version a source checkout
 # declares in scripts/lib/version.sh, falling back to the running
 # dispatcher's own $JIG_VERSION when it cannot be read. Mirrors init.sh's
@@ -445,7 +456,7 @@ _upgrade_place() {
 #                       <local-hash> <staged-hash>
 # Applies one row of the upgrade decision table to a single framework-owned
 # path and appends the resulting manifest line ("<hash> <path>") to the
-# caller's `new_entries` variable (dynamic scope; cmd_upgrade declares it
+# caller's `new_entries` variable (dynamic scope; _upgrade_install declares it
 # local, along with the placed_count/kept_count/removed_count/conflict_count
 # tally this function keeps for the run summary, and reconciled_count, which
 # decides whether the manifest is rewritten at all). Prints one report line per
@@ -1162,8 +1173,8 @@ _upgrade_branch_pr() {
     [ "$forge" = github ] || [ "$forge" = gitlab ] || exit 0
     prs=$(_upgrade_land_prs "$forge" "$1" "$2") || exit 0
     printf '%s\n' "$prs" | awk -F '\t' -v b="$2" '
-      $1 == b && $4 != "" && $4 != "null" {
-        if ($2 == "open") { print $2 "\t" $4; found = 1; exit }
+      !found && $1 == b && $4 != "" && $4 != "null" {
+        if ($2 == "open") { print $2 "\t" $4; found = 1 }
         if (first == "") first = $2 "\t" $4
       }
       END { if (!found && first != "") print first }'
@@ -1214,17 +1225,20 @@ $untracked
 EOF
 }
 
-# _upgrade_custom_profiles — active profile names (profiles_active) that are
+# _upgrade_custom_profiles — profile names of the stack (profiles_stack_v) that are
 # not part of the checkout a plain upgrade reads from (upgrade_source): a profile
 # somebody wrote themselves rather than one the framework ships. `generic` is
 # never included: it is the framework's own fallback and already declares
 # `verifies: nothing`. Silent (prints nothing) when the source cannot be
 # read, rather than guessing.
 _upgrade_custom_profiles() {
-  local source p
+  local source p names
   source=$(upgrade_source) || source=""
   [ -n "$source" ] || return 0
-  for p in $(profiles_active); do
+  # The stack, not the list: a project's own layer over a base is as custom as
+  # one named in `profiles:`, and a base it extends is never custom.
+  profiles_stack_v names --stock-root "$source/profiles" || return 0
+  for p in $names; do
     [ "$p" != generic ] || continue
     [ -f "$source/profiles/$p/profile.yaml" ] && continue
     printf '%s\n' "$p"
@@ -1499,6 +1513,12 @@ _UPGRADE_DONE=0
 # that made a run fall back from the tree to the checkout.
 _UPGRADE_PATH=checkout
 _UPGRADE_IGNORED=""
+# Why a run that began in the tree went on in the checkout (gitignored|pre-commit-hook),
+# empty when it did not.
+_UPGRADE_FELL_BACK=""
+# Set when the commit in the tree was refused by the project's pre-commit hook and the
+# install has to be redone in the checkout.
+_UPGRADE_REDO=0
 # The branch name the commit will cut.
 _UPGRADE_NAME=""
 # The level every step of the run ships at, the key it was read from, and who
@@ -1576,7 +1596,24 @@ _upgrade_tree_fall_back() {
   _UPGRADE_TREE=""
   _UPGRADE_PATH=checkout
   _UPGRADE_IGNORED=$4
+  _UPGRADE_FELL_BACK=gitignored
   _upgrade_out "note: this project's .gitignore ignores framework files the upgrade places ($ignored), so a commit made in Jig's tree could not carry them; the upgrade works in your checkout instead"
+  _upgrade_preflight "$1" 0 checkout
+  _upgrade_open_branch "$2" "$3"
+}
+
+# _upgrade_hook_fall_back <source> <to> <label> — the project's pre-commit hook refused
+# the commit in Jig's tree, which has none of the project's installed dependencies:
+# give the tree and the lock back (the commit was detached, so no branch exists), say
+# so without quoting the hook, and go on in the checkout: its preflight, and its branch.
+_upgrade_hook_fall_back() {
+  ot_close
+  _upgrade_swap_project "$_UPGRADE_MAIN"
+  _UPGRADE_TREE=""
+  _UPGRADE_PATH=checkout
+  _UPGRADE_IGNORED=""
+  _UPGRADE_FELL_BACK=pre-commit-hook
+  _upgrade_out "note: the project's pre-commit hook refused the commit in Jig's tree, which has none of the project's installed dependencies; the upgrade works in your checkout instead, where it has them"
   _upgrade_preflight "$1" 0 checkout
   _upgrade_open_branch "$2" "$3"
 }
@@ -1667,6 +1704,7 @@ _upgrade_unmerged() {
   # The carry-on works on the waiting branch and touches nothing in the checkout.
   _UPGRADE_PATH=tree
   _UPGRADE_IGNORED=""
+  _UPGRADE_FELL_BACK=""
   _UPGRADE_DONE=1
   _UPGRADE_J_MODE=copy
   _UPGRADE_J_DRY=0
@@ -1699,9 +1737,11 @@ _upgrade_unmerged() {
 }
 
 # _upgrade_finish_tree <from> <to> <summary> — the end of a run in the tree:
-# the self-check, one commit on a branch cut for it, and the ship.
+# the self-check, one commit on a branch cut for it, and the ship. When the project's
+# pre-commit hook refused the commit it sets _UPGRADE_REDO and returns: the caller redoes
+# the run in the checkout.
 _upgrade_finish_tree() {
-  local from="$1" to="$2" summary="$3" rc=0 base rel msg name out first why
+  local from="$1" to="$2" summary="$3" rc=0 base rel msg name out first
   base=$(cfg git.base_branch main)
   _upgrade_self_check 0 || rc=$?
   _upgrade_config_note 0
@@ -1734,15 +1774,17 @@ _upgrade_finish_tree() {
   # branch to take back.
   out=$(git -C "$JIG_PROJECT" commit -q -F "$msg" 2>&1) || rc=$?
   if [ "$rc" -ne 0 ]; then
-    first=$(_jig_ship_first_line "$out")
+    # A pre-commit hook usually needs what the project installed (node_modules, a
+    # vendor directory), and Jig's tree has none of it: the checkout has. The caller
+    # goes on there (_upgrade_hook_fall_back).
     if [ -n "$(git -C "$JIG_PROJECT" config --get core.hooksPath 2>/dev/null)" ] \
        || [ -x "$(git -C "$JIG_PROJECT" rev-parse --git-path hooks/pre-commit 2>/dev/null)" ]; then
-      why="the project's pre-commit hook refused in Jig's tree"
-    else
-      why="git refused the commit in Jig's tree"
+      _UPGRADE_REDO=1
+      return 0
     fi
+    first=$(_jig_ship_first_line "$out")
     _UPGRADE_J_OUTCOME=incomplete
-    jig_fail commit-refused "upgrade: not committed: $why: $first; nothing was left behind, and the checkout was not touched"
+    jig_fail commit-refused "upgrade: not committed: git refused the commit in Jig's tree: $first; nothing was left behind, and the checkout was not touched"
   fi
   out=$(git -C "$JIG_PROJECT" branch "$name" HEAD 2>&1) \
     || jig_die "upgrade: committed, but could not cut branch $name at the commit: $out"
@@ -2058,6 +2100,7 @@ EOF
 $_UPGRADE_IGNORED
 IGN
     o="$o,\"ignored\":[$list]"
+    json_str_or_null "$_UPGRADE_FELL_BACK"; o="$o,\"fell_back\":$_JSON"
     json_str_or_null "$_UPGRADE_MERGE_BY"; o="$o,\"merge_by\":$_JSON"
     if [ -n "$_UPGRADE_J_NOT_MERGED_CODE" ]; then
       json_quote "$_UPGRADE_J_NOT_MERGED_CODE"; o="$o,\"not_merged\":{\"code\":$_JSON"
@@ -2095,119 +2138,17 @@ EOF
   printf '%s\n' "$o,\"would_stop\":[$list]}"
 }
 
-_upgrade_run() {
-  local from="" dry_run=0 quiet=0 level=none
-  _UPGRADE_UNRELEASED=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --from) [ $# -ge 2 ] || jig_fail usage "upgrade: --from requires a value"; from="$2"; shift 2 ;;
-      --dry-run) dry_run=1; shift ;;
-      --unreleased) _UPGRADE_UNRELEASED=1; shift ;;
-      --quiet) quiet=1; shift ;;
-      *) jig_fail usage "upgrade: unknown argument: $1" ;;
-    esac
-  done
-  jig_require_init
-  # shellcheck source=lib/output.sh
-  . "$JIG_LIB/output.sh"
-  out_init
-  _UPGRADE_GROUPED=""
-  # shellcheck source=lib/manifest.sh
-  . "$JIG_LIB/manifest.sh"
-  # shellcheck source=lib/profiles.sh
-  . "$JIG_LIB/profiles.sh"
-  # shellcheck source=lib/section.sh
-  . "$JIG_LIB/section.sh"
-
-  local source
-  if [ -n "$from" ]; then
-    [ -d "$from" ] || jig_die "upgrade: --from directory does not exist: $from"
-    source=$(cd "$from" && pwd)
-  else
-    # Where it looked, never what the manifest records: that may be another
-    # machine's path, meaningless here.
-    source=$(upgrade_source) || jig_die "$(_upgrade_no_source_message)"
-  fi
-  jig_is_source_root "$source" \
-    || jig_die "upgrade: not a framework source root (missing skills/, templates/ or scripts/jig): $source"
-
-  # Source every adapter known to the source checkout (not just the ones
-  # active in config) so manifest paths owned by a since-deactivated adapter
-  # are still recognised as framework-owned and can be deleted.
-  local adapter_dir a
-  for adapter_dir in "$source"/adapters/*/; do
-    [ -d "$adapter_dir" ] || continue
-    [ -f "$adapter_dir/adapter.sh" ] || continue
-    # shellcheck disable=SC1090,SC1091
-    . "$adapter_dir/adapter.sh"
-    a=$(basename "$adapter_dir")
-    if command -v "adapter_${a}_skills_dir" >/dev/null 2>&1; then
-      _UPGRADE_DELETE_ROOTS="$_UPGRADE_DELETE_ROOTS $("adapter_${a}_skills_dir")"
-    fi
-  done
-  _UPGRADE_DELETE_ROOTS=".ai$_UPGRADE_DELETE_ROOTS"
-
-  local active_profiles active_adapters
-  active_profiles=$(cfg_list profiles generic)
+# _upgrade_install <source> <in_tree> <dry-run> <to-version> <to-label> — the install proper:
+# stage, place every path, the section, the manifest, the summary and the finish. Run in
+# the tree or in the checkout; sets _UPGRADE_REDO when the project's pre-commit hook
+# refused the commit in the tree and the run has to be redone in the checkout (_upgrade_run).
+# A hook's refusal is that global, not a status: called bare, the run keeps `set -e`.
+_upgrade_install() {
+  local source="$1" in_tree="$2" dry_run="$3" to_version="$4" to_label="$5"
+  local active_profiles active_adapters from_version
+  # The branch may hold another config; read what this run installs there.
+  _upgrade_stack_v active_profiles "$source" "No framework file was placed"
   active_adapters=$(cfg_list adapters "claude codex")
-
-  local mode
-  mode=$(manifest_header_get jig.mode)
-  if [ "$mode" = "link" ]; then
-    # The same refusal as `init --link`, for the same reason: where `ln -s`
-    # copies, every "missing link" would be placed as a copy of the source.
-    jig_link_detect
-    [ "$_JIG_LINK_KIND" = symlink ] \
-      || jig_die "upgrade: this project is installed in link mode, which needs symbolic links, and they cannot be made here"
-    _UPGRADE_J_MODE="link"
-    _UPGRADE_J_DRY=$dry_run
-    _UPGRADE_J_FROM=$(manifest_header_get jig.version)
-    _UPGRADE_J_TO=$(_upgrade_source_version "$source")
-    _upgrade_link "$source" "$active_profiles" "$active_adapters" "$dry_run"
-    if _upgrade_self_check "$dry_run"; then
-      _UPGRADE_J_OUTCOME=linked
-    else
-      _UPGRADE_J_OUTCOME=incomplete
-    fi
-    [ "$dry_run" != 1 ] || _UPGRADE_J_OUTCOME=planned
-    _upgrade_config_note "$dry_run"
-    return 0
-  fi
-
-  # Copy mode is a unit of work (adr-20260930-an-upgrade-is-a-unit-of-work):
-  # the newest code, the checks, then a branch of its own — all before the
-  # first file is touched. upgrade_pending skips the checks: it runs on every
-  # `status` and `verify`, and reads only the per-path lines.
-  # A copy-mode project takes released code only, dry run included: a plan
-  # the real run would refuse is no plan (adr-20261106-copy-mode-projects-take-released-code-only).
-  jig_require_released_source upgrade "$source" "$_UPGRADE_UNRELEASED"
-  local from_version to_version to_label in_tree=0 where=checkout
-  if [ "$dry_run" != 1 ]; then
-    _upgrade_handoff "$source"
-    level=$(jig_agent_git) \
-      || jig_die "upgrade: invalid agent.git: $level (expected none|commit|push|pr|merge); nothing was changed"
-  fi
-  # Which way a real run would go decides what could stop it: built in Jig's own
-  # tree it asks nothing of the checkout (_upgrade_use_tree).
-  if _upgrade_use_tree; then
-    in_tree=1
-    where=tree
-  fi
-  [ "${_upgrade_skip_preflight:-0}" = 1 ] || _upgrade_preflight "$source" "$dry_run" "$where"
-  to_version=$(_upgrade_source_version "$source")
-  to_label=$(jig_source_taken_version "$source" 2>/dev/null) || to_label="$to_version"
-  if [ "$dry_run" != 1 ]; then
-    if [ "$in_tree" = 1 ]; then
-      _UPGRADE_J_TO=$to_label
-      _upgrade_tree_begin "$to_version" "$to_label"
-      [ "$_UPGRADE_DONE" != 1 ] || return 0
-    else
-      _upgrade_open_branch "$to_version" "$to_label"
-    fi
-    # The branch may hold another config; read what this run installs there.
-    active_profiles=$(cfg_list profiles generic)
-    active_adapters=$(cfg_list adapters "claude codex")
-  fi
   from_version=$(manifest_header_get jig.version)
   _UPGRADE_J_MODE=copy
   _UPGRADE_J_DRY=$dry_run
@@ -2232,7 +2173,7 @@ _upgrade_run() {
     elif [ -n "$ignored" ]; then
       _upgrade_tree_fall_back "$source" "$to_version" "$to_label" "$ignored"
       in_tree=0
-      active_profiles=$(cfg_list profiles generic)
+      _upgrade_stack_v active_profiles "$source" "No framework file was placed"
       active_adapters=$(cfg_list adapters "claude codex")
       from_version=$(manifest_header_get jig.version)
       _UPGRADE_J_FROM=$from_version
@@ -2315,6 +2256,126 @@ _upgrade_run() {
   fi
   _upgrade_finish "$from_version" "$to_label" \
     "$(_upgrade_summary_text "$placed_count" "$kept_count" "$removed_count" "$conflict_count" "$manifest_state")"
+}
+
+_upgrade_run() {
+  local from="" dry_run=0 quiet=0 level=none
+  _UPGRADE_UNRELEASED=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) [ $# -ge 2 ] || jig_fail usage "upgrade: --from requires a value"; from="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --unreleased) _UPGRADE_UNRELEASED=1; shift ;;
+      --quiet) quiet=1; shift ;;
+      *) jig_fail usage "upgrade: unknown argument: $1" ;;
+    esac
+  done
+  jig_require_init
+  # shellcheck source=lib/output.sh
+  . "$JIG_LIB/output.sh"
+  out_init
+  _UPGRADE_GROUPED=""
+  # shellcheck source=lib/manifest.sh
+  . "$JIG_LIB/manifest.sh"
+  # shellcheck source=lib/profiles.sh
+  . "$JIG_LIB/profiles.sh"
+  # shellcheck source=lib/section.sh
+  . "$JIG_LIB/section.sh"
+
+  local source
+  if [ -n "$from" ]; then
+    [ -d "$from" ] || jig_die "upgrade: --from directory does not exist: $from"
+    source=$(cd "$from" && pwd)
+  else
+    # Where it looked, never what the manifest records: that may be another
+    # machine's path, meaningless here.
+    source=$(upgrade_source) || jig_die "$(_upgrade_no_source_message)"
+  fi
+  jig_is_source_root "$source" \
+    || jig_die "upgrade: not a framework source root (missing skills/, templates/ or scripts/jig): $source"
+
+  # Source every adapter known to the source checkout (not just the ones
+  # active in config) so manifest paths owned by a since-deactivated adapter
+  # are still recognised as framework-owned and can be deleted.
+  local adapter_dir a
+  for adapter_dir in "$source"/adapters/*/; do
+    [ -d "$adapter_dir" ] || continue
+    [ -f "$adapter_dir/adapter.sh" ] || continue
+    # shellcheck disable=SC1090,SC1091
+    . "$adapter_dir/adapter.sh"
+    a=$(basename "$adapter_dir")
+    if command -v "adapter_${a}_skills_dir" >/dev/null 2>&1; then
+      _UPGRADE_DELETE_ROOTS="$_UPGRADE_DELETE_ROOTS $("adapter_${a}_skills_dir")"
+    fi
+  done
+  _UPGRADE_DELETE_ROOTS=".ai$_UPGRADE_DELETE_ROOTS"
+
+  local active_profiles active_adapters
+  _upgrade_stack_v active_profiles "$source" "Nothing was changed"
+  active_adapters=$(cfg_list adapters "claude codex")
+
+  local mode
+  mode=$(manifest_header_get jig.mode)
+  if [ "$mode" = "link" ]; then
+    # The same refusal as `init --link`, for the same reason: where `ln -s`
+    # copies, every "missing link" would be placed as a copy of the source.
+    jig_link_detect
+    [ "$_JIG_LINK_KIND" = symlink ] \
+      || jig_die "upgrade: this project is installed in link mode, which needs symbolic links, and they cannot be made here"
+    _UPGRADE_J_MODE="link"
+    _UPGRADE_J_DRY=$dry_run
+    _UPGRADE_J_FROM=$(manifest_header_get jig.version)
+    _UPGRADE_J_TO=$(_upgrade_source_version "$source")
+    _upgrade_link "$source" "$active_profiles" "$active_adapters" "$dry_run"
+    if _upgrade_self_check "$dry_run"; then
+      _UPGRADE_J_OUTCOME=linked
+    else
+      _UPGRADE_J_OUTCOME=incomplete
+    fi
+    [ "$dry_run" != 1 ] || _UPGRADE_J_OUTCOME=planned
+    _upgrade_config_note "$dry_run"
+    return 0
+  fi
+
+  # Copy mode is a unit of work (adr-20260930-an-upgrade-is-a-unit-of-work):
+  # the newest code, the checks, then a branch of its own — all before the
+  # first file is touched. upgrade_pending skips the checks: it runs on every
+  # `status` and `verify`, and reads only the per-path lines.
+  # A copy-mode project takes released code only, dry run included: a plan
+  # the real run would refuse is no plan (adr-20261106-copy-mode-projects-take-released-code-only).
+  jig_require_released_source upgrade "$source" "$_UPGRADE_UNRELEASED"
+  local to_version to_label in_tree=0 where=checkout
+  if [ "$dry_run" != 1 ]; then
+    _upgrade_handoff "$source"
+    level=$(jig_agent_git) \
+      || jig_die "upgrade: invalid agent.git: $level (expected none|commit|push|pr|merge); nothing was changed"
+  fi
+  # Which way a real run would go decides what could stop it: built in Jig's own
+  # tree it asks nothing of the checkout (_upgrade_use_tree).
+  if _upgrade_use_tree; then
+    in_tree=1
+    where=tree
+  fi
+  [ "${_upgrade_skip_preflight:-0}" = 1 ] || _upgrade_preflight "$source" "$dry_run" "$where"
+  to_version=$(_upgrade_source_version "$source")
+  to_label=$(jig_source_taken_version "$source" 2>/dev/null) || to_label="$to_version"
+  if [ "$dry_run" != 1 ]; then
+    if [ "$in_tree" = 1 ]; then
+      _UPGRADE_J_TO=$to_label
+      _upgrade_tree_begin "$to_version" "$to_label"
+      [ "$_UPGRADE_DONE" != 1 ] || return 0
+    else
+      _upgrade_open_branch "$to_version" "$to_label"
+    fi
+  fi
+  _upgrade_install "$source" "$in_tree" "$dry_run" "$to_version" "$to_label"
+  if [ "$_UPGRADE_REDO" = 1 ]; then
+    # Not an error: the commit could not be made in Jig's tree, and the checkout is
+    # where the project's dependencies are.
+    _upgrade_hook_fall_back "$source" "$to_version" "$to_label"
+    _UPGRADE_REDO=0
+    _upgrade_install "$source" 0 "$dry_run" "$to_version" "$to_label"
+  fi
 }
 
 # --- upgrade_pending ---------------------------------------------------------

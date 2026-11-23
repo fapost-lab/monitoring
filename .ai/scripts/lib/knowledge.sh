@@ -1431,8 +1431,8 @@ km_stub_sources() {
 # ", a decision record" when the stub is an ADR: a team's accepted decision
 # is never edited in place, so an edit to one must stand out in the report.
 km_source_note() {
-  printf '%s\n' "$2" | awk -F '\t' -v s="$1" '$1 == s {
-    printf "source of %s%s\n", $2, ($3 == "adr" ? ", a decision record" : ""); exit }'
+  printf '%s\n' "$2" | awk -F '\t' -v s="$1" '!d && $1 == s {
+    printf "source of %s%s\n", $2, ($3 == "adr" ? ", a decision record" : ""); d = 1 }'
 }
 
 # km_changed_sources_block <base> — `knowledge changed --to-review`: the
@@ -3035,86 +3035,12 @@ _km_json_main() {
   esac
 }
 
-# _km_utf8_clean <s> — _KM_CLEAN <- <s> without the bytes that are not valid
-# UTF-8, _KM_LOSSY <- true when there were any. json_quote lets such bytes
-# through as they are, and one of them makes the whole line invalid JSON: a
-# source file is anything a person committed. Strict UTF-8 is checked and
-# repaired by iconv; where there is none, every byte outside ASCII becomes `?`,
-# one per byte, which is the lossy end of the same thing.
+# _km_utf8_clean <s> — json_utf8_clean (json.sh) into _KM_CLEAN and _KM_LOSSY,
+# the names this file's readers use.
 _km_utf8_clean() {
-  local ascii src
-  _KM_CLEAN=$1
-  _KM_LOSSY=false
-  if command -v iconv >/dev/null 2>&1; then
-    # Some iconv builds (macOS) accept what is not UTF-8 to a JSON parser: bytes
-    # F5 to FF, which lead no character, and F4 followed by 90 to BF, which leads
-    # one above U+10FFFF. Those go first; the continuation bytes they leave alone
-    # are iconv's to drop. F4 followed by 80 to 8F is U+100000 to U+10FFFF, valid
-    # and kept.
-    src=$(printf '%sx' "$1" | LC_ALL=C tr -d '\365-\377')
-    src=${src%x}
-    if [ -n "$(printf '%s' "$src" | LC_ALL=C tr -cd '\364')" ]; then
-      _km_drop_above_unicode "$src"
-      src=$_KM_CLEAN
-      _KM_CLEAN=$1
-    fi
-    if [ "$src" = "$1" ] && printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
-      return 0
-    fi
-    # The sentinel keeps the trailing newlines $(...) would strip, and ends a
-    # truncated sequence the way following bytes would: three of them, since a
-    # four-byte lead left with fewer behind it takes them down with it (macOS
-    # iconv drops an incomplete last character whole).
-    _KM_CLEAN=$(printf '%sxxx' "$src" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || true)
-    _KM_CLEAN=${_KM_CLEAN%xxx}
-    _KM_LOSSY=true
-    return 0
-  fi
-  # Printable ASCII, tab, carriage return and newline stay.
-  ascii=$(printf '\t\r -~')
-  if [ -z "$(printf '%s' "$1" | LC_ALL=C tr -d "\n$ascii")" ]; then
-    return 0
-  fi
-  _KM_CLEAN=$(printf '%sx' "$1" | LC_ALL=C tr -c "\n$ascii" '?')
-  _KM_CLEAN=${_KM_CLEAN%x}
-  _KM_LOSSY=true
-}
-
-# _km_drop_above_unicode <s> — _KM_CLEAN <- <s> without each F4 byte and the byte
-# from 90 to BF that follows it. Matched by the shell, byte by byte under the C locale: sed and awk
-# would drop the carriage return of a CRLF line under Git Bash (conventions/shell.md). The text is
-# split on F4 by word splitting, not stripped with ${s//pattern/}: on bash 3.2 that substitution
-# costs the text's length once per match, and a source file can be long and hold many of them.
-# The `x` keeps a trailing F4's empty field, and the trailing newlines $(...) would strip.
-#
-# The work runs in a $(...) with a plain LC_ALL=C, never under `local LC_ALL=C`: bash restores a
-# local locale on return, which crashes Homebrew's bash on macOS now and then, while the
-# subshell's assignment dies with it, unrestored (conventions/shell.md). The text comes back
-# through the same sentinel-guarded $(...) that _km_utf8_clean already passes it through first,
-# and globbing needs no restoring there.
-_km_drop_above_unicode() {
-  _KM_CLEAN=$(
-    LC_ALL=C
-    # Each pattern opens with `(`: bash 3.2 cannot parse a bare `pattern)` inside $(...).
-    case $1 in (*$'\364'*) ;; (*) printf '%sx' "$1"; exit 0 ;; esac
-    local IFS=$'\364' part first=1
-    local -a parts acc
-    set -f
-    # shellcheck disable=SC2206 # the split on IFS is the point; globbing is off
-    parts=(${1}x)
-    # The pieces are joined once at the end: appending each to one string would
-    # copy all of it again per F4.
-    for part in "${parts[@]}"; do
-      if [ -n "$first" ]; then acc[0]=$part; first=; continue; fi
-      case $part in
-        ([$'\220'-$'\277']*) acc[${#acc[@]}]=${part#?} ;;
-        (*) acc[${#acc[@]}]=$'\364'$part ;;
-      esac
-    done
-    IFS=
-    printf '%s' "${acc[*]}"
-  )
-  _KM_CLEAN=${_KM_CLEAN%x}
+  json_utf8_clean "$1"
+  _KM_CLEAN=$_JSON_CLEAN
+  _KM_LOSSY=$_JSON_LOSSY
 }
 
 # _km_json_print <json> — the producer's one value, free of bytes that are not
@@ -3165,32 +3091,6 @@ _km_json_list() {
 $1
 EOF
   _JSON="[$out]"
-}
-
-# _km_json_quote_text <s> — _JSON <- <s> as a JSON string, for a text that may
-# be large: json_quote is quadratic in the length on bash 3.2 (a 83 KB diff
-# took minutes), so the escaping is one awk pass over the lines instead. A
-# backslash, a quote and every control byte are escaped as json_quote does;
-# <s> is a diff, so it is lines ending in a newline and is checked UTF-8 already.
-_km_json_quote_text() {
-  _JSON=$(printf '%s' "$1" | LC_ALL=C awk '
-    BEGIN {
-      cls = "[\\\\\"" sprintf("%c", 1) "-" sprintf("%c", 31) "]"
-      for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
-      esc["\n"] = "\\n"; esc["\r"] = "\\r"; esc["\t"] = "\\t"
-      esc["\\"] = "\\\\"; esc["\""] = "\\\""
-      ORS = ""; print "\""
-    }
-    {
-      line = $0; out = ""
-      while (match(line, cls)) {
-        out = out substr(line, 1, RSTART - 1) esc[substr(line, RSTART, 1)]
-        line = substr(line, RSTART + 1)
-      }
-      print out line "\\n"
-    }
-    END { print "\"" }
-  ')
 }
 
 # _km_waiting_field <tip> <path> <key> — a frontmatter value of the document as it is
@@ -3386,7 +3286,7 @@ _km_sources_diff_json() {
   [ "$_KM_LOSSY" = false ] || lossy=true
   json_quote "$state"; out="$out,\"state\":$_JSON"
   json_str_or_null "$KM_DIFF_HASH"; out="$out,\"approved_hash\":$_JSON"
-  if [ -n "$text" ]; then _km_json_quote_text "$text"; else _JSON=null; fi
+  if [ -n "$text" ]; then json_quote_text "$text"; else _JSON=null; fi
   out="$out,\"diff\":$_JSON,\"lossy\":$lossy}"
   _km_json_print "$out"
 }
@@ -3420,21 +3320,13 @@ km_stages() {
 # _km_json_text <file> — _JSON <- the file's whole text as a JSON string, _KM_LOSSY
 # <- true when bytes that are not UTF-8 were dropped from it. The text is read with
 # a sentinel, so the trailing newlines $(...) would strip stay, and is escaped by
-# _km_json_quote_text's one pass, which ends every line it sees with a newline:
-# a file that does not end in one gets it back off.
+# json_quote_text (json.sh), which takes a long text line by line.
 _km_json_text() {
   local text
   text=$(cat "$1" && printf x) || jig_die "knowledge read: cannot read $1"
   text=${text%x}
   _km_utf8_clean "$text"
-  text=$_KM_CLEAN
-  if [ -n "$text" ] && [ "${text%$'\n'}" = "$text" ]; then
-    _km_json_quote_text "$text
-"
-    _JSON="${_JSON%\\n\"}\""
-  else
-    _km_json_quote_text "$text"
-  fi
+  json_quote_text "$_KM_CLEAN"
 }
 
 # _km_read_json <id> — the data of `knowledge read <id> --json`: the document's

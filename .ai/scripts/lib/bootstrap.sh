@@ -294,7 +294,7 @@ _bootstrap_inode() {
   # one quoted path goes in and the first field of the first line, a number,
   # comes out. `find -printf '%i'` is GNU-only and so is not the alternative.
   # shellcheck disable=SC2012
-  ls -di "$1" 2>/dev/null | awk 'NR==1 {print $1; exit}'
+  ls -di "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
 }
 
 # _bootstrap_join <words> — space-separated words, comma separated for a

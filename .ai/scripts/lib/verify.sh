@@ -378,7 +378,7 @@ _verify_cleanup() {
   if [ -n "${JIG_VERIFY_MAP_TMP:-}" ]; then
     rm -f "$JIG_VERIFY_MAP_TMP.src" 2>/dev/null || true
   fi
-  rm -f "${JIG_VERIFY_TMP:-}" "${JIG_VERIFY_MAP_TMP:-}" "${JIG_VERIFY_MAP_ALL_TMP:-}" 2>/dev/null || true
+  rm -f "${JIG_VERIFY_TMP:-}" "${JIG_VERIFY_MAP_TMP:-}" "${JIG_VERIFY_MAP_ALL_TMP:-}" "${JIG_VERIFY_CHECKS_TMP:-}" 2>/dev/null || true
   if [ -n "${JIG_VERIFY_BUSY:-}" ]; then
     _verify_busy_release "$JIG_VERIFY_BUSY"
     JIG_VERIFY_BUSY=""
@@ -388,25 +388,36 @@ _verify_cleanup() {
 
 # --- a profile covers a check of another ------------------------------------
 #
-# A profile above another can run the same work one of its checks does —
-# laravel's `php artisan test` is php's PHPUnit/Pest suite — and a run with
-# both paid for it twice. The profile above says so, `covers: [php:tests]`;
+# A profile above another can run the same work one of its checks does — a
+# project's own test runner is a stack's suite — and a run with both paid for
+# it twice. The profile above says so, `covers: [php:tests]`;
 # the profile below names the check it can hand over, `checks: [tests]`, and
 # nothing about who takes it. Which covers hold in a run is decided here,
 # once, and handed down as JIG_VERIFY_COVERED; the profile's jp_covered prints
 # the skip (adr-20261107-a-profile-covers-a-check-of-another).
 
-# _verify_covers <installed-dir> <run-profiles> <narrowed> — the covers that
-# hold in this run, one line each as _verify_covers_resolve prints them, first
-# covering profile in run order kept. <run-profiles> are the
+# _verify_covers <installed-dir> <run-profiles> <narrowed> [<edges>] — the covers
+# that hold in this run, one line each as _verify_covers_resolve prints them,
+# first covering profile in run order kept. <run-profiles> are the
 # profiles the run will start: a profile that never starts covers nothing,
 # and a check of a profile that never starts needs no cover. A cover holds
 # only where the covering profile applies (profiles_applies), only for a
-# check the covered profile names (else a warning: the check still runs).
+# check the covered profile names (else a warning: the check still runs), and
+# the check is addressed as a layer's row is (adr-20261118-a-layer-overrides-its-bases-checks-by-role):
+# `covers: [laravel:tests]` over a pure layer laravel is the check of the first
+# profile of laravel's chain that is no pure layer and lists `tests`; a pure
+# layer whose chain lists none is warned about, nothing is covered. And
+# not when the covering profile's own check of that name is dropped by a layer
+# above it in <edges>: nothing would run it, so the covered profile does (said
+# on stderr, with the other notes of this function).
 _verify_covers() {
-  local dir="$1" run=" $2 " narrowed="$3" u udir item b check bdir seen="" raw=""
+  local dir="$1" run=" $2 " narrowed="$3" edges="${4:-}" u udir item b check bdir seen="" raw=""
+  local named chain owner
+  # shellcheck disable=SC2034 # dv takes the value _profiles_tab_find_v is not asked for
+  local ovr dropper dv lifted=""
   for u in $2; do
     udir=$(profiles_dir "$dir" "$u")
+    profiles_check_overrides_v ovr "$udir" "$edges"
     while IFS= read -r item; do
       [ -n "$item" ] || continue
       b=${item%%:*}
@@ -420,6 +431,21 @@ _verify_covers() {
       case "$check" in
         *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) jig_warn "profile '$u' covers '$item', which is not <profile>:<check>; ignored"; continue ;;
       esac
+      # The profile the cover names may be a layer, or a profile over one: the
+      # check is the one its chain runs.
+      named=$b
+      if [ -n "$edges" ]; then
+        _profiles_chain_v chain "$b" "$edges"
+        _profiles_role_owner_v owner "$check" "$chain" "$dir"
+        if [ -n "$owner" ]; then
+          b=$owner
+        elif [ "$chain" != "$b" ] && _profiles_is_pure "$(profiles_dir "$dir" "$b")"; then
+          # A pure layer of this run's stack (it has a base in <edges>); one
+          # outside the stack covers nothing, as a profile that never starts.
+          jig_warn "profile '$u' covers '$item', but no profile of $b's chain names a check '$check' (checks:), so nothing is covered"
+          continue
+        fi
+      fi
       [ "$b" != "$u" ] || continue
       case "$run" in
         *" $b "*) ;;
@@ -434,28 +460,150 @@ _verify_covers() {
         jig_warn "profile '$u' covers '$b:$check', but '$b' names no check '$check' (checks:), so it still runs"
         continue
       fi
+      if [ -n "$ovr" ] && _profiles_tab_find_v dv "$ovr" "$check" drop dropper; then
+        # Lifted for now: decided below, once the covers that hold are known.
+        lifted="${lifted}$b	$check	$u	$named	$dropper
+"
+        continue
+      fi
       seen="$seen $b:$check "
-      raw="${raw}$b	$check	$u
+      raw="${raw}$b	$check	$u	$named
 "
     done < <(_profiles_list_lines "$udir" covers)
   done
-  _verify_covers_resolve "$dir" "$raw" "$narrowed"
+  # A dropped check that another profile still runs by a cover is not left to
+  # nobody: the drop has no effect there (the override warning says so), so the
+  # dropped profile's own cover stands and follows the chain to that runner —
+  # `myapp covers up:tests`, `up covers low:tests` and up's tests dropped still
+  # run the suite once, in myapp. Decided on the covers that survive
+  # _verify_covers_resolve (a narrowed run may drop one over maps), until no
+  # lifted cover comes back; its warnings are printed once, by the last call.
+  local resolved rest changed lb lc lu ln ld
+  while [ -n "$lifted" ]; do
+    resolved=$(_verify_covers_resolve "$dir" "$raw" "$narrowed" "$edges" 2>/dev/null)
+    rest=""
+    changed=0
+    while IFS=$'\t' read -r lb lc lu ln ld; do
+      [ -n "$lb" ] || continue
+      if _verify_covers_held "$resolved" "$lu" "$lc"; then
+        case "$seen" in
+          *" $lb:$lc "*) ;;
+          *)
+            seen="$seen $lb:$lc "
+            raw="${raw}$lb	$lc	$lu	$ln
+"
+            ;;
+        esac
+        changed=1
+      else
+        rest="${rest}$lb	$lc	$lu	$ln	$ld
+"
+      fi
+    done <<EOF
+$lifted
+EOF
+    lifted=$rest
+    [ "$changed" = 1 ] || break
+  done
+  resolved=$(_verify_covers_resolve "$dir" "$raw" "$narrowed" "$edges")
+  _verify_covers_lifted_lines "$dir" "$resolved" "$lifted" "$edges"
+  [ -z "$resolved" ] || printf '%s\n' "$resolved"
 }
 
-# _verify_covers_resolve <installed-dir> <covers> <narrowed> — the covers of
+# _verify_covers_held <covers> <profile> <check> — true when <covers> (as
+# _verify_covers_resolve prints them) hands <profile>'s <check> to another profile.
+_verify_covers_held() {
+  local b c _r
+  while IFS=$'\t' read -r b c _r; do
+    [ "$b" = "$2" ] && [ "$c" = "$3" ] && return 0
+  done <<EOF
+$1
+EOF
+  return 1
+}
+
+# _verify_covers_lifted_lines <installed-dir> <covers> <lifted> [<edges>] — on stderr,
+# one line per cover a drop lifted, naming the profile that really runs the check:
+# the covered profile, or, when its own check is dropped too, the one its own lifted
+# cover falls to, or the profile a cover that holds hands it to; `nothing runs it`
+# when the last of them has the check dropped as well.
+_verify_covers_lifted_lines() {
+  # shellcheck disable=SC2034 # dv and dl take the values _profiles_tab_find_v is not asked for
+  local dir="$1" b check u named dropper r hops nb nc nu runner ov dv dl
+  while IFS=$'\t' read -r b check u named dropper; do
+    [ -n "$b" ] || continue
+    r=$b
+    runner=""
+    hops=0
+    while [ "$hops" -lt 32 ]; do
+      hops=$((hops + 1))
+      while IFS=$'\t' read -r nb nc nu _; do
+        if [ "$nb" = "$r" ] && [ "$nc" = "$check" ]; then runner=$nu; break; fi
+      done <<EOF
+$2
+EOF
+      [ -z "$runner" ] || break
+      nb=""
+      while IFS=$'\t' read -r nb nc nu _; do
+        [ "$nu" = "$r" ] && [ "$nc" = "$check" ] && break
+        nb=""
+      done <<EOF
+$3
+EOF
+      [ -n "$nb" ] || break
+      r=$nb
+    done
+    if [ -z "$runner" ]; then
+      runner=$r
+      profiles_check_overrides_v ov "$(profiles_dir "$dir" "$r")" "${4:-}"
+      if [ -n "$ov" ] && _profiles_tab_find_v dv "$ov" "$check" drop dl; then
+        runner=""
+      fi
+    fi
+    if [ -n "$runner" ]; then
+      printf 'verify: %s:%s is dropped by %s, so %s no longer covers %s:%s; %s runs it\n' \
+        "$u" "$check" "$dropper" "$u" "$b" "$check" "$runner" >&2
+    else
+      printf 'verify: %s:%s is dropped by %s, so %s no longer covers %s:%s; nothing runs it\n' \
+        "$u" "$check" "$dropper" "$u" "$b" "$check" >&2
+    fi
+  done <<EOF
+$3
+EOF
+  return 0
+}
+
+# _verify_profile_maps_v <var> <installed-dir> <profile> <edges> — the project maps
+# that exist for <profile>, space-separated, each written as
+# `$JIG_AI_DIR/verify/<name>.map`: the maps of the pure layers whose tests it runs
+# (profiles_layer_maps_v), topmost first, then its own. Empty when there is none.
+_verify_profile_maps_v() {
+  local __pm_lyrs __pm_n __pm_out=""
+  profiles_layer_maps_v __pm_lyrs "$2" "$3" "$4"
+  for __pm_n in $__pm_lyrs "$3"; do
+    [ ! -f "$JIG_PROJECT/$JIG_AI_DIR/verify/$__pm_n.map" ] || __pm_out="${__pm_out:+$__pm_out }$JIG_AI_DIR/verify/$__pm_n.map"
+  done
+  printf -v "$1" '%s' "$__pm_out"
+}
+
+# _verify_covers_resolve <installed-dir> <covers> <narrowed> [<edges>] — the covers of
 # _verify_covers, each followed to the profile that finally runs the check:
-# `myapp covers laravel:tests` and `laravel covers php:tests` make php's
-# tests myapp's, so php's skip names myapp and php.map reaches the
-# profile that runs them. Prints `<profile><TAB><check><TAB><runner><TAB><depth>`,
-# <depth> the number of covers between them. A chain that comes back to where
+# `shop covers myapp:tests` and `myapp covers laravel:tests` (laravel's tests being
+# php's) make php's tests shop's, so php's skip names shop and php.map reaches the
+# profile that runs them. Prints
+# `<profile><TAB><check><TAB><runner><TAB><depth><TAB><named>`, <depth> the number
+# of covers between them and <named> the profile the cover was written against
+# (`laravel` for `covers: [laravel:tests]`, where <profile> is php). A chain that comes back to where
 # it started runs the check nowhere: those covers are dropped with a warning,
 # and every profile in it keeps its check. A cover whose map would be dropped
 # — a narrowed run, the covered profile reads a map of its own, the profile
 # that runs the check narrows without reading maps — is dropped with a warning
-# too, and the covered profile keeps its tests.
+# too, and the covered profile keeps its tests; the maps of a pure layer that
+# runs its tests in the covered profile count as the covered profile's own.
 _verify_covers_resolve() {
-  local dir="$1" all="$2" narrowed="$3" b check u final depth seen cycle nb nc nu found wdir bdir
-  while IFS=$'\t' read -r b check u; do
+  local dir="$1" all="$2" narrowed="$3" edges="${4:-}"
+  local b check u named final depth seen cycle nb nc nu found wdir bdir pmaps mapfile
+  while IFS=$'\t' read -r b check u named; do
     [ -n "$b" ] || continue
     final="$u"
     depth=1
@@ -463,7 +611,7 @@ _verify_covers_resolve() {
     cycle=0
     while :; do
       found=""
-      while IFS=$'\t' read -r nb nc nu; do
+      while IFS=$'\t' read -r nb nc nu _; do
         if [ "$nb" = "$final" ] && [ "$nc" = "$check" ]; then found="$nu"; break; fi
       done <<EOF
 $all
@@ -480,17 +628,20 @@ EOF
       jig_warn "profile '$u' covers '$b:$check' in a circle of covers that runs it nowhere; ignored, so it still runs"
       continue
     fi
-    if [ "$narrowed" = 1 ] && [ "$check" = tests ] \
-       && [ -f "$JIG_PROJECT/$JIG_AI_DIR/verify/$b.map" ]; then
-      bdir=$(profiles_dir "$dir" "$b")
-      wdir=$(profiles_dir "$dir" "$final")
-      if profiles_supports "$bdir" map && profiles_supports "$wdir" changed \
-         && ! profiles_supports "$wdir" map; then
-        jig_warn "profile '$final' runs '$b:$check' but reads no map, so $JIG_AI_DIR/verify/$b.map keeps '$b' running it"
-        continue
+    if [ "$narrowed" = 1 ] && [ "$check" = tests ]; then
+      _verify_profile_maps_v pmaps "$dir" "$b" "$edges"
+      mapfile="${pmaps%% *}"
+      if [ -n "$mapfile" ]; then
+        bdir=$(profiles_dir "$dir" "$b")
+        wdir=$(profiles_dir "$dir" "$final")
+        if profiles_supports "$bdir" map && profiles_supports "$wdir" changed \
+           && ! profiles_supports "$wdir" map; then
+          jig_warn "profile '$final' runs '$b:$check' but reads no map, so $mapfile keeps '$b' running it"
+          continue
+        fi
       fi
     fi
-    printf '%s\t%s\t%s\t%s\n' "$b" "$check" "$final" "$depth"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$b" "$check" "$final" "$depth" "$named"
   done <<EOF
 $all
 EOF
@@ -500,8 +651,8 @@ EOF
 # _verify_covered_words <covers> <profile> — the JIG_VERIFY_COVERED words for
 # <profile>: `<check>=<covering profile>`, space-separated.
 _verify_covered_words() {
-  local b check u depth words=""
-  while IFS=$'\t' read -r b check u depth; do
+  local b check u depth named words=""
+  while IFS=$'\t' read -r b check u depth named; do
     [ "$b" = "$2" ] || continue
     words="${words:+$words }$check=$u"
   done <<EOF
@@ -511,21 +662,123 @@ EOF
 }
 
 # _verify_handed_maps <installed-dir> <covers> <profile> — the covered profiles whose map
-# follows their tests to <profile>, one `<depth><TAB><name>` line each. A map's decisions
+# (and the maps of the pure layers over them) follows their tests to <profile>, one
+# `<depth><TAB><name>` line each; whether a map file exists is for the caller. A map's decisions
 # narrow its profile's tests (schemas/verify-map.md), so the profile that
 # took the tests over reads them: without this, a project's php.map either
-# kept php running the suite beside laravel or was dropped in silence.
+# kept php running the suite beside the profile that took it or was dropped
+# in silence.
 _verify_handed_maps() {
-  local b check u depth
-  while IFS=$'\t' read -r b check u depth; do
+  local b check u depth named
+  while IFS=$'\t' read -r b check u depth named; do
     [ "$u" = "$3" ] && [ "$check" = tests ] || continue
-    [ -f "$JIG_PROJECT/$JIG_AI_DIR/verify/$b.map" ] || continue
     # A map its own profile never reads is not a decision anyone made for it.
     profiles_supports "$(profiles_dir "$1" "$b")" map || continue
     printf '%s\t%s\n' "$depth" "$b"
   done <<EOF
 $2
 EOF
+  return 0
+}
+
+# _verify_override_lines <base> <overrides> <covers> [<edges>] — what `jig verify` says
+# before a base runs about the layers that changed its checks: one line per
+# overridden role, `verify: <base>:<role>: <field>[, <field>] from <layer>` (several
+# layers: `full from a; narrowed from b`), so a failure names whose argument it
+# ran with; a drop says nothing here, the check's own skip names the layer. A role
+# another profile covers in this run is also warned about: the override has no
+# effect where the check does not run (adr-20261118-a-layer-overrides-its-bases-checks-by-role).
+# Not warned about: a layer on the chain from the profile the cover names down to
+# <base> (the profile itself included) — `covers: [laravel:tests]` replaces what
+# laravel's tests were, its own override of them too, and nobody can act on a
+# warning about that.
+_verify_override_lines() {
+  local base="$1" roles="" role field lyr c text lyrs="" runner cb cc cu depth cn warned=" "
+  local named="" nchain nl inchain
+  local r f l
+  while IFS=$'\t' read -r role _ _ _; do
+    [ -n "$role" ] || continue
+    case " $roles " in *" $role "*) ;; *) roles="$roles $role" ;; esac
+  done <<EOF
+$2
+EOF
+  for role in $roles; do
+    text=""
+    lyrs=""
+    # Layers in the order of the fields they won: command, full, narrowed.
+    for field in command full narrowed; do
+      while IFS=$'\t' read -r r f _ l; do
+        [ "$r" = "$role" ] && [ "$f" = "$field" ] || continue
+        case " $lyrs " in *" $l "*) ;; *) lyrs="$lyrs $l" ;; esac
+      done <<EOF
+$2
+EOF
+    done
+    for lyr in $lyrs; do
+      c=""
+      for field in command full narrowed; do
+        while IFS=$'\t' read -r r f _ l; do
+          if [ "$r" = "$role" ] && [ "$f" = "$field" ] && [ "$l" = "$lyr" ]; then
+            c="${c:+$c, }$field"
+          fi
+        done <<EOF
+$2
+EOF
+      done
+      text="${text:+$text; }$c from $lyr"
+    done
+    [ -z "$text" ] || printf 'verify: %s:%s: %s\n' "$base" "$role" "$text"
+  done
+  # Every layer that wrote a field of a role, drops included, for the warning.
+  while IFS=$'\t' read -r role _ _ lyr; do
+    [ -n "$role" ] || continue
+    runner=""
+    named=""
+    while IFS=$'\t' read -r cb cc cu depth cn; do
+      if [ "$cb" = "$base" ] && [ "$cc" = "$role" ]; then runner=$cu; named=$cn; break; fi
+    done <<EOF
+$3
+EOF
+    [ -n "$runner" ] || continue
+    if [ -n "$named" ] && [ -n "${4:-}" ]; then
+      _profiles_chain_v nchain "$named" "$4"
+      inchain=0
+      for nl in $nchain; do
+        [ "$nl" != "$lyr" ] || inchain=1
+        [ "$nl" != "$base" ] || break
+      done
+      [ "$inchain" = 0 ] || continue
+    fi
+    case "$warned" in *" $lyr:$role "*) continue ;; esac
+    warned="$warned$lyr:$role "
+    printf 'verify: warning: %s overrides %s:%s, but %s runs it in this run (covers), so the override has no effect\n' \
+      "$lyr" "$base" "$role" "$runner"
+  done <<EOF
+$2
+EOF
+}
+
+# _verify_all_dropped_v <var> <rows> — when every role the table <rows>
+# (profiles_check_merged) lists is dropped by a layer, those layers, comma
+# separated, into <var>; empty otherwise. Decided from the rows `jig verify`
+# wrote, never from what the profile printed.
+_verify_all_dropped_v() {
+  local __ad_r __ad_f __ad_v __ad_listed=0 __ad_dropped=0 __ad_layers=""
+  printf -v "$1" '%s' ""
+  while IFS=$'\t' read -r __ad_r __ad_f __ad_v; do
+    case "$__ad_f" in
+      listed) __ad_listed=$((__ad_listed + 1)) ;;
+      drop)
+        __ad_dropped=$((__ad_dropped + 1))
+        case ", $__ad_layers," in *", $__ad_v,"*) ;; *) __ad_layers="${__ad_layers:+$__ad_layers, }$__ad_v" ;; esac
+        ;;
+    esac
+  done <<EOF
+$2
+EOF
+  if [ "$__ad_listed" -gt 0 ] && [ "$__ad_dropped" -ge "$__ad_listed" ]; then
+    printf -v "$1" '%s' "$__ad_layers"
+  fi
   return 0
 }
 
@@ -544,12 +797,13 @@ cmd_verify() {
   # one empty line, and would otherwise be dropped rather than rejected.
   local list_only=0 explain=0 profile_given=0 profiles_words="" p pdir raw tok
   local scope=0 base="" nfiles=0 scope_ok note full=0 explicit=0 full_run
-  local header="" base_branch base_ref mb map map_ok map_err maps maps_listed map_bad b
+  local header="" base_branch base_ref mb map map_ok map_err maps maps_listed map_bad b pmaps stale_base stock_src stale_why tracked_profiles=""
   local incomplete=0 covered=0 explained=0 unknown=0 plan_output plan_bad hr_state hr_rt hr_text
-  local covered_needs_install=0 is_fallback=0 run_output ci_left=0 task_base="" task_which="" task_note=""
+  local table_err table_rows table_overrides="" base_roles="" p_dropped="" dropped_msg="" dropped_needs=0 covered_needs_install=0 is_fallback=0 run_output ci_left=0 task_base="" task_which="" task_note=""
   JIG_VERIFY_TMP=""
   JIG_VERIFY_MAP_TMP=""
   JIG_VERIFY_MAP_ALL_TMP=""
+  JIG_VERIFY_CHECKS_TMP=""
   JIG_VERIFY_BUSY=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -591,15 +845,47 @@ cmd_verify() {
   local installed_dir
   installed_dir=$(profiles_installed_dir)
 
+  # The stack: the names asked for (a `--profile` list, or `profiles:`) and every
+  # base they extend, a layer before its base. `--profile php` runs php and what
+  # php extends, never what extends php. A stack that does not resolve is refused
+  # below, after the staleness gate; here the names stay as they were asked.
+  local plain_words="$profiles_words" stack_err="" stack_layer="" stack_edges=""
+  # shellcheck disable=SC2086
+  if profiles_stack_v profiles_words $plain_words; then
+    # shellcheck disable=SC2086
+    profiles_stack_v stack_edges --edges $plain_words || true
+  else
+    stack_err=$PROFILES_STACK_ERROR
+    stack_layer=$PROFILES_STACK_LAYER
+    profiles_words=$plain_words
+  fi
+
   if [ "$list_only" = 1 ]; then
+    local over under e
     for p in $profiles_words; do
       pdir=$(profiles_dir "$installed_dir" "$p")
       if [ -d "$pdir" ]; then
-        printf '%s: installed\n' "$p"
+        over=""
+        under=""
+        while IFS=$'\t' read -r e b; do
+          [ -n "$e" ] || continue
+          [ "$e" != "$p" ] || over=$b
+          [ "$b" != "$p" ] || under="${under:+$under, }$e"
+        done <<EOF
+$stack_edges
+EOF
+        note=""
+        [ -z "$over" ] || note="layer over $over"
+        [ -z "$under" ] || note="${note:+$note; }base of $under"
+        printf '%s: installed%s\n' "$p" "${note:+ ($note)}"
       else
         printf '%s: not installed\n' "$p"
       fi
     done
+    if [ -n "$stack_err" ]; then
+      printf 'FAIL %s\n' "$stack_err"
+      return 1
+    fi
     return 0
   fi
 
@@ -689,6 +975,33 @@ cmd_verify() {
   # fw_pending_rc != 0: pending state unknown (e.g. no source checkout on
   # this machine, domains/install) — proceed and verify the profiles normally.
 
+  # A stack that does not resolve, or a layer whose check table is wrong, is
+  # refused before any profile starts: a layer that runs without its base, or
+  # whose override is ignored, passes for something it did not check. After the
+  # gate above, which catches a missing stock base first.
+  if [ -n "$stack_err" ]; then
+    if [ "$explain" = 1 ]; then
+      printf 'PLAN %s: error (%s)\n' "$stack_layer" "${stack_err#"$stack_layer: "}"
+    else
+      printf 'FAIL %s\n' "$stack_err"
+    fi
+    return 1
+  fi
+  local layer_refused=0 lint_layer lint_n lint_reason
+  while IFS=$'\t' read -r lint_layer lint_n lint_reason; do
+    [ -n "$lint_layer" ] || continue
+    layer_refused=1
+    if [ "$explain" = 1 ]; then
+      printf 'PLAN %s: error (profile.yaml:%s: %s)\n' "$lint_layer" "$lint_n" "$lint_reason"
+    else
+      printf 'FAIL %s: profile.yaml:%s: %s\n' "$lint_layer" "$lint_n" "$lint_reason"
+    fi
+  done < <(
+    # shellcheck disable=SC2086
+    profiles_check_layers "$installed_dir" "$stack_edges" $profiles_words || true
+  )
+  [ "$layer_refused" = 0 ] || return 1
+
   # One trap for both the temporary files and the run record: the record has to
   # come back on every exit, not only on a run that narrowed.
   jig_on_exit '_verify_cleanup'
@@ -759,12 +1072,25 @@ cmd_verify() {
     if [ -n "$RUNENV_EXEC" ] && ! profiles_supports "$pdir" environment; then continue; fi
     run_profiles="${run_profiles:+$run_profiles }$p"
   done
-  covers=$(_verify_covers "$installed_dir" "$run_profiles" "$scope")
+  covers=$(_verify_covers "$installed_dir" "$run_profiles" "$scope" "$stack_edges")
 
   local total=0 pass=0 failn=0 skip=0 rc
   for p in $profiles_words; do
-    total=$((total + 1))
     pdir=$(profiles_dir "$installed_dir" "$p")
+
+    # A pure layer — it extends a profile and has no verify.sh of its own — is
+    # a few lines of configuration over its base, not a broken install: it runs
+    # nothing, is not counted, and says where its checks run. Whether anything
+    # was covered is what its bases say.
+    if [ -f "$pdir/profile.yaml" ] && [ ! -f "$pdir/verify.sh" ]; then
+      profile_get_v ext "$pdir" extends || true
+      if [ -n "$ext" ]; then
+        printf 'verify: %s is a layer over %s; its checks run in its bases\n' "$p" "$ext"
+        continue
+      fi
+    fi
+
+    total=$((total + 1))
 
     if [ ! -d "$pdir" ]; then
       if [ "$explain" = 1 ]; then
@@ -791,6 +1117,39 @@ cmd_verify() {
     fi
 
     if [ ! -f "$pdir/verify.sh" ]; then
+      # A stock profile that became a layer while the installed profile.yaml was
+      # kept (hand-edited, so upgrade left it and deleted the verify.sh): without
+      # `extends` it is not a layer, and its base would run the checks its own
+      # way, silently. With the source at hand the stock copy names the base;
+      # without it (a copy-mode project running its own jig) a profile the
+      # manifest tracks — one jig placed — with neither a verify.sh nor an
+      # `extends` fails the same way: its checks run nowhere.
+      stale_base=""
+      stale_why=""
+      ext=""
+      [ ! -f "$pdir/profile.yaml" ] || profile_get_v ext "$pdir" extends || true
+      if [ -f "$pdir/profile.yaml" ] && [ -z "$ext" ]; then
+        stock_src=$(profiles_source_dir)
+        if [ -n "$stock_src" ] && [ -f "$stock_src/$p/profile.yaml" ]; then
+          profile_get_v stale_base "$stock_src/$p" extends || stale_base=""
+          [ -z "$stale_base" ] || stale_why="profile.yaml has no extends, but the stock $p now extends $stale_base and ships no verify.sh; jig upgrade kept your edited profile.yaml — carry your edits onto the new one"
+        fi
+        if [ -z "$stale_why" ] && [ -z "$stock_src" ]; then
+          [ -n "$tracked_profiles" ] || _profiles_tracked_v tracked_profiles
+          case "$tracked_profiles" in
+            *" $p "*) stale_why="a profile jig installed, with neither a verify.sh nor an extends, so its checks run nowhere; if jig upgrade kept your edited profile.yaml, the stock $p may now be a layer over another profile — carry your edits onto the new one, else run jig upgrade" ;;
+          esac
+        fi
+      fi
+      if [ -n "$stale_why" ]; then
+        failn=$((failn + 1))
+        if [ "$explain" = 1 ]; then
+          printf 'PLAN %s: error (%s)\n' "$p" "$stale_why"
+        else
+          printf 'FAIL %s: %s\n' "$p" "$stale_why"
+        fi
+        continue
+      fi
       if [ "$explain" = 1 ]; then
         printf 'PLAN %s: unknown (no verify.sh)\n' "$p"
         unknown=$((unknown + 1))
@@ -838,6 +1197,44 @@ cmd_verify() {
       unset JIG_VERIFY_COVERED
     fi
 
+    # The profile's check table (schemas/profile.md): linted here, once, and
+    # handed down as a file of rows, so a typo is a failed profile rather than
+    # an override that does nothing. Rows reach only a profile that has them —
+    # the rows are the declaration, and `checks: [tests]` alone, as released
+    # before the table, is not one; every other profile runs with the variable
+    # unset, so a caller's own JIG_VERIFY_CHECKS never reaches one. A listed
+    # role is a `<role> listed` row, so the library can tell a role with no
+    # arguments from a role the profile.yaml does not know.
+    rm -f "$JIG_VERIFY_CHECKS_TMP" 2>/dev/null || true
+    JIG_VERIFY_CHECKS_TMP=""
+    # A profile over a base may write the base's roles too; the layer lint above
+    # has already judged those rows, so here they are only let through.
+    base_roles=""
+    if [ -n "$stack_edges" ]; then
+      _profiles_base_roles_v base_roles "$p" "$installed_dir" "$stack_edges"
+    fi
+    if ! table_err=$(profiles_check_table "$pdir" "$base_roles"); then
+      failn=$((failn + 1))
+      if [ "$explain" = 1 ]; then
+        printf 'PLAN %s: error (profile.yaml:%s)\n' "$p" "$table_err"
+      else
+        printf 'RESULT %s: fail (profile.yaml:%s)\n' "$p" "$table_err"
+      fi
+      continue
+    fi
+    profiles_check_overrides_v table_overrides "$pdir" "$stack_edges"
+    table_rows=$(profiles_check_merged "$pdir" "$stack_edges")
+    _verify_all_dropped_v p_dropped "$table_rows"
+    if [ -n "$table_rows" ]; then
+      JIG_VERIFY_CHECKS_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-verify-checks.XXXXXX") \
+        || jig_die "verify: cannot create temporary file"
+      printf '%s\n' "$table_rows" > "$JIG_VERIFY_CHECKS_TMP"
+      JIG_VERIFY_CHECKS="$JIG_VERIFY_CHECKS_TMP"
+      export JIG_VERIFY_CHECKS
+    else
+      unset JIG_VERIFY_CHECKS
+    fi
+
     note=""
     scope_ok=0
     if [ "$scope" = 1 ]; then
@@ -860,14 +1257,18 @@ cmd_verify() {
     # — a line silently skipped would narrow the checks the wrong way.
     map_ok=0
     if [ "$scope_ok" = 1 ] && [ "$nfiles" -gt 0 ] && profiles_supports "$pdir" map; then
-      # The profile's own map first, then the map of every profile whose
-      # tests it covers: the decisions follow the tests (_verify_handed_maps),
-      # and with the own map's lines first, first match wins across both.
+      # The maps of the pure layers whose tests this profile runs, topmost
+      # first (warehouse.map before laravel.map), then the profile's own map,
+      # then the map of every profile whose tests it covers, each behind the
+      # maps of its own layers: the decisions follow the tests
+      # (_verify_handed_maps, _verify_profile_maps_v), and with the nearest
+      # lines first, first match wins across all of them.
       maps=""
-      [ ! -f "$JIG_PROJECT/$JIG_AI_DIR/verify/$p.map" ] || maps="$JIG_AI_DIR/verify/$p.map"
-      # Nearest first: laravel.map before php.map for a profile over both.
+      _verify_profile_maps_v maps "$installed_dir" "$p" "$stack_edges"
+      # Nearest first.
       for b in $(_verify_handed_maps "$installed_dir" "$covers" "$p" | LC_ALL=C sort -n -k1,1 | cut -f2); do
-        maps="${maps:+$maps }$JIG_AI_DIR/verify/$b.map"
+        _verify_profile_maps_v pmaps "$installed_dir" "$b" "$stack_edges"
+        [ -z "$pmaps" ] || maps="${maps:+$maps }$pmaps"
       done
       map_bad=0
       for map in $maps; do
@@ -909,6 +1310,10 @@ cmd_verify() {
         note=" (scope: changed, $nfiles files, map $maps_listed)"
       fi
     fi
+
+    # Whose argument a check runs with: said before the base's own lines, in a
+    # preview and in a run alike.
+    [ -z "$table_overrides" ] || _verify_override_lines "$p" "$table_overrides" "$covers" "$stack_edges"
 
     # A profile without declared support is run with the scope variables
     # cleared, never merely unset by the caller's environment: an installed
@@ -1004,8 +1409,16 @@ cmd_verify() {
         # own wording) or hit a real gap (a missing tool, a broken check) — and
         # only the second is a person's to fix. Absence of any skip line at all
         # is read as the cautious default, same as an undeclared capability.
+        # The count is what it always was; a profile whose every check a layer
+        # dropped is also remembered (known from the table, never from the
+        # profile's output), so the summary can say what happened (see below). A streamed
+        # `--full` run leaves no output to read, and counts as a gap.
         if [ "$is_fallback" != 1 ] && ! _verify_skip_lines_all_scoped "$run_output"; then
           covered_needs_install=$((covered_needs_install + 1))
+          [ -z "$p_dropped" ] || dropped_needs=$((dropped_needs + 1))
+        fi
+        if [ -n "$p_dropped" ]; then
+          dropped_msg="${dropped_msg:+$dropped_msg; }every check of $p was dropped by $p_dropped"
         fi
         printf 'RESULT %s: skip%s\n' "$p" "$note"
         ;;
@@ -1038,6 +1451,17 @@ cmd_verify() {
   if [ "$ci_left" -gt 0 ]; then
     printf 'verify: %d check(s) left their full set to CI (verify.full_run: ci); jig verify --full runs it here\n' \
       "$ci_left"
+  fi
+  # A layer that dropped every check of its base is said on every run where it
+  # is true, whatever else passed or failed (the exit code is not changed by
+  # it). The one run that says it inside another sentence — the nothing-checked
+  # ending below, which names the dropped checks instead of "install" — does
+  # not say it twice.
+  if [ -n "$dropped_msg" ] && ! { [ "$incomplete" -eq 0 ] && [ "$pass" -eq 0 ] \
+       && [ "$failn" -eq 0 ] && [ "$total" -gt 0 ] && [ "$covered" = 1 ] \
+       && [ "$covered_needs_install" -gt 0 ] \
+       && [ "$covered_needs_install" -eq "$dropped_needs" ]; }; then
+    printf 'verify: %s; nothing verified it\n' "$dropped_msg"
   fi
   # Incomplete outranks fail: a run something was killed in is not evidence, so
   # the failures in it cannot be trusted either. Nothing is lost — a real
@@ -1082,6 +1506,12 @@ cmd_verify() {
   # counts covered profiles whose skip does NOT reduce to scope narrowing:
   # zero of those, and the state is the third one above, not the first.
   if [ "$pass" -eq 0 ] && [ "$failn" -eq 0 ] && [ "$total" -gt 0 ]; then
+    # Only the dropped checks kept the run from a verdict: say so, not "install".
+    if [ "$covered" = 1 ] && [ "$covered_needs_install" -gt 0 ] \
+       && [ "$covered_needs_install" -eq "$dropped_needs" ]; then
+      printf 'verify: nothing was checked, so this is not a pass — %s; nothing verified it\n' "$dropped_msg"
+      return 3
+    fi
     if [ "$covered" = 1 ] && [ "$covered_needs_install" -gt 0 ]; then
       printf 'verify: nothing was checked, so this is not a pass — install the project'"'"'s tools so its profile can run\n'
       return 3

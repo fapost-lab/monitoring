@@ -76,6 +76,9 @@ without saying the reason to the person in words, and the same reason goes into 
 When the person asks to set priorities or to order the tasks, follow
 [task priority](references/priority.md): the answer is written to the queue, not listed in the chat.
 
+A task whose `jig task show` says `gate_state: answered` continues from its human gate (below): a
+person answered the design and it waits to be reworked.
+
 ## 2. Classify
 
 Read `references/classification.md`, answer its risk test — what a mistake would cost and
@@ -268,6 +271,23 @@ already. Run the stage that is missing, not the ones the author has done.
 
 ## Human gate (T3, T4)
 
+**The design says what it needs decided.** End a T3/T4 `design.md` with this section, its heading
+and `Recommended:` in English whatever language the rest is in — Jig reads them as data for the
+person's board:
+
+```
+## Gate questions
+
+### <the question, one line>
+<context, optional>
+- <option>
+- <option>
+Recommended: <your pick and why, one line>
+```
+
+Zero to five questions; a section with none says the design only needs a yes. Write the design as if
+every recommendation were taken: an approval takes them all.
+
 Stop. Show the document being approved — `design.md`; for T4 also `spec.md` and the
 alternatives — verbatim, with your objections after it, as
 [show the document](references/show-the-document.md) says. What changes, which
@@ -276,6 +296,13 @@ they are missing, the document is not ready for the gate. Wait for the human to 
 change or reject it, and record the decision in `task.md` (`jig task artifact append <id> task --from <file>`). Do not start implementing while
 waiting, and do not treat silence or a general "ok, go on" from an earlier message as
 approval.
+
+The person may answer from their board instead of here: `jig task gate <id> answered --answer
+<text>` records their words and takes the card away until the design changes. Before acting on an
+"ok", or when you resume a task at its gate, read `jig task show <id>`: `gate_state: answered` means
+their answer, on its `gate_answer:` line, waits for you; once you rewrite the design the state is
+`waiting` again. Record it in `task.md` as their decision, rework the design and come back to the gate
+with the changed sections (a repeated gate). An answer is never an approval.
 
 When the human approves, record it for the scripts too, after the design reflects every change
 they asked for:

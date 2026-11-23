@@ -3,8 +3,23 @@ name: php
 description: PHP projects using Composer.
 detect: [composer.json]
 scope: [changed, map, explain, environment]
-# Checks another profile can take over by name (`covers: [php:tests]`).
-checks: [tests]
+# The checks of this profile by role, and the index of its check table
+# (schemas/profile.md, Check table). Another profile can take one over by name
+# (`covers: [php:tests]`).
+checks: [tests, static, style, manifest]
+# tests: phpunit, or pest when the project has no phpunit; verify.sh chooses
+# the runner, so the table names no command. A narrowed run passes the test
+# files it selected.
+checks.tests.narrowed: {selection}
+# static: phpstan; a narrowed run analyses the changed .php files.
+checks.static.full: analyse --no-progress
+checks.static.narrowed: analyse --no-progress {selection}
+# style: pint; a narrowed run checks the changed .php files.
+checks.style.full: --test
+checks.style.narrowed: --test {selection}
+# manifest: composer validate, never narrowed by files.
+checks.manifest.command: composer
+checks.manifest.full: validate --no-check-publish
 carry: [vendor]
 lock: [composer.lock]
 install: composer install

@@ -1369,7 +1369,7 @@ _config_entries_json() {
   local key row default kind allowed desc sep=""
   _CONFIG_ENTRIES=""
   for key in "$@"; do
-    row=$(jig_config_key_rows | JIG_CFG_KEY="$key" awk -F'|' '$1 == ENVIRON["JIG_CFG_KEY"] { print; exit }')
+    row=$(jig_config_key_rows | JIG_CFG_KEY="$key" awk -F'|' '!d && $1 == ENVIRON["JIG_CFG_KEY"] { print; d = 1 }')
     [ -n "$row" ] || continue
     IFS='|' read -r key default kind allowed desc <<EOF
 $row

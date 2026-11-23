@@ -55,7 +55,7 @@ _self_update_branch() {
   # — a remote asking for credentials must fail the pull, not hang it
   # (fetch-never-waits-for-a-prompt).
   rc=0
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$source")" \
     git -C "$source" pull --ff-only || rc=$?
   if [ "$rc" -ne 0 ]; then
     printf 'jig: error: self-update: git pull --ff-only failed\n' >&2
@@ -111,7 +111,7 @@ _self_update_detached() {
   # See _self_update_branch: `cmd || rc=$?`, never `if ! cmd; then rc=$?`.
   # Same GIT_TERMINAL_PROMPT=0 / GIT_SSH_COMMAND reasoning as there.
   rc=0
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$source")" \
     git -C "$source" fetch --tags origin || rc=$?
   if [ "$rc" -ne 0 ]; then
     printf 'jig: error: self-update: git fetch --tags origin failed\n' >&2
@@ -144,11 +144,38 @@ _self_update_detached() {
   fi
 }
 
+# _self_update_repoint_origin <source> — an install made before Jig moved to
+# the fapost-jig organisation still has origin = fapost-lab/jig and fetches
+# through GitHub's redirect, which ends the day that name is reused
+# (adr-20261118-jig-lives-in-its-own-organisation). Repoint exactly that old
+# address, keeping its transport (https or ssh), and say so; any other remote
+# (a fork, a mirror, a local path) is left alone. The raw config value is
+# read, not `git remote get-url`, which applies url.*.insteadOf rewrites. A
+# failed rewrite only warns: the redirect still serves this update.
+_self_update_repoint_origin() {
+  local source="$1" old new
+  old=$(git -C "$source" config --get remote.origin.url 2>/dev/null) || return 0
+  case "$old" in
+    https://github.com/fapost-lab/jig | https://github.com/fapost-lab/jig.git | \
+      https://github.com/fapost-lab/jig/ | https://github.com/fapost-lab/jig.git/)
+      new=https://github.com/fapost-jig/jig.git ;;
+    git@github.com:fapost-lab/jig | git@github.com:fapost-lab/jig.git | \
+      ssh://git@github.com/fapost-lab/jig | ssh://git@github.com/fapost-lab/jig.git)
+      new=git@github.com:fapost-jig/jig.git ;;
+    *) return 0 ;;
+  esac
+  if git -C "$source" remote set-url origin "$new" 2>/dev/null; then
+    printf 'self-update: origin moved: %s -> %s\n' "$old" "$new"
+  else
+    jig_warn "self-update: could not repoint origin from $old to $new; set it by hand: git -C $source remote set-url origin $new"
+  fi
+}
+
 cmd_self_update() {
   local global self_phys source
 
   global=$(jig_global_executable) \
-    || jig_die "self-update: no global jig on PATH; install it with: curl -fsSL https://raw.githubusercontent.com/fapost-lab/jig/main/install.sh | bash"
+    || jig_die "self-update: no global jig on PATH; install it with: curl -fsSL https://raw.githubusercontent.com/fapost-jig/jig/main/install.sh | bash"
 
   # JIG_SELF is already symlink-resolved (dispatcher); made physical the same
   # way jig_global_executable makes its own answer physical, so the two
@@ -169,6 +196,7 @@ cmd_self_update() {
 
   source=$(jig_global_source) || jig_die "self-update: no global jig on PATH"
   _self_update_validate_source "$source"
+  _self_update_repoint_origin "$source"
 
   if git -C "$source" symbolic-ref -q HEAD >/dev/null 2>&1; then
     _self_update_branch "$source" "$global"

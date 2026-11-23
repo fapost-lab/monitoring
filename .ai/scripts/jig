@@ -86,7 +86,9 @@ Usage: jig <command> [args]
   task autopilot <id> start|stage|repair|stop|resume|end|report
                                  run a task's route without stopping between stages;
                                  repair caps out at 2 and stops the run (exit 3)
-  task gate <id> approved        record the human's approval of a T3/T4 design
+  task gate <id> approved|answered
+                                 record the human's approval of a T3/T4 design, or their
+                                 answer (--answer <text>) to its gate questions
   context [...]                  relevant knowledge for a task
   context resolve [...]          required documents; --stage, --no-task, --catalog
   context pending|guard [...]    knowledge required but not yet acknowledged
@@ -113,6 +115,8 @@ Usage: jig <command> [args]
   knowledge read <id> --json     one document's text, and a stub's linked file as it is now
   spec new <id>                  create .ai/specs/<id>/ from the specification templates
   spec list                      specifications under .ai/specs/ and their roadmap progress
+  spec read <id> spec|roadmap [--json]
+                                 one document of a spec as written; --json as data
   spec done <task-id>            check the roadmap items that name a spec-linked task
   spec drop <task-id>            close the roadmap items of an abandoned or moved task, with why
   spec link <spec-id> <task-id>  link a filed, not-started task to the spec phase naming it

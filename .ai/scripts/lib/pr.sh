@@ -619,7 +619,7 @@ _pr_keep_pr_base() {
   _pr_git "$JIG_PROJECT" cat-file -e "$sha^{commit}" 2>/dev/null && return 0
   opts=$(_pr_fetch_opts)
   # shellcheck disable=SC2086 # opts is a list of fixed flags
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$JIG_PROJECT")" \
     jig_net _pr_git "$JIG_PROJECT" fetch -q $opts "$remote" "+$sha:$ref" >/dev/null 2>&1 || true
   got=$(_pr_git "$JIG_PROJECT" rev-parse --verify --quiet "$ref^{commit}") || got=""
   [ "$got" = "$sha" ] \
@@ -688,7 +688,7 @@ EOF
   local fetch_opts
   fetch_opts=$(_pr_fetch_opts)
   # shellcheck disable=SC2086 # fetch_opts is a list of fixed flags
-  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$JIG_PROJECT")" \
     jig_net _pr_git "$JIG_PROJECT" fetch -q $fetch_opts "$remote" \
       "+$head_ref:refs/jig/pr/$_PR_N/head" \
       "+refs/heads/$base:refs/jig/pr/$_PR_N/base" >/dev/null \
@@ -2226,7 +2226,7 @@ _pr_fu_keep() {
   else
     opts=$(_pr_fetch_opts)
     # shellcheck disable=SC2086 # opts is a list of fixed flags
-    if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh)" \
+    if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(jig_git_batch_ssh "$JIG_PROJECT")" \
       jig_net _pr_git "$JIG_PROJECT" fetch -q $opts "$remote" "+$sha:$ref" >/dev/null 2>&1; then
       _PR_FU_HOW=fetched
     fi

@@ -144,7 +144,7 @@ _runenv_container() {
     docker inspect -f '{{.Name}}{{"\n"}}{{range .Mounts}}{{.Source}}{{"\t"}}{{.Destination}}{{"\n"}}{{end}}' "$id" 2>/dev/null \
       | RUNENV_A="$here" RUNENV_B="$real" awk -F '\t' '
           NR == 1 { n = $1; sub(/^\//, "", n); next }
-          ($1 == ENVIRON["RUNENV_A"] || $1 == ENVIRON["RUNENV_B"]) && $2 != "" { print n "\t" $2; exit }'
+          ($1 == ENVIRON["RUNENV_A"] || $1 == ENVIRON["RUNENV_B"]) && $2 != "" && !d { print n "\t" $2; d = 1 }'
   done | sed -n '1p'
 }
 
