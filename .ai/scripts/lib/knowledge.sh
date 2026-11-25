@@ -12,6 +12,7 @@ KM_USAGE="usage: jig knowledge check [--quiet]
        jig knowledge paths add|remove <id> <glob>
        jig knowledge summary <id> <text>
        jig knowledge stages add|remove <id> <stage>
+       jig knowledge supersede <old-id> --by <new-id>
        jig knowledge proposed [--json]
        jig knowledge accept <id>... [--revision <n>] [--json]
        jig knowledge reject <id>... [--revision <n>] [--json]
@@ -32,7 +33,7 @@ cmd_knowledge() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
   case "$sub" in
-    check | new | paths | stale | reviewed | accept | reject | decide | proposed | inventory | summary | stages | changed | sources | read | adr-convention) ;;
+    check | new | paths | stale | reviewed | accept | reject | decide | proposed | inventory | summary | stages | supersede | changed | sources | read | adr-convention) ;;
     *) jig_die "$KM_USAGE" ;;
   esac
 
@@ -105,6 +106,7 @@ cmd_knowledge() {
     proposed) km_proposed "$@" ;;
     summary) km_summary "$@" ;;
     stages) km_stages "$@" ;;
+    supersede) km_supersede "$@"; jig_status_page_touch --full ;;
     inventory) km_inventory "$@" ;;
     changed) km_changed "$@" ;;
     sources) km_sources "$@" ;;
@@ -531,6 +533,58 @@ km_summary() {
   doc=$(km_doc_by_id "$id")
   fm_set "$doc" summary "$text" || jig_die "knowledge summary: could not write: $id"
   printf 'summary    %s\n' "$(km_rel "$doc")"
+}
+
+# km_supersede <old-id> --by <new-id> — retire one document in favour of another:
+# `status: superseded` on the old one, `supersedes: <old-id>` on the new one.
+# Everything is refused before the first write; if the second write fails the
+# first is put back, so a refusal or a failure leaves both documents as they were.
+km_supersede() {
+  local usage="usage: jig knowledge supersede <old-id> --by <new-id>"
+  local old="" new=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by) [ $# -ge 2 ] || jig_die "knowledge supersede: --by requires an id"
+        new="$2"; shift 2 ;;
+      -*) jig_die "knowledge supersede: unknown argument: $1" ;;
+      *) [ -z "$old" ] || jig_die "knowledge supersede: unknown argument: $1"
+        old="$1"; shift ;;
+    esac
+  done
+  if [ -z "$old" ] || [ -z "$new" ]; then jig_die "$usage"; fi
+  [ "$old" != "$new" ] || jig_die "knowledge supersede: a document cannot supersede itself: $old"
+
+  local old_file new_file
+  old_file=$(km_doc_by_id "$old")
+  new_file=$(km_doc_by_id "$new")
+
+  local old_type new_type old_status new_status held
+  old_type=$(fm_get "$old_file" type)
+  new_type=$(fm_get "$new_file" type)
+  old_status=$(fm_get "$old_file" status)
+  new_status=$(fm_get "$new_file" status)
+
+  [ "$old_type" = "$new_type" ] \
+    || jig_die "knowledge supersede: $old is type $old_type but $new is type $new_type; a document is replaced by one of its own type"
+  [ "$old_status" != superseded ] || jig_die "knowledge supersede: $old is already superseded"
+  jig_knowledge_status_resolvable "$old_status" \
+    || jig_die "knowledge supersede: $old is $old_status; only an active or accepted document is superseded"
+  jig_knowledge_status_resolvable "$new_status" \
+    || jig_die "knowledge supersede: $new is $new_status; the replacing document must be active or accepted (accept it first)"
+  # `supersedes` holds one id: writing over another would leave that document
+  # superseded with no successor naming it.
+  held=$(fm_get "$new_file" supersedes)
+  [ -z "$held" ] || jig_die "knowledge supersede: $new already supersedes $held; one document replaces one"
+  [ "$(fm_get "$old_file" supersedes)" != "$new" ] \
+    || jig_die "knowledge supersede: $old already supersedes $new; that would be a cycle"
+
+  fm_set "$old_file" status superseded || jig_die "knowledge supersede: could not write: $old"
+  if ! fm_set "$new_file" supersedes "$old"; then
+    fm_set "$old_file" status "$old_status" || :
+    jig_die "knowledge supersede: could not write: $new"
+  fi
+  printf 'superseded %s  by %s\n' "$(km_rel "$old_file")" "$new"
+  printf 'supersedes %s  %s\n' "$(km_rel "$new_file")" "$old"
 }
 
 # --- accept / reject --------------------------------------------------------------
@@ -1106,6 +1160,10 @@ km_check() {
   KM_META_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-meta.XXXXXX")
   KM_TRACKED_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-tracked.XXXXXX")
   KM_SOURCES_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-sources.XXXXXX")
+  KM_SUPERSEDES_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-supersedes.XXXXXX")
+  KM_SUPERSEDED_FILE=$(mktemp "${TMPDIR:-/tmp}/jig-knowledge-superseded.XXXXXX")
+  jig_cleanup_add "$KM_SUPERSEDES_FILE"
+  jig_cleanup_add "$KM_SUPERSEDED_FILE"
   jig_cleanup_add "$KM_LIST_FILE"
   jig_cleanup_add "$KM_IDS_FILE"
   jig_cleanup_add "$KM_IDS_ALL_FILE"
@@ -1126,17 +1184,22 @@ km_check() {
   # Pass 1: collect all declared ids up front, so `supersedes` can reference an
   # id defined in a document that sorts after the one referencing it, and the
   # `requires` graph can be walked in either direction.
-  local t meta_status meta_reqs
+  local t meta_status meta_reqs meta_supersedes block
   t=$(printf '\t')
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     jig_knowledge_is_global "$file" && continue
-    fm_has "$file" || continue
-    id=$(fm_get "$file" id)
+    fm_read_v block "$file" || continue
+    fm_get_block_v id "$block" id
     [ -n "$id" ] || continue
     printf '%s\n' "$id" >> "$KM_IDS_ALL_FILE"
     relpath=$(jig_relpath "$file" "$JIG_PROJECT")
-    meta_status=$(fm_get "$file" status)
+    fm_get_block_v meta_status "$block" status
+    # Who is replaced and who replaces: pass 4 asks that every superseded
+    # document has a successor naming it.
+    fm_get_block_v meta_supersedes "$block" supersedes
+    [ -z "$meta_supersedes" ] || printf '%s\n' "$meta_supersedes" >> "$KM_SUPERSEDES_FILE"
+    [ "$meta_status" != superseded ] || printf '%s%s%s\n' "$id" "$t" "$relpath" >> "$KM_SUPERSEDED_FILE"
     meta_reqs=$(fm_list "$file" requires | sed '/^$/d' | tr '\n' ',' | sed 's/,$//')
     printf '%s%s%s%s%s%s%s\n' \
       "$id" "$t" "$relpath" "$t" "$meta_status" "$t" "$meta_reqs" >> "$KM_META_FILE"
@@ -1152,6 +1215,16 @@ km_check() {
 
   # Pass 3: the `requires` graph, which no single document can validate alone.
   km_check_requires "$KM_META_FILE"
+
+  # Pass 4: every superseded document must be named in some other document's
+  # `supersedes`.
+  local old_id old_rel supersedes_all
+  supersedes_all=$(cat "$KM_SUPERSEDES_FILE")
+  while IFS="$t" read -r old_id old_rel; do
+    [ -n "$old_id" ] || continue
+    jig_has_line "$old_id" "$supersedes_all" \
+      || km_warn "$old_rel" "status superseded but no document names it in supersedes (jig knowledge supersede $old_id --by <new-id>)"
+  done < "$KM_SUPERSEDED_FILE"
 
   [ "$KM_QUIET" -eq 1 ] \
     || printf 'knowledge check: %d documents, %d failures, %d warnings\n' \

@@ -770,8 +770,10 @@ _hk_forge_init() {
       ;;
     gitlab)
       # A row needs a branch and a state; jig_glab_fields (common.sh) splits
-      # glab's compact array and drops objects without a source branch. The
-      # merge request's own web_url, not its author's, which comes first.
+      # glab's compact array into its top-level objects (nested assignee and
+      # reviewer objects stay inside theirs) and drops objects without a source
+      # branch. The merge request's own web_url, not its author's, which comes
+      # first.
       # 100, GitLab's largest page, where glab's own default is 30: an upgrade
       # merge request behind 30 newer ones would drop out of the forge cache,
       # which this list replaces whole (GitHub's list asks for 200).
@@ -821,18 +823,20 @@ _hk_forge_init() {
 # counts once, at its newest run, as gh keeps only that one per workflow and
 # name; a skipped or neutral check counts as neither, a cancelled one as
 # failed, anything unfinished as pending. red, pending, green, or none when no
-# check ran. gh's own --jq, not jq (ADR-0002); the filter hands over the
-# review's raw words and the decision is made in the shell, once, in
-# jig_pr_approval_github_v, where `task pr-status` and `task land` make it too.
+# check ran. gh's own --jq, not jq (ADR-0002), with no "/" in it (not even
+# "//": Git Bash may take such an argument for a path; tests/gh.t.sh guards it).
+# The filter hands over the review's raw words and the decision is made in the
+# shell, once, in jig_pr_approval_github_v, where `task pr-status` and
+# `task land` make it too.
 _hk_forge_ci() {
   [ "$_HK_FORGE_KIND" = github ] || return 0
   local out h b c m oid url dec reviews pending rv w t=$'\t'
   # shellcheck disable=SC2016 # $c is the --jq expression's variable, not the shell's
   out=$(jig_gh pr list --state open --limit 200 \
     --json headRefName,baseRefName,statusCheckRollup,mergeable,headRefOid,url,reviewDecision,latestReviews,reviewRequests \
-    --jq '.[] | [.statusCheckRollup // []
-          | group_by((.workflowName // "") + "/" + (.name // .context // ""))[]
-          | max_by(.startedAt // .completedAt // "")
+    --jq '.[] | [(if .statusCheckRollup == null then [] else .statusCheckRollup end)
+          | group_by([(if .workflowName == null then "" else .workflowName end), (if .name != null then .name elif .context != null then .context else "" end)])[]
+          | max_by(if .startedAt != null then .startedAt elif .completedAt != null then .completedAt else "" end)
           | if .__typename == "StatusContext" then
               (if .state == "SUCCESS" then "pass"
                elif .state == "ERROR" or .state == "FAILURE" then "fail"
@@ -847,7 +851,7 @@ _hk_forge_ci() {
             if any($c[]; . == "fail") then "red"
             elif any($c[]; . == "pending") then "pending"
             elif any($c[]; . == "pass") then "green"
-            else "none" end)\t\(.mergeable // "" | if . == "" then "-" else . end)\t\(.headRefOid // "" | if . == "" then "-" else . end)\t\(.url // "" | if . == "" then "-" else . end)\t\(.reviewDecision // "" | if . == "" then "-" else . end)\t\([.latestReviews[]?.state] | join(",") | if . == "" then "-" else . end)\t\([.reviewRequests[]? | (if .login then .login elif .slug then .slug else .name end) | select(. != null)] | join(",") | if . == "" then "-" else . end)"' 2>/dev/null) || return 0
+            else "none" end)\t\(.mergeable | if . == null or . == "" then "-" else . end)\t\(.headRefOid | if . == null or . == "" then "-" else . end)\t\(.url | if . == null or . == "" then "-" else . end)\t\(.reviewDecision | if . == null or . == "" then "-" else . end)\t\([.latestReviews[]?.state] | join(",") | if . == "" then "-" else . end)\t\([.reviewRequests[]? | (if .login then .login elif .slug then .slug else .name end) | select(. != null)] | join(",") | if . == "" then "-" else . end)"' 2>/dev/null) || return 0
   # One row per line, read in this shell: no process per pull request. A row
   # with no decision field (a shorter one) carries no review.
   while IFS="$t" read -r h b c m oid url dec reviews pending; do

@@ -609,6 +609,161 @@ _pr_gh_refuse_a_lost_reply() {
 
 # --- fetch --------------------------------------------------------------------------------
 
+# --- the issue a pull request implements -------------------------------------------------
+#
+# `jig pr fetch` names the head branch and the issue candidates the review
+# starts from. The pattern is the reviewed repository's own, as its base sets it:
+# never the head's (the author controls it), never this clone's working tree or
+# the person's local layer, never personal or global settings.
+
+# _pr_issue_pattern_at_v <var> <sha> — task.issue_pattern of `.ai/config.yaml`
+# as it is at commit <sha> of the reviewed repository, into <var>, with one
+# pair of surrounding quotes removed (jig_strip_quotes, as _task_issue_pattern
+# does); empty when the commit has no such file or the file no such key. A
+# setter, called as a plain command, so the temp file is registered in the
+# caller's shell (conventions/shell.md: never from inside $(...)). Always
+# returns 0; <var> is set on every path. Locals are prefixed: the caller names
+# <var>, and a local of that name here would capture the write.
+_pr_issue_pattern_at_v() {
+  local __pip_tmp __pip_val=""
+  printf -v "$1" '%s' ""
+  __pip_tmp=$(mktemp "${TMPDIR:-/tmp}/jig-pr-config.XXXXXX") || return 0
+  jig_cleanup_add "$__pip_tmp"
+  if _pr_git "$JIG_PROJECT" show "$2:.ai/config.yaml" > "$__pip_tmp" 2>/dev/null; then
+    _cfg_read_v __pip_val "$__pip_tmp" task.issue_pattern || __pip_val=""
+  fi
+  rm -f "$__pip_tmp"
+  __pip_val=$(jig_strip_quotes "$__pip_val")
+  printf -v "$1" '%s' "$__pip_val"
+  return 0
+}
+
+# _pr_issue_candidates <pattern> <head branch> <title> <body> — one
+# `<issue><TAB><where>` line per distinct candidate, at most five, in the order
+# head branch, title, body; <where> lists every place it was found in. Only
+# matched tokens are printed, never the text. When matches beyond the five
+# exist, a last line `more<TAB>-` says so. Exit 2, printing nothing, when awk
+# cannot read the pattern; 1 when it failed otherwise.
+#
+# The body goes to awk on stdin, a line at a time (a match never spans lines),
+# because a long body would not fit the environment's per-string limit; the
+# pattern, branch and title are short and go through it.
+#
+# The head branch is read as _task_issue_from_id (task.sh; keep the two rules
+# the same) reads an id, per segment of
+# `/`: the pattern anchored at the segment's start, awk's longest match, kept
+# only at the segment's end or before `-`, `_` or `.`. Title and body: every
+# match that is a whole word (no letter, digit or `_` right before or after;
+# awk has no \b). A match of digits only counts only after a `#` (`#123`), the
+# issue as `jig task new` stores it; a bare number in prose is no candidate.
+_pr_issue_candidates() {
+  local rc=0
+  # `env` sets the locale: bash 5.3 can crash restoring LC_ALL after a command
+  # that took it as a prefix assignment (exit 139), as _pr_json_lines avoids.
+  # shellcheck disable=SC2016 # an awk program
+  printf '%s\n' "$4" | env LC_ALL=C JIG_P_PAT="$1" JIG_P_BRANCH="$2" JIG_P_TITLE="$3" awk '
+    function add(v, where,   k) {
+      gsub(/[[:cntrl:]]/, " ", v)
+      if (!(v in idx)) {
+        if (n >= 5) { more = 1; return }
+        idx[v] = ++n; val[n] = v; src[n] = ""
+      }
+      k = idx[v]
+      if (!((k SUBSEP where) in seen)) {
+        seen[k, where] = 1
+        src[k] = (src[k] == "" ? "" : src[k] ", ") where
+      }
+    }
+    function scan(text, where,   pos, p, len, tok, before, after) {
+      pos = 1
+      while (pos <= length(text) && match(substr(text, pos), "(" pat ")")) {
+        p = pos + RSTART - 1; len = RLENGTH
+        if (len < 1) { pos = p + 1; continue }
+        tok = substr(text, p, len)
+        before = (p > 1) ? substr(text, p - 1, 1) : ""
+        after = substr(text, p + len, 1)
+        if (before !~ /[A-Za-z0-9_]/ && after !~ /[A-Za-z0-9_]/ && (tok !~ /^[0-9]+$/ || before == "#")) {
+          add(tok, where)
+          pos = p + len
+        } else pos = p + 1
+      }
+    }
+    BEGIN {
+      pat = ENVIRON["JIG_P_PAT"]
+      segs = split(ENVIRON["JIG_P_BRANCH"], seg, "/")
+      for (i = 1; i <= segs; i++) {
+        if (!match(seg[i], "^(" pat ")") || RLENGTH < 1) continue
+        after = substr(seg[i], RLENGTH + 1, 1)
+        if (after == "" || after == "-" || after == "_" || after == ".") add(substr(seg[i], 1, RLENGTH), "head branch")
+      }
+      scan(ENVIRON["JIG_P_TITLE"], "title")
+    }
+    { scan($0, "body") }
+    END {
+      for (k = 1; k <= n; k++) print val[k] "\t" src[k]
+      if (more) print "more\t-"
+    }' 2>/dev/null || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 2 ] && return 2
+  return 1
+}
+
+# _pr_issue_lines <base sha> <head branch> <title> <body> <read> — the `issue:`
+# lines of the fetch: a candidate a line, or one `issue: ask (…)` that says why
+# there is none. <read> is 1 when the forge's text could be read. Never fails:
+# the person can always be asked.
+_pr_issue_lines() {
+  local pattern out rc=0 cand where tab
+  tab=$(printf '\t')
+  _pr_issue_pattern_at_v pattern "$1"
+  if [ -z "$pattern" ]; then
+    printf 'issue: ask (the base sets no task.issue_pattern; ask the person for the issue or where to find it)\n'
+    return 0
+  fi
+  if [ "$5" != 1 ]; then
+    printf 'issue: ask (the forge gave no head branch, title and body to look in; ask the person for the issue or where to find it)\n'
+    return 0
+  fi
+  out=$(_pr_issue_candidates "$pattern" "$2" "$3" "$4") || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    printf "issue: ask (the base's task.issue_pattern is not a pattern awk can read; ask the person)\n"
+    return 0
+  elif [ "$rc" -ne 0 ]; then
+    printf 'issue: ask (awk failed on the head branch, title and body; ask the person for the issue or where to find it)\n'
+    return 0
+  fi
+  if [ -z "$out" ]; then
+    printf "issue: ask (the base's task.issue_pattern matches nothing in the head branch, title or body; ask the person)\n"
+    return 0
+  fi
+  while IFS="$tab" read -r cand where; do
+    if [ "$cand" = more ] && [ "$where" = - ]; then
+      printf 'issue: ask (more matches than shown; ask the person which issue the pull request implements)\n'
+      continue
+    fi
+    printf "issue: %s (%s)   (a candidate by the base's task.issue_pattern; confirm it with the person)\n" "$cand" "$where"
+  done <<EOF
+$out
+EOF
+}
+
+# _pr_gh_text <owner/repo> — the head branch, the title and the body of pull
+# request _PR_N into _PR_HEAD_BRANCH, _PR_TITLE and _PR_BODY; exit 1 when
+# GitHub does not answer. Apart from _pr_pull_info, whose line `comments check`
+# reads.
+_PR_HEAD_BRANCH="" _PR_TITLE="" _PR_BODY=""
+_pr_gh_text() {
+  local out rest nl=$'\n'
+  _PR_HEAD_BRANCH="" _PR_TITLE="" _PR_BODY=""
+  out=$(_pr_gh "repos/$1/pulls/$_PR_N" --jq '.head.ref, .title, (if .body == null then "" else .body end)' 2>/dev/null) || return 1
+  out=$(printf '%s\n' "$out" | tr -d '\r')
+  _PR_HEAD_BRANCH=${out%%"$nl"*}
+  [ "$out" != "$_PR_HEAD_BRANCH" ] || return 0
+  rest=${out#*"$nl"}
+  _PR_TITLE=${rest%%"$nl"*}
+  [ "$rest" = "$_PR_TITLE" ] || _PR_BODY=${rest#*"$nl"}
+}
+
 # _pr_keep_pr_base <sha> <remote> — make GitHub's base commit of the pull
 # request available here: nothing to do when the clone holds it (the base
 # branch's history usually does), else fetched by its id into
@@ -628,7 +783,7 @@ _pr_keep_pr_base() {
 
 _pr_fetch() {
   local rc=0 remote info base api_head state slug dir rec wt kind recorded head base_sha mb accounts active tok login why now t
-  local head_ref extra="" pr_base="" own_mb=""
+  local head_ref extra="" pr_base="" own_mb="" text_ok=0
   [ $# -eq 1 ] || jig_fail usage "pr fetch: one pull request URL is required; $PR_USAGE"
   _pr_parse_url "$1" || rc=$?
   [ "$rc" = 0 ] \
@@ -662,6 +817,7 @@ _pr_fetch() {
       || jig_die "pr fetch: GitLab did not answer for $_PR_URL (glab auth status --hostname $_PR_HOST)"
     base="$_PR_GL_TARGET" api_head="$_PR_GL_SHA" state="$_PR_GL_STATE"
     head_ref="refs/merge-requests/$_PR_N/head"
+    _pr_gl_text && text_ok=1
   else
     command -v gh >/dev/null 2>&1 || jig_die "pr fetch: the GitHub CLI (gh) is needed to read $_PR_URL"
     _pr_propose_login "$slug"
@@ -674,6 +830,8 @@ EOF
       '' | *[!0-9a-f]*) jig_die "pr fetch: GitHub named no base commit for $_PR_URL" ;;
     esac
     head_ref="refs/pull/$_PR_N/head"
+    # Not worth a refusal: without the text the review asks the person for the issue.
+    if _pr_gh_text "$slug" && [ -n "$_PR_HEAD_BRANCH" ]; then text_ok=1; fi
   fi
   git check-ref-format --branch "$base" >/dev/null 2>&1 \
     || jig_die "pr fetch: $_PR_FORGE_NAME named no usable base branch for $_PR_URL: $base"
@@ -781,6 +939,8 @@ fetched_at: $now
       "$JIG_PROJECT" "$own_mb" "$head" "$base"
   fi
   printf 'rules: git -C %s show %s:<path>   (the base, never the head)\n' "$JIG_PROJECT" "$base_sha"
+  printf 'head branch: %s\n' "${_PR_HEAD_BRANCH:-unknown}"
+  _pr_issue_lines "$base_sha" "$_PR_HEAD_BRANCH" "$_PR_TITLE" "$_PR_BODY" "$text_ok"
   _pr_method_lines
 }
 

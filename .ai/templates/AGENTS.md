@@ -150,7 +150,8 @@ new class requires.
 - Before finishing a task, decide what should survive it. Update `.ai/knowledge/`, or
   state `NO_DURABLE_KNOWLEDGE` — and record the decision in task state
   (`jig-consolidate`). Frontmatter is maintained by `jig knowledge new`,
-  `jig knowledge paths add|remove` and `jig knowledge reviewed`, never by hand.
+  `jig knowledge paths add|remove`, `jig knowledge reviewed` and `jig knowledge supersede`,
+  never by hand.
 - Knowledge authority, highest first: human instruction, accepted ADR, architecture,
   rules and invariants, conventions, glossary, feature knowledge, task context.
   Escalate real conflicts to a human.

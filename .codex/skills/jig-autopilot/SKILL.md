@@ -135,6 +135,8 @@ as the run's level allows. Then:
 .ai/scripts/jig task autopilot <id> report
 ```
 
+A `not merged` ship does not finish the run: it stays on until you ship again once it can merge, or `end` it with the reason.
+
 Hand back the pull request link (or "ready for your commit", or the pushed branch CI lands) and the
 report. The pull request body — in the commit message when `external` leaves no pull request — is short and in English: what changed and why, the review result, the verify result, and the
 report's blocks as they are — never its stage and repair lines, never a task artifact. Its
@@ -195,7 +197,8 @@ staging branch instead: exit 5 is a conflict you resolve as `jig-consolidate` §
 not; exit 3 on review is a stop when attended, and an unattended run is told to wait. After
 `landed …` or `not landed: …`, `end --reason "<that line>"` and do not close the task: it is
 **parked** — waiting for review or for "prepare for prod" — and the run is over. Never land it
-`--without-review` unless the person said so, never approve its pull request, never run
+`--without-review` unless the person said so — inside the unattended run, on or stopped, it is
+refused; after `end` it is the person's word, as in any session — never approve its pull request, never run
 `jig task promote`. `--by human` is a person's form, for the person or their UI; the agent never
 passes it. `autopilot start` and `stage` refuse a parked task, and only a person's
 `jig task resume <id>` takes it back for a fix. With

@@ -49,10 +49,14 @@ _land_refuse() {
 }
 
 # _land_nobody_answers <id> — an unattended run waits for nobody; a person who
-# pressed the button is somebody.
+# pressed the button is somebody. Only the task's own unattended run, on or
+# stopped, counts: the clone's `autopilot.unattended` alone does not take the
+# word from the person working the task outside a run, as at the gate
+# (adr-20261111-a-task-lands-on-staging-through-its-pull-request, amended
+# 2026-11-23).
 _land_nobody_answers() {
   [ "$_LAND_BY_HUMAN" != 1 ] || return 1
-  _task_nobody_answers "$1"
+  _task_run_unattended "$1"
 }
 
 # _land_claim <who> — claim the revision a person's landing was asked against,
@@ -368,7 +372,7 @@ land_task() {
     [ "$(jig_staging_review || true)" != require ] \
       || _land_refuse review-required "$who: --without-review: git.staging_review is require, so $pr waits for an approval"
     ! _land_nobody_answers "$id" \
-      || jig_die "$who: --without-review: nobody answers in an unattended run, so $pr waits for review"
+      || jig_die "$who: --without-review: nobody answers in an unattended run, so $pr waits for review; the person lands it themselves: jig task land $id --by human --without-review"
   fi
 
   # The person's word given earlier in this landing, still standing while a

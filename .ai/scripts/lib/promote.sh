@@ -705,7 +705,7 @@ _promote_base_gated_github() {
     --jq '[.[] | select(.type == "required_status_checks")] | length' 2>/dev/null) || rules=""
   # shellcheck disable=SC2016 # $r is jq's, not the shell's
   classic=$(jig_net jig_gh api "repos/{owner}/{repo}/branches/$base" \
-    --jq '(.protection.required_status_checks // {}) as $r | if ($r.enforcement_level // "everyone") == "off" then 0 else ((($r.contexts // []) + ($r.checks // [])) | length) end' \
+    --jq '(if .protection.required_status_checks == null then {} else .protection.required_status_checks end) as $r | if $r.enforcement_level == "off" then 0 else (((if $r.contexts == null then [] else $r.contexts end) + (if $r.checks == null then [] else $r.checks end)) | length) end' \
     2>/dev/null) || classic=""
   case "$rules" in '' | *[!0-9]*) rules="" ;; esac
   case "$classic" in '' | *[!0-9]*) classic="" ;; esac

@@ -685,7 +685,7 @@ _prdo_protection() {
     enc=$(printf '%s' "$base" | sed 's|/|%2F|g')
     # shellcheck disable=SC2016 # a jq definition, not the shell's
     out=$(jig_net jig_gh api "repos/{owner}/{repo}/rules/branches/$enc" \
-      --jq '"\([.[] | select(.type == "pull_request") | .parameters.required_approving_review_count] | max // 0)|\([.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context] | unique | join(","))"' 2>/dev/null) || return 0
+      --jq '"\([.[] | select(.type == "pull_request") | .parameters.required_approving_review_count] | max | if . == null then 0 else . end)|\([.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context] | unique | join(","))"' 2>/dev/null) || return 0
     out=$(printf '%s' "${out%%$'\n'*}" | tr -d '\r')
     _PRDO_REQ_APPROVALS=${out%%|*}
     _PRDO_REQ_CHECKS=${out#*|}
