@@ -280,14 +280,16 @@ EOF
 
 # _pr_gl_mr_info — merge request _PR_N of project _PR_GL_PID into _PR_GL_STATE,
 # _PR_GL_TARGET, _PR_GL_SHA (its head), _PR_GL_LOCKED, _PR_GL_CHANGES and the
-# three shas of its diff: _PR_GL_BASE, _PR_GL_START and _PR_GL_HEADSHA.
+# three shas of its diff: _PR_GL_BASE, _PR_GL_START and _PR_GL_HEADSHA, and its
+# source branch, title and description: _PR_GL_SRC, _PR_GL_TITLE, _PR_GL_DESC.
 _PR_GL_STATE="" _PR_GL_TARGET="" _PR_GL_SHA="" _PR_GL_LOCKED="" _PR_GL_CHANGES=""
-_PR_GL_BASE="" _PR_GL_START="" _PR_GL_HEADSHA=""
+_PR_GL_BASE="" _PR_GL_START="" _PR_GL_HEADSHA="" _PR_GL_SRC="" _PR_GL_TITLE="" _PR_GL_DESC=""
 _pr_gl_mr_info() {
-  local out line tab v
+  local out line tab v last="" nl=$'\n'
+  local -a desc_rest=()
   tab=$(printf '\t')
   _PR_GL_STATE="" _PR_GL_TARGET="" _PR_GL_SHA="" _PR_GL_LOCKED="" _PR_GL_CHANGES=""
-  _PR_GL_BASE="" _PR_GL_START="" _PR_GL_HEADSHA=""
+  _PR_GL_BASE="" _PR_GL_START="" _PR_GL_HEADSHA="" _PR_GL_SRC="" _PR_GL_TITLE="" _PR_GL_DESC=""
   out=$(_pr_glab "projects/$_PR_GL_PID/merge_requests/$_PR_N" 2>/dev/null | _pr_json_lines) || return 1
   while IFS= read -r line; do
     v=${line#*"$tab"}
@@ -301,11 +303,34 @@ _pr_gl_mr_info() {
       "0.diff_refs.base_sha$tab"*) _PR_GL_BASE="$v" ;;
       "0.diff_refs.start_sha$tab"*) _PR_GL_START="$v" ;;
       "0.diff_refs.head_sha$tab"*) _PR_GL_HEADSHA="$v" ;;
+      "0.source_branch$tab"*) _PR_GL_SRC="$v" ;;
+      "0.title$tab"*) _PR_GL_TITLE="$v" ;;
+      "0.description$tab"*) _PR_GL_DESC="$v" ;;
+    esac
+    # A line of a multi-line string follows as a TAB and the text: the
+    # description's next line.
+    case "$line" in
+      "$tab"*) [ "$last" != description ] || desc_rest[${#desc_rest[@]}]="${line#"$tab"}" ;;
+      "0.description$tab"*) last=description ;;
+      *) last="" ;;
     esac
   done <<EOF
 $out
 EOF
+  # Joined once: a description is the author's text and can be long.
+  if [ "${#desc_rest[@]}" -gt 0 ]; then
+    local IFS="$nl"
+    _PR_GL_DESC="$_PR_GL_DESC$nl${desc_rest[*]}"
+  fi
   [ -n "$_PR_GL_SHA" ]
+}
+
+# _pr_gl_text — the head branch, the title and the description of the merge
+# request _pr_gl_mr_info read into _PR_HEAD_BRANCH, _PR_TITLE and _PR_BODY (the
+# names the GitHub half fills); exit 1 when GitLab gave no source branch.
+_pr_gl_text() {
+  _PR_HEAD_BRANCH="$_PR_GL_SRC" _PR_TITLE="$_PR_GL_TITLE" _PR_BODY="$_PR_GL_DESC"
+  [ -n "$_PR_GL_SRC" ]
 }
 
 # _pr_gl_read_files — merge request _PR_N's files as GitLab's diff has them,

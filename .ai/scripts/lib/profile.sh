@@ -218,9 +218,9 @@ jp_check_cmd() {
     done < "$JIG_VERIFY_CHECKS"
   fi
   if [ "$known" = 0 ]; then
-    reason="profile.yaml names no check '$role'; jig upgrade restores it"
+    reason="profile.yaml names no check '$role'; carry your edits onto the stock profile's new profile.yaml"
   elif [ "$mode" = narrowed ] && [ "$have_narrowed" = 0 ]; then
-    reason="profile.yaml has no checks.$role.narrowed; jig upgrade restores it"
+    reason="profile.yaml has no checks.$role.narrowed; carry your edits onto the stock profile's new profile.yaml"
   fi
   if [ -n "$reason" ]; then
     if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
@@ -260,9 +260,9 @@ EOF
   done
   if [ "${#JP_CMD[@]}" -eq 0 ]; then
     if [ "${JIG_VERIFY_EXPLAIN:-}" = 1 ]; then
-      jp_plan "$label" skip "profile.yaml gives no command for '$role'; jig upgrade restores it"
+      jp_plan "$label" skip "profile.yaml gives no command for '$role'; carry your edits onto the stock profile's new profile.yaml"
     else
-      jp_fail "$label" "profile.yaml gives no command for '$role'; jig upgrade restores it"
+      jp_fail "$label" "profile.yaml gives no command for '$role'; carry your edits onto the stock profile's new profile.yaml"
     fi
     return 1
   fi

@@ -91,6 +91,17 @@ $1
 "
 }
 
+# jig_strip_quotes <value> — <value> with one pair of surrounding single or
+# double quotes removed, printed with a newline.
+jig_strip_quotes() {
+  local v="$1"
+  case "$v" in
+    \'*\') v=${v#\'}; v=${v%\'} ;;
+    \"*\") v=${v#\"}; v=${v%\"} ;;
+  esac
+  printf '%s\n' "$v"
+}
+
 jig_cleanup_add() {
   local dir=0 p
   if [ "${1:-}" = "-d" ]; then dir=1; shift; fi
@@ -3339,16 +3350,60 @@ jig_forge_kind() {
 # jig_glab_fields <key>... — read `glab ... --output json` on stdin and print
 # one tab-separated row of the given string fields per object, skipping an
 # object whose first field is empty. `glab` returns a compact single-line
-# array, so it is split into one object per line first: a greedy `.*` across
-# the whole line would keep only the last merge request. Each field is taken
-# at its first occurrence, whatever the key order: nested objects (author,
-# assignees) carry a `state` of their own, later on. A key written
-# `<key>@<text>` takes the first occurrence whose value contains <text>
-# instead: an object's `web_url` comes after its author's. Housekeeping and
-# jig_ship_pr both read `glab` through this, so they cannot disagree on it.
+# array, so it is split into one top-level object per line first: a greedy `.*`
+# across the whole line would keep only the last merge request. The split
+# counts braces and brackets and skips what a string holds (a title may carry
+# `{`, `}` or `\"`), so only an object at depth 0 starts a line: a merge request
+# with two assignees or reviewers keeps its nested `},{` inside its own line,
+# where a split on every `},{` would have cut `target_branch` away from
+# `web_url` and `merged_at`. A single object (`glab mr view`) passes through as
+# one line. Each field is taken at its first occurrence, whatever the key
+# order: nested objects (author, assignees) carry a `state` of their own, later
+# on. A key written `<key>@<text>` takes the first occurrence whose value
+# contains <text> instead: an object's `web_url` comes after its author's.
+# Housekeeping and jig_ship_pr both read `glab` through this, so they cannot
+# disagree on it.
 jig_glab_fields() {
-  sed 's/},[[:space:]]*{/}\
-{/g' | awk -v keys="$*" '
+  awk '
+    # Emit each top-level object on a line of its own; drop whatever lies
+    # between them (`[`, `,`, `]`, blanks). Depth and string state carry over
+    # lines, so a pretty-printed input is read the same.
+    BEGIN { depth = 0; instr = 0; esc = 0; from = 0; buf = "" }
+    {
+      len = length($0)
+      # Chunks of 4096 characters, each split into single characters: a
+      # substr() per character of a whole line would be quadratic in awks that
+      # count multibyte characters.
+      for (pos = 1; pos <= len; pos += 4096) {
+        m = split(substr($0, pos, 4096), ch, "")
+        for (k = 1; k <= m; k++) {
+          c = ch[k]
+          if (instr) {
+            if (esc) esc = 0
+            else if (c == "\\") esc = 1
+            else if (c == "\"") instr = 0
+          } else if (c == "\"") {
+            if (depth > 0) instr = 1
+          } else if (c == "{") {
+            if (depth == 0) { from = pos + k - 1; buf = "" }
+            depth++
+          } else if (c == "[") {
+            if (depth > 0) depth++
+          } else if (c == "}" || c == "]") {
+            if (depth > 0) {
+              depth--
+              if (depth == 0) {
+                print buf substr($0, from, pos + k - from)
+                from = 0; buf = ""
+              }
+            }
+          }
+        }
+      }
+      # An object that goes on over the next line: keep what is read of it,
+      # its line break dropped (a break only separates tokens in JSON).
+      if (from > 0) { buf = buf substr($0, from); from = 1 }
+    }' | awk -v keys="$*" '
     function field(key,   k, need, rest, v) {
       need = ""
       if (index(key, "@")) { need = substr(key, index(key, "@") + 1); key = substr(key, 1, index(key, "@") - 1) }

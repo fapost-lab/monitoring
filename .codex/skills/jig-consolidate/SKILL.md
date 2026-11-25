@@ -68,7 +68,8 @@ into knowledge because they exist. Retain only the accepted intent in its durabl
 
 Update the document that owns the topic instead of adding a parallel one. Several tasks
 over time shape one feature document. When a decision replaces an earlier one, mark the
-old ADR `superseded` rather than editing history.
+old ADR `superseded` rather than editing history: `.ai/scripts/jig knowledge supersede <old-id> --by <new-id>`
+sets the old status and the new `supersedes`, and refuses what it cannot do cleanly.
 
 A part of `ARCHITECTURE.md` under **Intended — not built yet** that this task built moves out
 of that heading and is described as built — as it is, where it differs from the intention.
