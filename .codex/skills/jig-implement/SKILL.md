@@ -63,7 +63,17 @@ those separately and let the user decide.
 
 Every change carries its evidence: a test for new behaviour, a failing-then-passing test
 for a defect, a check that the build still runs. During implementation, run the smallest
-relevant checks provided by the project.
+relevant checks through Jig:
+
+```
+.ai/scripts/jig verify --files <the files this edit touched>
+```
+
+It runs only the tests the project maps to those files (name a test file to run just it),
+where the project's checks run — a container included — with the profile's own flags, one
+run at a time. It never starts a full set, so it is not the task's verification. It selects
+by file, never by test name: for one test, use the runner the project's rules name for that
+(`jig context` lists them), where those checks run; without such a rule, the test's file.
 Run the checks `jig verify` runs once against the final change in `jig-verify`; do not run
 the whole suite after each edit or start another copy while a run is still active.
 

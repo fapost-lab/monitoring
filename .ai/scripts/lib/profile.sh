@@ -569,7 +569,11 @@ jp_files() {
 # (adr-20261001-checks-run-where-the-project-runs). The prefix is plain words,
 # split on blanks and never globbed. Stdin is closed under a prefix: `docker
 # compose exec` would otherwise read the input of the loop a profile calls it
-# from.
+# from. With JIG_VERIFY_RUN_TOKEN set (only `jig verify` sets it, only beside a
+# prefix) the command runs as `env JIG_VERIFY_RUN=<token> <cmd>`: every process
+# of its tree carries the token, which is how `jig verify` finds and ends what a
+# stopped run left in the container
+# (adr-20261125-verify-ends-the-processes-it-started).
 jp_exec() {
   local -a pre
   if [ -z "${JIG_RUN_EXEC:-}" ]; then
@@ -579,7 +583,11 @@ jp_exec() {
   read -r -a pre <<EOF
 $JIG_RUN_EXEC
 EOF
-  "${pre[@]}" "$@" </dev/null
+  if [ -n "${JIG_VERIFY_RUN_TOKEN:-}" ]; then
+    "${pre[@]}" env "JIG_VERIFY_RUN=$JIG_VERIFY_RUN_TOKEN" "$@" </dev/null
+  else
+    "${pre[@]}" "$@" </dev/null
+  fi
 }
 
 # jp_have <cmd> — exit 0 when <cmd> can be run where the project runs: the

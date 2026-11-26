@@ -16,6 +16,9 @@
 # (.ai/verify/<profile>.map) is parsed here, never in a profile, and handed to
 # profiles declaring `scope: [changed, map]` as JIG_VERIFY_MAPPED.
 #
+# --files <list>|- names the changed files itself and never starts a full set: the
+# profiles are told `ci`, and a profile that cannot narrow is skipped.
+#
 # One run per clone, and a run that dies is not a pass
 # (adr-20260925-one-test-run-per-clone-and-a-dead-run-is-not-a-pass): a run
 # takes a record every worktree of the clone can see and waits while another
@@ -105,6 +108,124 @@ _verify_merge_base() {
   printf -v "$2" '%s' "$__vmb_ref"
   printf -v "$3" '%s' "$__vmb_mb"
   return 0
+}
+
+# _verify_task_merge_base <ref-var> <mb-var> <note-var> <branch-var> — the merge
+# base a narrowed run is measured from. The current task's own base first
+# (ADR-0039): a task cut from an epic is measured from the epic, not from main,
+# or every task re-runs the whole epic's diff. A recorded base this clone cannot
+# resolve (an epic deleted after its merge, never fetched) falls back to the
+# configured one, never to the working tree alone. <ref-var> and <mb-var> are as
+# in _verify_merge_base (<mb-var> empty when nothing resolves), <note-var> is
+# "base of <which>; " when the task's base was used, <branch-var> the branch the
+# merge base was taken against.
+_verify_task_merge_base() {
+  local __vtm_ref="" __vtm_mb="" __vtm_note="" __vtm_branch __vtm_tb="" __vtm_tw=""
+  __vtm_branch=$(cfg git.base_branch main)
+  _verify_task_base __vtm_tb __vtm_tw
+  if [ -n "$__vtm_tb" ]; then
+    _verify_merge_base "$__vtm_tb" __vtm_ref __vtm_mb
+    if [ -n "$__vtm_mb" ]; then
+      __vtm_branch="$__vtm_tb"
+      __vtm_note="base of $__vtm_tw; "
+    fi
+  fi
+  [ -n "$__vtm_mb" ] || _verify_merge_base "$__vtm_branch" __vtm_ref __vtm_mb
+  printf -v "$1" '%s' "$__vtm_ref"
+  printf -v "$2" '%s' "$__vtm_mb"
+  printf -v "$3" '%s' "$__vtm_note"
+  printf -v "$4" '%s' "$__vtm_branch"
+  return 0
+}
+
+# _verify_named_files <raw> — the --files list, normalised: one repo-relative
+# path per line, sorted and unique. Each entry is trimmed and loses a leading
+# ./; an absolute path inside the project becomes repo-relative; /./ and
+# repeated / inside a path collapse and a trailing / (a directory) is dropped.
+# A path outside the project, with a .. segment, or naming the project root
+# itself is refused (exit 1), as is a list with nothing in it. A path that
+# does not exist on disk is fine: it may be a file the change deleted, and the
+# profile decides what that means.
+_verify_named_files() {
+  local raw="$1" line root root_p out="" drive
+  local root_msg="verify: --files names the project root; name files or a directory inside it"
+  root="${JIG_PROJECT%/}"
+  root_p=$(cd "$JIG_PROJECT" && pwd -P)
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|\\|/|g')
+    [ -n "$line" ] || continue
+    # A drive path (C:/x/a.php) is absolute. On MSYS the project root reads
+    # /c/x, so the drive is rewritten to that spelling and matched like any
+    # other absolute path; a root spelled otherwise leaves it outside.
+    case "$line" in
+      [A-Za-z]:/*)
+        drive=$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')
+        case "$root" in
+          [A-Za-z]:/*) ;;
+          *) line="/$drive/${line#?:/}" ;;
+        esac
+        ;;
+    esac
+    # Collapse repeated / and /./, and drop a trailing / or /. (a directory).
+    while :; do
+      case "$line" in
+        *//*) line=${line//\/\//\/} ;;
+        */./*) line=${line//\/.\//\/} ;;
+        / ) break ;;
+        */. | */)
+          line=${line%/*}
+          if [ -z "$line" ]; then line=/; fi
+          ;;
+        *) break ;;
+      esac
+    done
+    case "/$line/" in
+      */../*) jig_die "verify: --files path is outside the project (.. segment): $line" ;;
+    esac
+    case "$line" in
+      /*)
+        case "$line" in
+          "$root" | "$root_p") jig_die "$root_msg" ;;
+        esac
+        case "$line" in
+          "$root"/*) line=${line#"$root"/} ;;
+          "$root_p"/*) line=${line#"$root_p"/} ;;
+          *)
+            # The same place spelled through a symlink (/var and /private/var):
+            # resolve the nearest directory that exists, keep the rest.
+            local dir="${line%/*}" rest="${line##*/}"
+            while [ -n "$dir" ] && [ ! -d "$dir" ]; do
+              rest="${dir##*/}/$rest"
+              dir="${dir%/*}"
+            done
+            [ -z "$dir" ] || dir=$(cd "$dir" && pwd -P)
+            case "$dir/$rest" in
+              "$root_p") jig_die "$root_msg" ;;
+              "$root_p"/*) line=${dir#"$root_p"}/$rest; line=${line#/} ;;
+              *) jig_die "verify: --files path is outside the project: $line" ;;
+            esac
+            ;;
+        esac
+        ;;
+    esac
+    while :; do
+      case "$line" in
+        ./*) line=${line#./} ;;
+        *) break ;;
+      esac
+    done
+    if [ -z "$line" ]; then
+      continue
+    elif [ "$line" = "." ]; then
+      jig_die "$root_msg"
+    fi
+    out="$out$line
+"
+  done <<EOF
+$raw
+EOF
+  [ -n "$out" ] || jig_die "verify: --files is empty"
+  printf '%s' "$out" | LC_ALL=C sort -u
 }
 
 # _verify_ref_label <ref> — how a base ref reads in the report:
@@ -205,7 +326,8 @@ _verify_map_apply() {
 # The record is read by jig_verify_busy_holder and its helpers in common.sh:
 # `jig upgrade` asks the same question before it replaces scripts.
 
-# _verify_busy_claim <dir> — take the record, or fail.
+# _verify_busy_claim <dir> [<ttl>] — take the record, or fail. <ttl> is the
+# holder's verify.busy_ttl in seconds, written into the record.
 #
 # Creating `busy/run` exclusively is the claim (jig_claim_file,
 # adr-20261023-a-claim-is-an-exclusive-create); `busy/` is only its container.
@@ -219,10 +341,14 @@ _verify_map_apply() {
 # file falls back to the ttl, and a leftover temporary would make `rmdir` refuse
 # for good.
 _verify_busy_claim() {
-  local dir="$1"
+  local dir="$1" ttl="${2:-}"
   mkdir -p "$dir/busy" 2>/dev/null || return 1
   jig_claim_file "$dir/busy/run" || return 1
-  printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$" > "$dir/busy/run" 2>/dev/null || {
+  # `ttl:` is the holder's own verify.busy_ttl: how long a waiter with another
+  # setting must believe this record (jig_verify_busy_holder).
+  { printf 'checkout: %s\npid: %s\n' "$JIG_PROJECT" "$$"
+    if [ -n "$ttl" ]; then printf 'ttl: %s\n' "$ttl"; fi
+  } > "$dir/busy/run" 2>/dev/null || {
     rm -f "$dir/busy/run" 2>/dev/null || true
     rmdir "$dir/busy" 2>/dev/null || true
     return 1
@@ -230,61 +356,70 @@ _verify_busy_claim() {
   return 0
 }
 
-# _verify_busy_release <dir> — give the record back.
+# _verify_env_dir_is <dir> — true only when <dir> is exactly what _verify_env_dir
+# builds: `<cache>/jig/verify-env/<key>`, <key> one component of
+# [A-Za-z0-9._-], not `.` or `..`.
+_verify_env_dir_is() {
+  local base prefix key
+  base=$(_verify_env_base) || return 1
+  prefix="$base/jig/verify-env/"
+  case "$1" in
+    "$prefix"*) ;;
+    *) return 1 ;;
+  esac
+  key=${1#"$prefix"}
+  case "$key" in
+    '' | . | .. | */* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# _verify_busy_release <dir> [own] — give the record back. With `own` (a run's
+# own release at exit) the record goes only when its pid is this run's: a record
+# another run took over after this one's ttl ran out is that run's to give back.
+# Taking over a dead or expired record passes no `own`.
 #
 # The shape ADR-0035 allows `jig spec new`: one named file removed, then
 # `rmdir`, which refuses a directory that is not empty. No `rm -rf` on a
 # computed path anywhere, and the path is checked to be the one this code
 # builds before anything is deleted (RULES.md).
 _verify_busy_release() {
-  local dir="$1"
+  local dir="$1" mode="${2:-}" pid
   [ -n "$dir" ] || return 0
   case "$dir" in
     */"$JIG_AI_DIR"/runtime/verify) ;;
-    *) return 0 ;;
+    *) _verify_env_dir_is "$dir" || return 0 ;;
   esac
+  if [ "$mode" = own ]; then
+    pid=$(_jig_verify_busy_value "$dir/busy/run" pid) || pid=""
+    [ "$pid" = "$$" ] || return 0
+  fi
   rm -f "$dir/busy/run" 2>/dev/null || true
   rmdir "$dir/busy" 2>/dev/null || true
   return 0
 }
 
-# _verify_busy_acquire — hold the clone for this run, waiting while another has
-# it. Sets JIG_VERIFY_BUSY to the directory when the record is ours, so the
-# EXIT trap gives it back, and prints one line to stdout when a wait happened:
+# _verify_busy_wait <dir> <ttl> <label> — take the record in <dir>, waiting
+# while a live run holds it. <label> is empty for the clone's own record and
+# `<key>` for the environment's. Returns 0 with JIG_VERIFY_TAKEN=1 when the
+# record is ours, and 0 with JIG_VERIFY_TAKEN=0 when it could not be taken and
+# the run goes on without it. Prints one line to stdout when a wait happened:
 # the evidence belongs in the report, while the waiting itself goes to stderr,
 # where it cannot become part of output a caller reads.
-#
-# Nothing here may fail `jig verify`. Every path that cannot answer gives up and
-# lets the run go ahead: a record that cannot be taken is a missed serialisation,
-# which is today's behaviour, while a refusal would be a new way to break.
-_verify_busy_acquire() {
-  local dir ttl holder age checkout waited=0 announced=0 said=0 ago futile=0
-
-  # CI parallelism is deliberate and each job has a machine of its own. `CI` is
-  # the signal this command already trusts for `verify.full_run` (ADR-0041), so
-  # the mechanism is off there rather than queueing jobs meant to run at once.
-  [ -z "${CI:-}" ] || return 0
-
-  ttl=$(jig_verify_busy_ttl)
-  [ "$ttl" -gt 0 ] || return 0
-  dir=$(jig_verify_busy_dir) || return 0
-  [ -n "$dir" ] || return 0
-
-  # A `jig verify` started by a run that already holds this clone — a suite that
-  # verifies its own project — must not wait for itself.
-  [ "${JIG_VERIFY_BUSY_HELD:-}" != "$dir" ] || return 0
-
-  # A directory that cannot be made at all — a read-only clone root, a
-  # permission the agent does not have — is not a reason to refuse to verify.
-  mkdir -p "$dir" 2>/dev/null || return 0
-
+_verify_busy_wait() {
+  local dir="$1" ttl="$2" label="$3" holder age checkout="" waited=0 announced=0 said=0 ago futile=0
+  JIG_VERIFY_TAKEN=0
   while :; do
-    if _verify_busy_claim "$dir"; then
-      JIG_VERIFY_BUSY="$dir"
-      export JIG_VERIFY_BUSY_HELD="$dir"
+    if _verify_busy_claim "$dir" "$ttl"; then
+      JIG_VERIFY_TAKEN=1
       if [ "$waited" -gt 0 ]; then
-        printf 'verify: waited %s for the run in %s\n' \
-          "$(jig_checkout_ago "$waited")" "$checkout"
+        if [ -n "$label" ]; then
+          printf 'verify: waited %s for the run in %s (environment %s)\n' \
+            "$(jig_checkout_ago "$waited")" "$checkout" "$label"
+        else
+          printf 'verify: waited %s for the run in %s\n' \
+            "$(jig_checkout_ago "$waited")" "$checkout"
+        fi
       fi
       return 0
     fi
@@ -312,9 +447,15 @@ _verify_busy_acquire() {
     ago=$(jig_checkout_ago "$age")
     if [ "$announced" = 0 ]; then
       announced=1
-      jig_info "verify: another run holds this clone (in $checkout, started $ago ago); waiting for it"
-      jig_info "  two sets at once make both slower than running them in turn;" \
-        "set verify.busy_ttl: 0 in .ai/config.local.yaml never to wait"
+      if [ -n "$label" ]; then
+        jig_info "verify: another run holds the environment $label (in $checkout, started $ago ago); waiting for it"
+        jig_info "  two sets at once make both slower than running them in turn;" \
+          "set verify.busy_ttl: 0 in .ai/config.local.yaml never to wait"
+      else
+        jig_info "verify: another run holds this clone (in $checkout, started $ago ago); waiting for it"
+        jig_info "  two sets at once make both slower than running them in turn;" \
+          "set verify.busy_ttl: 0 in .ai/config.local.yaml never to wait"
+      fi
     elif [ $((waited - said)) -ge 60 ]; then
       said="$waited"
       jig_info "verify: still waiting ($(jig_checkout_ago "$waited"))"
@@ -322,6 +463,81 @@ _verify_busy_acquire() {
     sleep 2
     waited=$((waited + 2))
   done
+}
+
+# _verify_env_base — the machine's cache directory, or fail without one.
+_verify_env_base() {
+  jig_machine_cache_dir
+}
+
+# _verify_env_dir <key> — where the record of a shared environment lives, or
+# nothing: the machine's cache directory (the one `jig_machine_latest_file`
+# uses), under `jig/verify-env/`, named for the key made safe as a path
+# component. A container is shared between clones, so no clone's `.ai/runtime`
+# can hold it; without a cache directory there is no place and no record.
+_verify_env_dir() {
+  local base safe
+  base=$(_verify_env_base) || return 1
+  safe=$(printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g')
+  case "$safe" in
+    '' | . | ..) return 1 ;;
+  esac
+  printf '%s/jig/verify-env/%s\n' "$base" "$safe"
+}
+
+# _verify_busy_acquire — hold the clone for this run, waiting while another has
+# it, and then the environment the checks run in when other clones share it.
+# Sets JIG_VERIFY_BUSY (and JIG_VERIFY_ENV) to the directory when the record is
+# ours, so the EXIT trap gives it back.
+#
+# Always the clone first, then the environment: one order everywhere, so two
+# runs can never each hold what the other waits for.
+#
+# Nothing here may fail `jig verify`. Every path that cannot answer gives up and
+# lets the run go ahead: a record that cannot be taken is a missed serialisation,
+# which is today's behaviour, while a refusal would be a new way to break.
+_verify_busy_acquire() {
+  local dir ttl key envdir
+
+  # CI parallelism is deliberate and each job has a machine of its own. `CI` is
+  # the signal this command already trusts for `verify.full_run` (ADR-0041), so
+  # the mechanism is off there rather than queueing jobs meant to run at once.
+  [ -z "${CI:-}" ] || return 0
+
+  ttl=$(jig_verify_busy_ttl)
+  [ "$ttl" -gt 0 ] || return 0
+  dir=$(jig_verify_busy_dir) || return 0
+  [ -n "$dir" ] || return 0
+
+  # A `jig verify` started by a run that already holds this clone — a suite that
+  # verifies its own project — must not wait for itself.
+  if [ "${JIG_VERIFY_BUSY_HELD:-}" != "$dir" ]; then
+    # A directory that cannot be made at all — a read-only clone root, a
+    # permission the agent does not have — is not a reason to refuse to verify.
+    if mkdir -p "$dir" 2>/dev/null; then
+      _verify_busy_wait "$dir" "$ttl" ""
+      if [ "$JIG_VERIFY_TAKEN" = 1 ]; then
+        JIG_VERIFY_BUSY="$dir"
+        export JIG_VERIFY_BUSY_HELD="$dir"
+      fi
+    fi
+  fi
+
+  # The environment: only when the checks run in a container other clones can
+  # share (runenv_shared_key), and only where there is a cache directory.
+  # tests/run.sh takes the clone's record without ever resolving an
+  # environment, so runenv.sh may not be loaded: no environment, no record.
+  key=$(runenv_shared_key 2>/dev/null) || key=""
+  [ -n "$key" ] || return 0
+  envdir=$(_verify_env_dir "$key") || return 0
+  [ "${JIG_VERIFY_ENV_HELD:-}" != "$envdir" ] || return 0
+  mkdir -p "$envdir" 2>/dev/null || return 0
+  _verify_busy_wait "$envdir" "$ttl" "$key"
+  if [ "$JIG_VERIFY_TAKEN" = 1 ]; then
+    JIG_VERIFY_ENV="$envdir"
+    export JIG_VERIFY_ENV_HELD="$envdir"
+  fi
+  return 0
 }
 
 # _verify_skip_lines_all_scoped <output> — true when <output> (a covered
@@ -368,6 +584,98 @@ EOF
   printf '%s\n' "$n"
 }
 
+# --- processes a run leaves in the environment --------------------------------
+#
+# Under a prefix (`docker exec …`) the checks run in a container, and stopping
+# `jig verify` does not stop them there. Each command a profile runs through
+# jp_exec carries `JIG_VERIFY_RUN=<token>`; the token is `<host>-<pid>-<random>`,
+# made once per run: the host is this machine's name
+# (letters, digits and dots, so the dashes split the token), because two
+# machines may share one container (a jig on the host and one in a devcontainer,
+# two machines on one DOCKER_HOST) and a pid means something only where it was
+# taken. A run that is interrupted ends its own token's processes
+# on the way out; a run killed with SIGKILL cannot, so the next run ends the
+# processes of every token whose host pid no longer answers on this machine.
+# Never by name, pattern or user, and never a live run's token
+# (adr-20261125-verify-ends-the-processes-it-started). Nothing here may fail
+# `jig verify` or change its exit code: what cannot be asked is said in one line
+# and the run goes on (runenv.sh, _runenv_sweep_v).
+
+_VERIFY_RUN_TOKEN=""
+_VERIFY_RUN_HOST=""
+_VERIFY_LOOP_DONE=0
+
+# _verify_run_host_v <var> — this machine's name for a run token: `uname -n`
+# (else `hostname`) kept to letters, digits and dots. JIG_VERIFY_RUN_HOST
+# replaces it when set: a test seam only (tests/run.sh gives every test a name
+# of its own), never documented for users.
+_verify_run_host_v() {
+  local __h="${JIG_VERIFY_RUN_HOST:-}"
+  [ -n "$__h" ] || __h=$(uname -n 2>/dev/null || hostname 2>/dev/null || true)
+  __h=$(printf '%s' "$__h" | tr -cd 'A-Za-z0-9.')
+  [ -n "$__h" ] || __h=host
+  printf -v "$1" '%s' "$__h"
+}
+
+# _verify_end_own_run — the EXIT part: end this run's processes in the
+# environment unless every profile ran to the end. Script-global state, because
+# the EXIT trap runs after cmd_verify returned.
+_verify_end_own_run() {
+  local n
+  [ -n "${_VERIFY_RUN_TOKEN:-}" ] || return 0
+  if [ "${_VERIFY_LOOP_DONE:-0}" = 1 ]; then
+    _VERIFY_RUN_TOKEN=""
+    return 0
+  fi
+  n=0
+  runenv_end_token_v n "$_VERIFY_RUN_TOKEN" || n=0
+  _VERIFY_RUN_TOKEN=""
+  if [ "$n" -gt 0 ]; then
+    printf 'verify: ended %s processes this run left in %s\n' "$n" "$RUNENV_WHERE"
+  fi
+  return 0
+}
+
+# _verify_end_dead_runs — the start part: end the processes of every run token
+# in the environment whose host process is gone from this machine. Only tokens
+# made on this machine are judged: a pid of another host says nothing here, so
+# its processes are never ended. A token of this run, or of a host pid that still answers (`kill -0`, and `ps -p` for a
+# process of another user, which `kill -0` refuses), is left alone.
+_verify_end_dead_runs() {
+  local tokens tok pid n
+  tokens=""
+  runenv_list_tokens_v tokens || return 0
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    [ "$tok" != "$_VERIFY_RUN_TOKEN" ] || continue
+    [ "${tok%%-*}" = "$_VERIFY_RUN_HOST" ] || continue
+    pid=${tok#*-}
+    pid=${pid%%-*}
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then
+      continue
+    fi
+    n=0
+    runenv_end_token_v n "$tok" || n=0
+    if [ "$n" -gt 0 ]; then
+      printf 'verify: ended %s processes a dead run (pid %s) left in %s\n' "$n" "$pid" "$RUNENV_WHERE"
+    fi
+  done <<EOF_TOKENS
+$tokens
+EOF_TOKENS
+  return 0
+}
+
+# _verify_out_tmp — the file a narrowed profile's output is kept in, made once
+# a run and emptied before each profile.
+_verify_out_tmp() {
+  if [ -z "${JIG_VERIFY_OUT_TMP:-}" ]; then
+    JIG_VERIFY_OUT_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-verify-out.XXXXXX") \
+      || jig_die "verify: cannot create temporary file"
+  fi
+  : > "$JIG_VERIFY_OUT_TMP"
+}
+
 # _verify_cleanup — the one EXIT trap: temporary files and the run record. Its
 # variables are script-global, never `local`, because the trap runs after the
 # function that set them has returned (conventions/shell.md).
@@ -378,11 +686,21 @@ _verify_cleanup() {
   if [ -n "${JIG_VERIFY_MAP_TMP:-}" ]; then
     rm -f "$JIG_VERIFY_MAP_TMP.src" 2>/dev/null || true
   fi
-  rm -f "${JIG_VERIFY_TMP:-}" "${JIG_VERIFY_MAP_TMP:-}" "${JIG_VERIFY_MAP_ALL_TMP:-}" "${JIG_VERIFY_CHECKS_TMP:-}" 2>/dev/null || true
+  rm -f "${JIG_VERIFY_TMP:-}" "${JIG_VERIFY_MAP_TMP:-}" "${JIG_VERIFY_MAP_ALL_TMP:-}" "${JIG_VERIFY_CHECKS_TMP:-}" "${JIG_VERIFY_OUT_TMP:-}" 2>/dev/null || true
   if [ -n "${JIG_VERIFY_BUSY:-}" ]; then
-    _verify_busy_release "$JIG_VERIFY_BUSY"
+    _verify_busy_release "$JIG_VERIFY_BUSY" own
     JIG_VERIFY_BUSY=""
   fi
+  if [ -n "${JIG_VERIFY_ENV:-}" ]; then
+    _verify_busy_release "$JIG_VERIFY_ENV" own
+    JIG_VERIFY_ENV=""
+  fi
+  # Last, and after the records are given back: a run that did not reach the
+  # end of its profiles was stopped (a signal, a die), and what it started in
+  # the environment is still running there. The signal supervisor allows this
+  # cleanup about 5 s before it kills it, so nothing a kill could cut short is
+  # left to do after the sweep.
+  _verify_end_own_run
   return 0
 }
 
@@ -796,15 +1114,18 @@ cmd_verify() {
   # since piping an empty string through `tr`/`read` yields zero lines, not
   # one empty line, and would otherwise be dropped rather than rejected.
   local list_only=0 explain=0 profile_given=0 profiles_words="" p pdir raw tok
+  local files_given=0 files_stdin=0 files_arg="" named_files="" profile_full_run files_left=0
   local scope=0 base="" nfiles=0 scope_ok note full=0 explicit=0 full_run
   local header="" base_branch base_ref mb map map_ok map_err maps maps_listed map_bad b pmaps stale_base stock_src stale_why tracked_profiles=""
   local incomplete=0 covered=0 explained=0 unknown=0 plan_output plan_bad hr_state hr_rt hr_text
-  local table_err table_rows table_overrides="" base_roles="" p_dropped="" dropped_msg="" dropped_needs=0 covered_needs_install=0 is_fallback=0 run_output ci_left=0 task_base="" task_which="" task_note=""
+  local table_err table_rows table_overrides="" base_roles="" p_dropped="" dropped_msg="" dropped_needs=0 covered_needs_install=0 is_fallback=0 run_output ci_left=0 task_note=""
   JIG_VERIFY_TMP=""
   JIG_VERIFY_MAP_TMP=""
   JIG_VERIFY_MAP_ALL_TMP=""
   JIG_VERIFY_CHECKS_TMP=""
+  JIG_VERIFY_OUT_TMP=""
   JIG_VERIFY_BUSY=""
+  JIG_VERIFY_ENV=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --changed) scope=1; explicit=1; shift ;;
@@ -827,6 +1148,12 @@ cmd_verify() {
             *) profiles_words="$profiles_words $tok" ;;
           esac
         done < <(printf '%s\n' "$raw" | tr ',' '\n')
+        shift 2
+        ;;
+      --files)
+        [ $# -ge 2 ] || jig_die "verify: --files requires a value"
+        files_given=1
+        if [ "$2" = "-" ]; then files_stdin=1; files_arg=""; else files_stdin=0; files_arg="$2"; fi
         shift 2
         ;;
       --list) list_only=1; shift ;;
@@ -899,6 +1226,26 @@ EOF
     *) jig_die "verify: invalid verify.full_run: $full_run (expected local or ci)" ;;
   esac
 
+  # --files names the files itself: a computed scope or a full run beside it
+  # would say two things about one run. A full set is never started under it, so
+  # profiles are always told the project's CI runs it (the `ci` answer), and
+  # JIG_VERIFY_FULL_RUN is decided here, once, for every place that hands it on.
+  profile_full_run=$full_run
+  if [ "$files_given" = 1 ]; then
+    [ "$full" = 0 ] || jig_die "verify: --files cannot be combined with --full"
+    [ "$scope" = 0 ] || jig_die "verify: --files cannot be combined with --changed"
+    [ -z "$base" ] || jig_die "verify: --files cannot be combined with --base"
+    if [ "$files_stdin" = 1 ]; then
+      named_files=$(cat)
+    else
+      named_files=$(printf '%s\n' "$files_arg" | tr ',' '\n')
+    fi
+    named_files=$(_verify_named_files "$named_files")
+    scope=1
+    explicit=1
+    profile_full_run=ci
+  fi
+
   if [ "$full" = 1 ] && { [ "$scope" = 1 ] || [ -n "$base" ]; }; then
     jig_die "verify: --full cannot be combined with --changed or --base"
   fi
@@ -917,23 +1264,7 @@ EOF
       header="verify: full run (CI is set)"
     else
       scope=1
-      # The current task's own base first (ADR-0039): a task cut from an epic
-      # is measured from the epic, not from main, or every task re-runs the
-      # whole epic's diff. A recorded base this clone cannot resolve (an epic
-      # deleted after its merge, never fetched) falls back to the configured
-      # one, never to the working tree alone.
-      base_branch=$(cfg git.base_branch main)
-      _verify_task_base task_base task_which
-      base_ref=""
-      mb=""
-      if [ -n "$task_base" ]; then
-        _verify_merge_base "$task_base" base_ref mb
-        if [ -n "$mb" ]; then
-          base_branch="$task_base"
-          task_note="base of $task_which; "
-        fi
-      fi
-      [ -n "$mb" ] || _verify_merge_base "$base_branch" base_ref mb
+      _verify_task_merge_base base_ref mb task_note base_branch
       if [ -n "$mb" ]; then
         base="$mb"
         header=$(printf 'verify: scope changed since %s@%s (%sverify.full_run: ci, full set runs in CI)' \
@@ -1009,8 +1340,20 @@ EOF
   if [ "$scope" = 1 ]; then
     JIG_VERIFY_TMP=$(mktemp "${TMPDIR:-/tmp}/jig-verify-files.XXXXXX") \
       || jig_die "verify: cannot create temporary file"
-    _verify_changed_files "$base" > "$JIG_VERIFY_TMP"
+    if [ "$files_given" = 1 ]; then
+      printf '%s\n' "$named_files" > "$JIG_VERIFY_TMP"
+      # The named list is the whole scope; the base only tells a profile what
+      # to diff inside a file (the shell profile's changed functions), resolved
+      # as the `verify.full_run: ci` run does, and empty when nothing resolves.
+      _verify_task_merge_base base_ref mb task_note base_branch
+      base=$mb
+    else
+      _verify_changed_files "$base" > "$JIG_VERIFY_TMP"
+    fi
     nfiles=$(grep -c . < "$JIG_VERIFY_TMP" || true)
+    if [ "$files_given" = 1 ]; then
+      header=$(printf 'verify: scope named files (--files, %d files); a full set is never started here — run jig verify before declaring done' "$nfiles")
+    fi
   fi
 
   [ -z "$header" ] || printf '%s\n' "$header"
@@ -1020,7 +1363,9 @@ EOF
   # was checked: exit 3, before anyone waits for the clone.
   # shellcheck source=lib/runenv.sh
   . "$JIG_LIB/runenv.sh"
-  unset JIG_RUN_EXEC
+  unset JIG_RUN_EXEC JIG_VERIFY_RUN_TOKEN
+  _VERIFY_RUN_TOKEN=""
+  _VERIFY_LOOP_DONE=0
   runenv_resolve
   if [ -n "$RUNENV_REFUSAL" ]; then
     printf 'verify: refused: %s\n' "$RUNENV_REFUSAL"
@@ -1053,6 +1398,14 @@ EOF
   # wait for the clone only to be told their arguments were wrong.
   if [ "$explain" = 0 ]; then
     _verify_busy_acquire
+    # The run's token, and the leftovers of runs that died: only once the
+    # records are ours, so a live run of another clone is never mistaken for a
+    # dead one while it is being waited for.
+    if [ -n "$RUNENV_EXEC" ]; then
+      _verify_run_host_v _VERIFY_RUN_HOST
+      _VERIFY_RUN_TOKEN="$_VERIFY_RUN_HOST-$$-${RANDOM}${RANDOM}"
+      _verify_end_dead_runs
+    fi
   else
     printf 'verify: plan only — no checks have run\n'
   fi
@@ -1070,6 +1423,8 @@ EOF
     [ -f "$pdir/verify.sh" ] || continue
     if [ "$explain" = 1 ] && ! profiles_supports "$pdir" explain; then continue; fi
     if [ -n "$RUNENV_EXEC" ] && ! profiles_supports "$pdir" environment; then continue; fi
+    # --files starts no profile that cannot narrow (the loop below skips it).
+    if [ "$files_given" = 1 ] && ! profiles_supports "$pdir" changed; then continue; fi
     run_profiles="${run_profiles:+$run_profiles }$p"
   done
   covers=$(_verify_covers "$installed_dir" "$run_profiles" "$scope" "$stack_edges")
@@ -1185,8 +1540,16 @@ EOF
     if [ -n "$RUNENV_EXEC" ]; then
       JIG_RUN_EXEC="$RUNENV_EXEC"
       export JIG_RUN_EXEC
+      # Beside the prefix and nowhere else: a profile that never declared
+      # `environment` never gets either (jp_exec reads it).
+      if [ -n "$_VERIFY_RUN_TOKEN" ]; then
+        JIG_VERIFY_RUN_TOKEN="$_VERIFY_RUN_TOKEN"
+        export JIG_VERIFY_RUN_TOKEN
+      else
+        unset JIG_VERIFY_RUN_TOKEN
+      fi
     else
-      unset JIG_RUN_EXEC
+      unset JIG_RUN_EXEC JIG_VERIFY_RUN_TOKEN
     fi
     # Set for a profile whose check another covers, cleared for every other:
     # a caller's own JIG_VERIFY_COVERED must never stand a check down.
@@ -1244,6 +1607,20 @@ EOF
       else
         note=" (scope ignored: profile declares no scope support, ran full set)"
       fi
+    fi
+
+    # A profile that cannot narrow would start its full set, which --files never
+    # does. Scope narrowing, not a missing tool: nothing here needs installing.
+    if [ "$files_given" = 1 ] && [ "$scope_ok" = 0 ]; then
+      files_left=$((files_left + 1))
+      if [ "$explain" = 1 ]; then
+        explained=$((explained + 1))
+        printf "PLAN %s: skip (scope: --files, profile cannot narrow; full set left to the task's jig verify)\n" "$p"
+      else
+        skip=$((skip + 1))
+        printf "RESULT %s: skip (scope: --files, profile cannot narrow; full set left to the task's jig verify)\n" "$p"
+      fi
+      continue
     fi
 
     if [ "$scope_ok" = 1 ] && [ "$nfiles" -eq 0 ] && [ "$explain" = 0 ]; then
@@ -1328,13 +1705,13 @@ EOF
       if [ "$map_ok" = 1 ]; then
         plan_output=$( cd "$JIG_PROJECT" \
           && JIG_VERIFY_EXPLAIN=1 JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$profile_full_run" \
              JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" JIG_VERIFY_MAPPED_ALL="$JIG_VERIFY_MAP_ALL_TMP" bash "$pdir/verify.sh" )
       elif [ "$scope_ok" = 1 ]; then
         plan_output=$( cd "$JIG_PROJECT" \
           && unset JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL \
           && JIG_VERIFY_EXPLAIN=1 JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$profile_full_run" \
              bash "$pdir/verify.sh" )
       else
         plan_output=$( cd "$JIG_PROJECT" \
@@ -1342,23 +1719,22 @@ EOF
           && JIG_VERIFY_EXPLAIN=1 bash "$pdir/verify.sh" )
       fi
       rc=$?
-    elif [ "$map_ok" = 1 ]; then
-      run_output=$( cd "$JIG_PROJECT" \
+    elif [ "$map_ok" = 1 ] || [ "$scope_ok" = 1 ]; then
+      # A narrowed run is shown as it comes — a test runner's progress lines
+      # included — and kept in a file for the summary to read afterwards.
+      _verify_out_tmp
+      ( cd "$JIG_PROJECT" \
         && unset JIG_VERIFY_EXPLAIN \
+        && if [ "$map_ok" = 1 ]; then
+             export JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" JIG_VERIFY_MAPPED_ALL="$JIG_VERIFY_MAP_ALL_TMP"
+           else
+             unset JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL
+           fi \
         && JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
-           JIG_VERIFY_MAPPED="$JIG_VERIFY_MAP_TMP" JIG_VERIFY_MAPPED_ALL="$JIG_VERIFY_MAP_ALL_TMP" \
-           bash "$pdir/verify.sh" 2>&1 )
-      rc=$?
-      [ -z "$run_output" ] || printf '%s\n' "$run_output"
-    elif [ "$scope_ok" = 1 ]; then
-      run_output=$( cd "$JIG_PROJECT" \
-        && unset JIG_VERIFY_EXPLAIN JIG_VERIFY_MAPPED JIG_VERIFY_MAPPED_ALL \
-        && JIG_VERIFY_SCOPE=changed JIG_VERIFY_FILES="$JIG_VERIFY_TMP" \
-             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$full_run" \
-           bash "$pdir/verify.sh" 2>&1 )
-      rc=$?
-      [ -z "$run_output" ] || printf '%s\n' "$run_output"
+             JIG_VERIFY_BASE="$base" JIG_VERIFY_FULL_RUN="$profile_full_run" \
+           bash "$pdir/verify.sh" 2>&1 ) | tee "$JIG_VERIFY_OUT_TMP"
+      rc=${PIPESTATUS[0]}
+      run_output=$(cat "$JIG_VERIFY_OUT_TMP" 2>/dev/null) || run_output=""
     else
       # Never scope-aware (no --changed, or the profile declares no scope
       # support): a skip here cannot be scope narrowing, so there is nothing
@@ -1437,6 +1813,9 @@ EOF
         ;;
     esac
   done
+  # Every profile ran to its end: nothing of this run is left to end.
+  _VERIFY_LOOP_DONE=1
+  unset JIG_VERIFY_RUN_TOKEN
 
   if [ "$explain" = 1 ]; then
     printf 'verify: %d profiles explained, %d unknown, %d error; no checks ran\n' \
@@ -1448,7 +1827,9 @@ EOF
 
   printf 'verify: %d profiles, %d pass, %d fail, %d skip, %d incomplete\n' \
     "$total" "$pass" "$failn" "$skip" "$incomplete"
-  if [ "$ci_left" -gt 0 ]; then
+  if [ "$ci_left" -gt 0 ] && [ "$files_given" = 1 ]; then
+    printf "verify: %d check(s) left their full set to the task's jig verify (--files)\n" "$ci_left"
+  elif [ "$ci_left" -gt 0 ]; then
     printf 'verify: %d check(s) left their full set to CI (verify.full_run: ci); jig verify --full runs it here\n' \
       "$ci_left"
   fi
@@ -1515,6 +1896,10 @@ EOF
     if [ "$covered" = 1 ] && [ "$covered_needs_install" -gt 0 ]; then
       printf 'verify: nothing was checked, so this is not a pass — install the project'"'"'s tools so its profile can run\n'
       return 3
+    fi
+    if [ "$covered" = 1 ] && [ "$files_given" = 1 ] && [ $((ci_left + files_left)) -gt 0 ]; then
+      printf "verify: every check in scope skipped or left its full set to the task's jig verify, so this run verified nothing here\n"
+      return 0
     fi
     if [ "$covered" = 1 ] && [ "$ci_left" -gt 0 ]; then
       printf 'verify: every check in scope skipped or left its full set to CI, so this run verified nothing here\n'
