@@ -34,9 +34,10 @@ task back to verify. A check that says `full set left to CI` is that, not a gap 
 filter (`php artisan test`, `phpunit`, `pytest`, `npm test`, `tests/run.sh`) — unless the person
 asks for it.
 
-`jig verify --changed` stays the tool for iteration: it narrows the run to what the diff
-touches regardless of `verify.full_run`, and each profile reports whether it honoured the
-scope or ran everything anyway.
+`jig verify --files <files>` is the tool for iteration: only the tests mapped to the files
+named, and never a full set — so it is never this stage's evidence. `jig verify --changed`
+narrows to the whole diff regardless of `verify.full_run`, and each profile reports whether
+it honoured the scope or ran everything anyway.
 
 Wait on the run's own handle and read that exit code: `.ai/scripts/jig verify & wait $!`
 in plain shell (its report goes to the terminal; do not redirect it into a file in the

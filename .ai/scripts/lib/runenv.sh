@@ -543,6 +543,56 @@ runenv_resolve() {
   return 0
 }
 
+# runenv_shared_key — the name of the container the checks run in when it can
+# be shared between projects, else nothing. Only a `docker exec` prefix names
+# a container by itself: the first word after its options, quotes stripped.
+# Any such prefix is keyed, whichever
+# detector (Devilbox, say) or run.exec built it. Compose, Sail, DDEV, Lando and devcontainers are an
+# environment per project, where a service name like `laravel.test` repeats
+# across projects without meaning one container.
+runenv_shared_key() {
+  local rest word group skip=0
+  local IFS=$' \t\n'
+  case "$RUNENV_EXEC" in
+    "docker exec "*) rest=${RUNENV_EXEC#docker exec } ;;
+    "docker container exec "*) rest=${RUNENV_EXEC#docker container exec } ;;
+    *) return 0 ;;
+  esac
+  # Word splitting is the point; globbing is not.
+  set -f
+  # shellcheck disable=SC2086
+  set -- $rest
+  set +f
+  for word in "$@"; do
+    if [ "$skip" = 1 ]; then
+      skip=0
+      continue
+    fi
+    case "$word" in
+      -e | -u | -w | --env | --user | --workdir | --env-file | --detach-keys) skip=1 ;;
+      --* | *=*) ;;
+      # In a group of short flags the first value-taking letter takes the rest
+      # of the word as its value (-w/var/www, -uwww), or the next word when it
+      # is the group's last letter (-iu, -iw).
+      -*)
+        group=${word#-}
+        case "${group%%[euw]*}" in
+          "${group%?}") skip=1 ;;
+        esac
+        ;;
+      *)
+        word=${word#\'}
+        word=${word#\"}
+        word=${word%\'}
+        word=${word%\"}
+        [ -z "$word" ] || printf '%s\n' "$word"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
 # _runenv_place — runenv_resolve without run.path: the host, a prefix, or a
 # refusal, from run.exec and the detectors.
 _runenv_place() {
@@ -584,4 +634,114 @@ _runenv_place() {
   esac
   _runenv_probe || true
   return 0
+}
+
+# --- processes a run leaves in the environment -------------------------------
+#
+# `docker exec` without a TTY does not pass a signal on: when a run is stopped,
+# the command it started in the container goes on. Every command a profile runs
+# there carries `JIG_VERIFY_RUN=<token>` in its environment (jp_exec), the whole
+# tree inherits it, and the two helpers below find those processes by that exact
+# line and nothing else (adr-20261125-verify-ends-the-processes-it-started).
+
+# _runenv_sweep_script — the POSIX sh program the helpers run in the
+# environment: `sh -c "$(_runenv_sweep_script)" sh <mode> <token> <grace>`.
+# `list` prints each distinct token in any readable process's environment;
+# `end` sends TERM to the processes whose environment holds exactly
+# `JIG_VERIFY_RUN=<token>`, KILL to those still there after <grace> seconds,
+# and prints how many are gone. A process whose environment cannot be read is
+# skipped, and so is the shell itself.
+_runenv_sweep_script() {
+  cat <<'SWEEP'
+mode=$1; tok=$2; grace=${3:-5}
+me=$$
+case $mode in
+  list)
+    for f in /proc/[0-9]*/environ; do
+      tr '\0' '\n' 2>/dev/null < "$f" | grep '^JIG_VERIFY_RUN=[A-Za-z0-9.][A-Za-z0-9.]*-[0-9][0-9]*-[0-9][0-9]*$'
+    done | sed 's/^JIG_VERIFY_RUN=//' | sort -u
+    exit 0 ;;
+  end) ;;
+  *) exit 2 ;;
+esac
+alive() {
+  [ -d "/proc/$1" ] || return 1
+  grep '^State:[[:space:]]*Z' "/proc/$1/status" >/dev/null 2>&1 && return 1
+  return 0
+}
+want="JIG_VERIFY_RUN=$tok"
+pids=
+for d in /proc/[0-9]*; do
+  p=${d#/proc/}
+  [ "$p" != "$me" ] || continue
+  tr '\0' '\n' 2>/dev/null < "$d/environ" | grep -Fx -- "$want" >/dev/null || continue
+  pids="$pids $p"
+done
+[ -n "$pids" ] || { echo 0; exit 0; }
+for p in $pids; do kill -TERM "$p" 2>/dev/null; done
+step=0.2; n=$((grace * 5))
+sleep 0.2 2>/dev/null || { step=1; n=$grace; }
+i=0
+while [ "$i" -lt "$n" ]; do
+  left=
+  for p in $pids; do alive "$p" && left="$left $p"; done
+  [ -n "$left" ] || break
+  sleep "$step"
+  i=$((i + 1))
+done
+for p in $pids; do alive "$p" && kill -KILL "$p" 2>/dev/null; done
+gone=0
+for p in $pids; do alive "$p" || gone=$((gone + 1)); done
+echo "$gone"
+SWEEP
+}
+
+_RUNENV_SWEEP_WARNED=0
+
+# _runenv_sweep_v <var> <mode> <token> [<grace>] — run the sweep program in the
+# environment through RUNENV_EXEC and put its output in <var>. Returns 1 and
+# says one line, once per run, when it could not run: nothing here may fail
+# `jig verify`. The working directory is the project's, as the probe's is: a
+# prefix like `devcontainer exec --workspace-folder .` reads it.
+_runenv_sweep_v() {
+  local __var="$1" __mode="$2" __tok="$3" __grace="${4:-5}" __out __err __last __rc=0
+  local -a __pre
+  read -r -a __pre <<EOF_PRE
+$RUNENV_EXEC
+EOF_PRE
+  __err=$(mktemp "${TMPDIR:-/tmp}/jig-runenv.XXXXXX" 2>/dev/null) || __err=/dev/null
+  [ "$__err" = /dev/null ] || jig_cleanup_add "$__err"
+  __out=$( cd "$JIG_PROJECT" 2>/dev/null && "${__pre[@]}" sh -c "$(_runenv_sweep_script)" sh "$__mode" "$__tok" "$__grace" </dev/null 2>"$__err" ) || __rc=$?
+  __last=""
+  if [ "$__err" != /dev/null ]; then
+    __last=$(sed '/^[[:space:]]*$/d' "$__err" | sed -n '$p')
+    rm -f "$__err"
+  fi
+  if [ "$__rc" -ne 0 ]; then
+    if [ "$_RUNENV_SWEEP_WARNED" = 0 ]; then
+      _RUNENV_SWEEP_WARNED=1
+      printf 'verify: could not check %s for leftover processes: %s\n' "$RUNENV_WHERE" "${__last:-exit $__rc}"
+    fi
+    printf -v "$__var" '%s' ""
+    return 1
+  fi
+  printf -v "$__var" '%s' "$__out"
+  return 0
+}
+
+# runenv_end_token_v <var> <token> [<grace>] — (grace 2 s by default, under the 5 s the signal supervisor allows) end the processes in the
+# environment that carry <token>; <var> gets how many are gone. Exit 1 when
+# the environment could not be asked.
+runenv_end_token_v() {
+  local __n
+  _runenv_sweep_v __n end "$2" "${3:-2}" || { printf -v "$1" '%s' 0; return 1; }
+  case "$__n" in '' | *[!0-9]*) __n=0 ;; esac
+  printf -v "$1" '%s' "$__n"
+  return 0
+}
+
+# runenv_list_tokens_v <var> — the distinct run tokens carried by processes in
+# the environment, one per line. Exit 1 when it could not be asked.
+runenv_list_tokens_v() {
+  _runenv_sweep_v "$1" list "" 5
 }
